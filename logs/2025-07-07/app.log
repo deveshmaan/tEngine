@@ -1,0 +1,83 @@
+[E 250707 13:58:06 smartConnect:246] Error occurred while making a POST request to https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword. Error: LoginbyPassword is not allowed. Please switch to Login by MPIN now.. URL: https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword, Headers: {'Content-type': 'application/json', 'X-ClientLocalIP': '127.0.0.1', 'X-ClientPublicIP': '106.193.147.98', 'X-MACAddress': '12:c5:e3:68:f9:ad', 'Accept': 'application/json', 'X-PrivateKey': 'd2lK2TME', 'X-UserType': 'USER', 'X-SourceID': 'WEB'}, Request: {'clientcode': 'AAAI838566', 'password': 'Avleen12358*', 'totp': '216306'}, Response: {'message': 'LoginbyPassword is not allowed. Please switch to Login by MPIN now.', 'errorcode': 'AB7001', 'status': False, 'data': None}
+[W 250707 14:03:38 smartWebSocketV2:318] Attempting to resubscribe/reconnect (Attempt 1)...
+[E 250707 14:03:48 smartWebSocketV2:303] Error occurred during WebSocket connection: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:03:48 smartWebSocketV2:332] Error occurred during resubscribe/reconnect: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:03:48 smartWebSocketV2:303] Error occurred during WebSocket connection: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:10:00 smartWebSocketV2:212] Error occurred during subscribe: 'WebSocketApp' object is not iterable
+[W 250707 14:10:00 smartWebSocketV2:318] Attempting to resubscribe/reconnect (Attempt 1)...
+[E 250707 14:10:10 smartWebSocketV2:212] Error occurred during subscribe: 'WebSocketApp' object is not iterable
+[E 250707 14:10:10 smartWebSocketV2:303] Error occurred during WebSocket connection: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:10:10 smartWebSocketV2:332] Error occurred during resubscribe/reconnect: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:10:10 smartWebSocketV2:303] Error occurred during WebSocket connection: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:18:41 smartWebSocketV2:212] Error occurred during subscribe: 'WebSocketApp' object is not iterable
+[W 250707 14:18:41 smartWebSocketV2:318] Attempting to resubscribe/reconnect (Attempt 1)...
+[E 250707 14:18:51 smartWebSocketV2:212] Error occurred during subscribe: 'WebSocketApp' object is not iterable
+[E 250707 14:18:51 smartWebSocketV2:303] Error occurred during WebSocket connection: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:18:51 smartWebSocketV2:332] Error occurred during resubscribe/reconnect: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:18:51 smartWebSocketV2:303] Error occurred during WebSocket connection: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[W 250707 14:41:46 smartWebSocketV2:318] Attempting to resubscribe/reconnect (Attempt 1)...
+[E 250707 14:41:56 smartWebSocketV2:303] Error occurred during WebSocket connection: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:41:56 smartWebSocketV2:332] Error occurred during resubscribe/reconnect: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[E 250707 14:41:56 smartWebSocketV2:303] Error occurred during WebSocket connection: InterfaceAngelOne.on_error() takes 2 positional arguments but 3 were given
+[W 250707 14:57:50 smartWebSocketV2:318] Attempting to resubscribe/reconnect (Attempt 1)...
+[E 250707 14:58:00 InterfaceAngelOne:199] Connection closed
+[W 250707 14:58:00 smartWebSocketV2:342] Connection closed due to max retry attempts reached.
+[E 250707 14:58:00 InterfaceAngelOne:199] Connection closed
+[W 250707 14:58:00 smartWebSocketV2:342] Connection closed due to max retry attempts reached.
+[E 250707 14:58:00 InterfaceAngelOne:199] Connection closed
+[W 250707 14:58:00 smartWebSocketV2:342] Connection closed due to max retry attempts reached.
+[W 250707 14:59:25 smartWebSocketV2:318] Attempting to resubscribe/reconnect (Attempt 1)...
+[E 250707 14:59:36 InterfaceAngelOne:199] Connection closed
+[W 250707 14:59:36 smartWebSocketV2:342] Connection closed due to max retry attempts reached.
+[E 250707 14:59:36 InterfaceAngelOne:199] Connection closed
+[W 250707 14:59:36 smartWebSocketV2:342] Connection closed due to max retry attempts reached.
+[E 250707 14:59:36 InterfaceAngelOne:199] Connection closed
+[W 250707 14:59:36 smartWebSocketV2:342] Connection closed due to max retry attempts reached.
+[I 250707 15:08:56 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14984857, 'exchange_timestamp': 1751881136000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:08:56 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14985134, 'exchange_timestamp': 1751881136000, 'last_traded_price': 154220, 'subscription_mode_val': 'LTP'}
+[I 250707 15:08:57 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14985532, 'exchange_timestamp': 1751881137000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:08:57 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14985717, 'exchange_timestamp': 1751881137000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:08:58 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14986236, 'exchange_timestamp': 1751881138000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:08:58 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14986422, 'exchange_timestamp': 1751881138000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:08:59 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14986918, 'exchange_timestamp': 1751881139000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:08:59 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14987103, 'exchange_timestamp': 1751881139000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:00 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14987798, 'exchange_timestamp': 1751881140000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:00 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14988042, 'exchange_timestamp': 1751881140000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:01 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14988478, 'exchange_timestamp': 1751881141000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:01 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14988714, 'exchange_timestamp': 1751881141000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:02 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14989150, 'exchange_timestamp': 1751881142000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:02 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14989352, 'exchange_timestamp': 1751881142000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:03 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14989797, 'exchange_timestamp': 1751881143000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:03 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14990041, 'exchange_timestamp': 1751881143000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:04 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14990427, 'exchange_timestamp': 1751881144000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:04 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14990482, 'exchange_timestamp': 1751881144000, 'last_traded_price': 154230, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:05 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14991105, 'exchange_timestamp': 1751881145000, 'last_traded_price': 154250, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:05 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14991155, 'exchange_timestamp': 1751881145000, 'last_traded_price': 154240, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:06 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14991748, 'exchange_timestamp': 1751881146000, 'last_traded_price': 154250, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:06 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14991834, 'exchange_timestamp': 1751881146000, 'last_traded_price': 154260, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:07 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14992427, 'exchange_timestamp': 1751881147000, 'last_traded_price': 154260, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:07 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14992518, 'exchange_timestamp': 1751881147000, 'last_traded_price': 154250, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:08 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14993103, 'exchange_timestamp': 1751881148000, 'last_traded_price': 154270, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:08 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14993226, 'exchange_timestamp': 1751881148000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:09 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14993721, 'exchange_timestamp': 1751881149000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:09 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14993881, 'exchange_timestamp': 1751881149000, 'last_traded_price': 154270, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:10 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14994363, 'exchange_timestamp': 1751881150000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:10 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14994564, 'exchange_timestamp': 1751881150000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:11 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14995042, 'exchange_timestamp': 1751881151000, 'last_traded_price': 154270, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:11 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14995246, 'exchange_timestamp': 1751881151000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:12 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14995721, 'exchange_timestamp': 1751881152000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:12 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14995922, 'exchange_timestamp': 1751881152000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:13 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14996324, 'exchange_timestamp': 1751881153000, 'last_traded_price': 154270, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:13 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14996616, 'exchange_timestamp': 1751881153000, 'last_traded_price': 154270, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:14 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14997005, 'exchange_timestamp': 1751881154000, 'last_traded_price': 154290, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:14 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14997293, 'exchange_timestamp': 1751881154000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:15 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14997612, 'exchange_timestamp': 1751881155000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:15 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14997905, 'exchange_timestamp': 1751881155000, 'last_traded_price': 154290, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:16 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14998300, 'exchange_timestamp': 1751881156000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:16 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14998591, 'exchange_timestamp': 1751881156000, 'last_traded_price': 154290, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:17 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14999079, 'exchange_timestamp': 1751881157000, 'last_traded_price': 154290, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:17 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14999277, 'exchange_timestamp': 1751881157000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[I 250707 15:09:18 InterfaceAngelOne:181] Ticks: {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885', 'sequence_number': 14999817, 'exchange_timestamp': 1751881158000, 'last_traded_price': 154280, 'subscription_mode_val': 'LTP'}
+[W 250707 15:09:18 smartWebSocketV2:318] Attempting to resubscribe/reconnect (Attempt 1)...
+[E 250707 15:09:20 InterfaceAngelOne:199] Connection closed
+[W 250707 15:09:20 smartWebSocketV2:342] Connection closed due to max retry attempts reached.
