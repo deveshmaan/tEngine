@@ -48,10 +48,26 @@ class TradingEngine():
     def ActivateMarketFeed(self):
         try:
             print("Activating Market Feed...")
-
-            self._angelOneInstance.StartStreamingUsingWebSocket()
             
-            self.subscribe_live_feedFNO()
+            # TODO: UNCMOMMNET This line once future option is ready
+            # if len(self.df_futureOptions) <= 0:
+            #     raise ValueError("future Options is empty.")
+            
+            # token_list = list(self.df_futureOptions['Token'])
+            # formatted_token_list = [ "{}|{}".format('NFO', token) for token in token_list ]
+            
+            # print("Subscribing to live feed for FNO...", formatted_token_list)
+            
+            test_formatted_token_list = [
+                {
+                    "exchangeType": 1,
+                    "tokens": ["26009"]
+                }
+            ]
+
+            self._angelOneInstance.StartStreamingUsingWebSocket(test_formatted_token_list)
+            
+            # self.subscribe_live_feedFNO()
                 
         except Exception as e:
             print(f"Failed to activate market feed: {e}")
@@ -141,6 +157,8 @@ class TradingEngine():
     # Subscribe to live feed from cluster dataframe
             
     def subscribe_live_feedFNO(self) -> None:
+        print(" AVI --------------------------------")
+        
         """ Subscribe to live feed from cluster dataframe (FNO) """
         try:
             if not isinstance(self._angelOneInstance, InterfaceAngelOne.InterfaceAngelOne):
@@ -156,7 +174,6 @@ class TradingEngine():
             
             test_formatted_token_list = [
                 {
-                    "action": 0,
                     "exchangeType": 1,
                     "tokens": ["26009"]
                 }

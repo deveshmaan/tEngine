@@ -20,6 +20,7 @@ class InterfaceAngelOne:
         self.feedToken = None
         self.action = 1
         self.mode = 1
+        self.tokenList = []
         
         
     def __set_up_feed(self):
@@ -181,15 +182,17 @@ class InterfaceAngelOne:
         logger.info("Ticks: {}".format(message))
         # close_connection()
 
-    def on_open(self,token_list):
+    def on_open(self, wsapp):
         print("on open new")
         
-        token_list = [
-            {
-                "exchangeType": 1,
-                "tokens": ["2885"]
-            }
-        ]
+        # token_list = [
+        #     {
+        #         "exchangeType": 1,
+        #         "tokens": ["26009"]
+        #     }
+        # ]
+        
+        token_list = self.tokenList
         
         self.sws.subscribe(CredentialAngelOne.CORRELATION_ID , self.mode, token_list)
         # sws.unsubscribe(correlation_id, mode, token_list1)
@@ -313,10 +316,11 @@ class InterfaceAngelOne:
     # #end of callbacks
 
             
-    def StartStreamingUsingWebSocket(self) -> None:
+    def StartStreamingUsingWebSocket(self, tokenList) -> None:
         try:
             print("Task streaming data <Price, Order> from Trading venue...")
             # Connection Failed 
+            self.tokenList = tokenList
             
             if self.IsConnect() == False:
                 print("Connection Failure. Please connect To Broker than using streaming function")
