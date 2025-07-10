@@ -1,10 +1,11 @@
 import InterfaceAngelOne
-# from Master.MasterSymbolFinvasia import MasterSymbolFinvasia, MasterTypeVar
-import Utility.RealtivePath
 import Utility.SystemCol as cl
 import settings
 import pandas as pd
 import StrategyEngine.TradingStrategy as ts
+import requests
+from datetime import date
+
 
 
 class TradingEngine():
@@ -14,8 +15,12 @@ class TradingEngine():
         self._angelOneInstance = InterfaceAngelOne.InterfaceAngelOne()
         # self.df_cash = pd.DataFrame()
         self.df_futureOptions = pd.DataFrame()
-        self.setup_system_trades()
-        self.__settings_strategy()
+    # The code is a Python script with comments. It appears to define a class or a module with methods
+    # such as `setup_system_trades()` and `__settings_strategy()`. The `setup_system_trades()` method
+    # is being called, and within that method, the `__settings_strategy()` method is being invoked.
+    # The code is likely setting up some trading system and configuring strategy settings.
+        # self.setup_system_trades()
+        # self.__settings_strategy()
         
         
     def ConnectToBroker(self):
@@ -91,56 +96,54 @@ class TradingEngine():
         
         
     # Download Master File
-    # def ActivateMasterSymbolDownloader(self):
-    #     print("Processing Master...")
-    #     try:      
-    #         getFullPath =  Utility.RealtivePath.Path.GetCurrentDirectory()
-    #         print(f"Current Directory: {getFullPath}")
-    #         __master = MasterSymbolFinvasia(getFullPath)
-    #         __master.DownloadMaster(MasterTypeVar.WITH_FNO)
-    #         __master.ReadAllMastersTextFile(MasterTypeVar.WITH_FNO)
-                        
-    #         # Here we are storing stocks data to df_futureOptions dataframe ( table)
-    #         self.df_futureOptions = __master.GetFutureOptionsMasterData()
+    def ActivateMasterSymbolDownloader(self):
+        print("Downloading Master File...")
+        try:    
+              
+            url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+            masterData = requests.get(url).json() 
+            print("Master Data Downloaded Successfully.",masterData)
+            self.df_futureOptions = pd.DataFrame.from_dict(masterData)
+            print("Master DataFrame from_dict:", self.df_futureOptions)
+            # self.df_futureOptions["expiry"] = pd.to_datetime(self.df_futureOptions["expiry"] , format = "mixed").apply(lambda x: x.date()).split("T")[0]
             
-    #         # self.apply_instruments_filter()
-    #         self.apply_instruments_filterFNO()
+            # print("Master  expiry:", self.df_futureOptions)
+
+            self.df_futureOptions = self.df_futureOptions.astype({"strike": float})
             
-    #     except Exception as e:
-    #         print(f"Failed to process master symbol: {e}")
-            
-            
-            
-    def apply_instruments_filterFNO(self):
-        
-        """ Filter other series data and include FNO series cluster and index cluster"""
-        
-        try:
             if self.df_futureOptions is None:
                 raise ValueError("DataFrame is not initialized.")               
             
             if (len(self.df_futureOptions) <= 0):
                 raise ValueError("DataFrame is empty.")
             
-            self.df_futureOptions = self.df_futureOptions[ (self.df_futureOptions['Symbol'].isin(settings.futureOption_list) 
-                                     & self.df_futureOptions['OptionType'].isin(settings.option_list)
-                                     & self.df_futureOptions['Instrument'].isin(settings.instrument_list)
-                                     )]
+            self.df_futureOptions = self.df_futureOptions[ (self.df_futureOptions['name'].isin(settings.futureOption_list) 
+                                                            & self.df_futureOptions['expiry'].isin(settings.expiry_list)
+                                                            & self.df_futureOptions['instrumenttype'].isin(settings.instrument_list))]
             
             #reset index again from 0
+            
+            print("Master DataFrame before reset:", self.df_futureOptions)
+
 
             self.df_futureOptions = self.df_futureOptions.reset_index(drop=True)
+            
+            print("Final Option Dataframe after Reset Index:", self.df_futureOptions)
+
 
             # includes those expiry date which are mentioned in settings
-            self.df_futureOptions = self.df_futureOptions[(self.df_futureOptions['Expiry'].isin(settings.expiry_list)) ]
-            self.df_futureOptions = self.df_futureOptions[(self.df_futureOptions['StrikePrice'] < 27000) ]
+            self.df_futureOptions = self.df_futureOptions[(self.df_futureOptions['expiry'].isin(settings.expiry_list)) ]
+            
+            print("Final Option Dataframe after Reset Index expiry:", self.df_futureOptions)
 
-           
-            print("Final Option Dataframe after Reset Index:", self.df_futureOptions)
+            self.df_futureOptions = self.df_futureOptions[(self.df_futureOptions['strike'] < 3000000) ]
+
+            print("Final Option Dataframe after Reset Index strike:", self.df_futureOptions)
+
 
             # self.df_futureOptions = self.df_futureOptions[ (self.df_futureOptions['Symbol'].str.match('^[^0-9]')) ]
             
-            filteredexpiry = self.df_futureOptions['Expiry'].unique()
+            filteredexpiry = self.df_futureOptions['expiry'].unique()
             
             print("filteredexpiry: ", filteredexpiry)
 
@@ -149,43 +152,10 @@ class TradingEngine():
             print(f"Pattern matching failed, {e}")
             
         except KeyError as e:
-            print(f"coloumn : missing from dataframe")
+            print(f"coloumn : missing from dataframe", e)
             
         except Exception as e:
             print(f"Failed to apply instruments filter: {e}")
-            
-    # Subscribe to live feed from cluster dataframe
-            
-    def subscribe_live_feedFNO(self) -> None:
-        print(" AVI --------------------------------")
-        
-        """ Subscribe to live feed from cluster dataframe (FNO) """
-        try:
-            if not isinstance(self._angelOneInstance, InterfaceAngelOne.InterfaceAngelOne):
-                raise AttributeError("This method should be accesed through an instance of class.")
-                
-            if len(self.df_futureOptions) <= 0:
-                raise ValueError(" future Options is empty.")
-            
-            token_list = list(self.df_futureOptions['Token'])
-            formatted_token_list = [ "{}|{}".format('NFO', token) for token in token_list ]
-            
-            print("Subscribing to live feed for FNO...", formatted_token_list)
-            
-            test_formatted_token_list = [
-                {
-                    "exchangeType": 1,
-                    "tokens": ["26009"]
-                }
-            ]
-            
-            #for bulk subscription
-            # print("Subscribing to live feed for FNO...", self._angelOneInstance.SubscribeTokenToBroker(formatted_token_list))
-            
-            self._angelOneInstance.SubscribeTokenToBroker(test_formatted_token_list) 
-            
-        except Exception as e:
-            print(f"Failed to subscribe to live feed for: {e}")
             
             
     def start(self):

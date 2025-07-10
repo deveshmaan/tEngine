@@ -348,19 +348,19 @@ class InterfaceAngelOne:
             print(f"Error starting WebSocket: {e}")
             
        # For Dynamic requirement     
-    def SubscribeTokenToBroker(self, tokenList):
-        try:
-            if self.IsWebSocketConnectionOpened() == False:
-                print("Error !! WebSocket connection failure")
-                return #Early return
+    # def SubscribeTokenToBroker(self, tokenList):
+    #     try:
+    #         if self.IsWebSocketConnectionOpened() == False:
+    #             print("Error !! WebSocket connection failure")
+    #             return #Early return
             
-            if isinstance(tokenList, list):
-                #handle this function to List Collection
-                print("Bulk subscribe to Broker...")
-                self.on_open(tokenList)
+    #         if isinstance(tokenList, list):
+    #             #handle this function to List Collection
+    #             print("Bulk subscribe to Broker...")
+    #             self.on_open(tokenList)
                 
-        except Exception as e:
-            print(f"Error subscribing to token: {e}")
+    #     except Exception as e:
+    #         print(f"Error subscribing to token: {e}")
             
     # Is web socket connection is open or not Price()
     

@@ -3,7 +3,7 @@ import TradingEngine as te
 
 if __name__ == "__main__": # main - first method
     handler = te.TradingEngine()
-    # handler.ActivateMasterSymbolDownloader()
+    handler.ActivateMasterSymbolDownloader()
     handler.ConnectToBroker()
     handler.StartEngine()
     # handler.start()
