@@ -54,26 +54,30 @@ class TradingEngine():
         try:
             print("Activating Market Feed...")
             
-            # TODO: UNCMOMMNET This line once future option is ready
-            # if len(self.df_futureOptions) <= 0:
-            #     raise ValueError("future Options is empty.")
+            if len(self.df_futureOptions) <= 0:
+                raise ValueError("future Options is empty.")
             
-            # token_list = list(self.df_futureOptions['Token'])
-            # formatted_token_list = [ "{}|{}".format('NFO', token) for token in token_list ]
+            token_list = list(self.df_futureOptions['Token'])
             
-            # print("Subscribing to live feed for FNO...", formatted_token_list)
+            print(f"Token List Activating Feed: {token_list}")       
+              
+            # exchangeType = 2 is for NFO
             
-            test_formatted_token_list = [
+            formatted_token_list = [
                 {
-                    "exchangeType": 1,
-                    "tokens": ["26009"]
+                    "exchangeType": 2, 
+                    "tokens": token_list
                 }
             ]
-
-            self._angelOneInstance.StartStreamingUsingWebSocket(test_formatted_token_list)
             
-            # self.subscribe_live_feedFNO()
-                
+            greeksPayload = {
+                "name":"NIFTY", 
+                "expirydate":"25SEP2025"
+                }
+
+            self._angelOneInstance.StartStreamingUsingWebSocket(formatted_token_list)
+            self._angelOneInstance.GetGreeksValue(greeksPayload)
+                            
         except Exception as e:
             print(f"Failed to activate market feed: {e}")
             
@@ -107,7 +111,6 @@ class TradingEngine():
             print("Master DataFrame from_dict:", self.df_futureOptions)
             # self.df_futureOptions["expiry"] = pd.to_datetime(self.df_futureOptions["expiry"] , format = "mixed").apply(lambda x: x.date()).split("T")[0]
             
-            # print("Master  expiry:", self.df_futureOptions)
 
             self.df_futureOptions = self.df_futureOptions.astype({"strike": float})
             
@@ -135,16 +138,16 @@ class TradingEngine():
             self.df_futureOptions = self.df_futureOptions[(self.df_futureOptions['expiry'].isin(settings.expiry_list)) ]
             
             print("Final Option Dataframe after Reset Index expiry:", self.df_futureOptions)
+            
+            # Assigning Stock Master DataFrame to class variable df_futureOptions
 
             self.df_futureOptions = self.df_futureOptions[(self.df_futureOptions['strike'] < 3000000) ]
 
             print("Final Option Dataframe after Reset Index strike:", self.df_futureOptions)
-
-
-            # self.df_futureOptions = self.df_futureOptions[ (self.df_futureOptions['Symbol'].str.match('^[^0-9]')) ]
             
-            filteredexpiry = self.df_futureOptions['expiry'].unique()
-            
+            filteredexpiry = self.df_futureOptions['expiry']
+            # filteredexpiry = self.df_futureOptions['expiry'].unique()
+
             print("filteredexpiry: ", filteredexpiry)
 
             
@@ -237,29 +240,12 @@ class TradingEngine():
                     
                     if (body_length <= threshold) and ( (has_upper_wick == True) and ( has_lower_wick == True) ):
                         print(f"Doji Candle Detected: {_token} : {stockname} {_ltp} > {_high}")
-                        # Implement your strategy logic here
+                        # Implement your strategy logic here                     
                         
-                        buy_or_sell='B'
-                        product_type='C'
-                        exchange='NSE'
                         tradingsymbol=stockname # Unique id of contract on which order to be placed. (use url encoding to avoid special char error for symbols like M&M
-                        quantity=75
-                        discloseqty=0
-                        # price_type='MKT', LMT, SL-MKT, SL-LMT
-                        # for stop loss = price_type='SL-LMT'
-                        price_type='LMT'  
                         price= 0.05  # Price in paise, 100.00 is sent as 10000
-                        trigger_price= None
-                        retention= 'DAY'
-                        amo= None  #Flag for After Market Order, YES/NO
-                        remarks= None # client order id or free text
-                        bookloss_price= 0.0
-                        bookprofit_price= 0.0
-                        trial_price= 0.0
                         
-                        self.take_new_entry( buy_or_sell, product_type, exchange, tradingsymbol, quantity, discloseqty, 
-                                            price_type, price, trigger_price, retention, amo, remarks,
-                                            bookloss_price, bookprofit_price, trial_price)
+                        self.take_new_entry(tradingsymbol,_token,price)
                 
             
         except Exception as e:
@@ -382,9 +368,7 @@ class TradingEngine():
         except Exception as e:
             print(f"Failed to start trading: {e}")
             
-    def take_new_entry(self,buy_or_sell, product_type, exchange, tradingsymbol, quantity, discloseqty,
-                       price_type, price, trigger_price, retention, amo, remarks,
-                       bookloss_price, bookprofit_price, trial_price):
+    def take_new_entry(self, tradingsymbol, token, price):
         
         """ Take new entry based on the strategies """
         try:
@@ -392,12 +376,42 @@ class TradingEngine():
             print("Taking new entry...")
             # NSE , 2093, 1, TATATECH,  TATATECH-EQ, EQ, 0.05
             
-            rec_orderid =  self._angelOneInstance.TransmitOrderToBrokerOMS(buy_or_sell,product_type,exchange,
-                                                                          tradingsymbol,quantity,discloseqty,
-                                                                          price_type, price, trigger_price, 
-                                                                          retention, amo, remarks, 
-                                                                          bookloss_price, bookprofit_price,
-                                                                          trial_price)
+            orderparams = {
+                "variety": "NORMAL",
+                "tradingsymbol": tradingsymbol,
+                "symboltoken": token,
+                "transactiontype": "BUY",
+                "exchange": "NFO",
+                "ordertype": "LIMIT",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "price": price,
+                "squareoff": "0",
+                "stoploss": "0",
+                "quantity": "1"
+                }
+            
+            # for STOP LOSS
+            
+            orderparams = {
+                "variety": "STOPLOSS",
+                "tradingsymbol": tradingsymbol,
+                "symboltoken": token,
+                "transactiontype": "BUY",
+                "exchange": "NFO",
+                "ordertype": "STOPLOSS_LIMIT",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "price": price,
+                "squareoff": "0",
+                "stoploss": "0",
+                "quantity": "1",
+                "triggerprice": price + 0.05  # Example trigger price for stop loss
+                }
+            
+            
+            
+            rec_orderid =  self._angelOneInstance.TransmitOrderToBrokerOMS(orderparams)
             
    
            
@@ -469,69 +483,4 @@ class TradingEngine():
             print(f"Failed to load trading strategy: {e}")
             
             
-     # def apply_instruments_filter(self):
-        
-    #     """ Filter other series data and include EQ series cluster and index cluster"""
-    #     print("Applying instruments filter for Cash Master...")
-        
-    #     try:
-    #         if self.df_cash is None:
-    #             raise ValueError("DataFrame is not initialized.")
-                
-            
-    #         if (len(self.df_cash) <= 0):
-    #             raise ValueError("DataFrame is empty.")
-                
-           
-    #         self.df_cash = self.df_cash[ (self.df_cash['Instrument'].isin(settings.instrument_list))]
-            
-            
-            
-    #         self.df_cash = self.df_cash[ (self.df_cash['Symbol'].str.match('^[^0-9]')) ]
-            
-    #         self.df_cash = self.df_cash.reset_index(drop=True)
-    #         print("Filtered Cash Master DataFrame:", self.df_cash)
-
-            
-        # except ValueError as e:
-        #     print(f"Pattern matching failed")
-            
-        # except KeyError as e:
-        #     print(f"coloumn : missing from dataframe")
-            
-        # except Exception as e:
-        #     print(f"Failed to apply instruments filter: {e}")
-            
-    # Subscribe to live feed from cluster dataframe
-            
-    # def subscribe_live_feed(self) -> None:
-        # """ Subscribe to live feed from cluster dataframe (FNO, Cash) """
-        # try:
-        #     if not isinstance(self._angelOneInstance, InterfaceFinvasia.InterfaceFinvasia):
-        #         raise AttributeError("This method should be accesed through an instance of class.")
-                
-        #     if len(self.df_cash) <= 0:
-        #         raise ValueError("Cash master is empty.")
-            
-        #     token_list = list(self.df_cash['Token'])
-        #     formatted_token_list = [ "{}|{}".format('NSE', token) for token in token_list ]
-            
-            #for bulk subscription
-            # self._angelOneInstance.SubscribeTokenToBroker(formatted_token_list)
-            
-            # task_collection =  list(map(self._angelOneInstance.SubscribeTokenToBroker, formatted_token_list))
-            # print(task_collection)
-            # print(list(task_collection))
-        # except Exception as e:
-        #     print(f"Failed to subscribe to live feed for: {e}")
-            
-            
-   
-    
-
-
-
-
-
-
-
+  

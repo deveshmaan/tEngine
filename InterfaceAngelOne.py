@@ -16,16 +16,22 @@ class InterfaceAngelOne:
         self._isConnected = False
         self._isWebSocketConnected = False
         self.__set_up_feed()
+        self.__set_up_greek_feed()
         self.authToken = None
         self.feedToken = None
         self.action = 1
-        self.mode = 1
+        self.mode = 3 # 3 for live data snap quote
         self.tokenList = []
+        self.smartApi = None
         
         
     def __set_up_feed(self):
         feed_col = ['Token', 'TradingSymbol', 'Open', 'High', 'Low', 'Close', 'Ltp', 'Vol', 'Oi']
         self.df_feed = pd.DataFrame(columns=feed_col)
+        
+    def __set_up_greek_feed(self):
+        greek_col = ['TradingSymbol', 'expiry', 'strikePrice', 'optionType', 'delta', 'gamma', 'theta', 'vega', 'impliedVolatility', 'tradeVolume']
+        self.df_greek_feed = pd.DataFrame(columns=greek_col)
         
         
     def login_panel(self):
@@ -44,7 +50,6 @@ class InterfaceAngelOne:
         
         smartApi = SmartConnect(api_key)
         
-        correlation_id = CredentialAngelOne.CORRELATION_ID
         
         data = smartApi.generateSession(username, pwd, totp)
         
@@ -64,6 +69,7 @@ class InterfaceAngelOne:
             refreshToken = data['data']['refreshToken']
             # fetch the feedtoken
             self.feedToken = smartApi.getfeedToken()
+            self.smartApi = smartApi
             # fetch User Profile
             res = smartApi.getProfile(refreshToken)
             smartApi.generateToken(refreshToken)
@@ -127,44 +133,34 @@ class InterfaceAngelOne:
         
     # connection close forcefully - Logout
     
-    def CloseAPI(self): 
-        try:
-            if self.IsConnect() == False:
-                print("Connection already closed.")
-                return
+    # def CloseAPI(self): 
+    #     try:
+    #         if self.IsConnect() == False:
+    #             print("Connection already closed.")
+    #             return
             
-            result = self._shoonyAPi.logout()
-            if result['stat'] == 'Ok':
-                print("Successfully disconnected from Finvasia Broker.")
-            else:
-                print("Failed to disconnect from Finvasia Broker:", result['stat'])
+    #         result = self._shoonyAPi.logout()
+    #         if result['stat'] == 'Ok':
+    #             print("Successfully disconnected from Finvasia Broker.")
+    #         else:
+    #             print("Failed to disconnect from Finvasia Broker:", result['stat'])
             
-        except Exception as e:
-            print(f"Error in CloseAPI: {e}")
+    #     except Exception as e:
+    #         print(f"Error in CloseAPI: {e}")
             
             
-    def TransmitOrderToBrokerOMS(self,buy_or_sell,product_type, 
-                                 exchange,tradingsymbol,quantity,
-                                 discloseqty,price_type, price,
-                                 trigger_price, retention, amo,
-                                 remarks, bookloss_price, bookprofit_price,
-                                 trial_price):
+    def TransmitOrderToBrokerOMS(self, orderparams):
         try:
             print("Sending trade signals to broker OMS...")
             
             
-            order_message = self._shoonyAPi.place_order(buy_or_sell,product_type,exchange,
-                                                        tradingsymbol,quantity,
-                                                        discloseqty,price_type, price,
-                                                        trigger_price, retention, amo,
-                                                        remarks, bookloss_price, bookprofit_price,
-                                                        trial_price)
+            order_message = self.smartApi.placeOrder(orderparams)
             
             print("Order Transmitted to broker:", order_message)
             
-            if order_message["stat"] == "Ok":
+            if order_message["status"] == "true":
                 print("Order transmitted successfully.")
-                return int(order_message["norenordno"])
+                return int(order_message["orderid"])
             else:
                 print("Failed to transmit order")
                 return -1
@@ -180,17 +176,114 @@ class InterfaceAngelOne:
     
     def on_data(self, wsapp, message):
         logger.info("Ticks: {}".format(message))
-        # close_connection()
+        
+        try:
+        
+            ltp = 0
+            open = 0
+            high = 0
+            low = 0
+            close = 0
+            volume = 0
+            Oi = 0
+            
+            token = message['token']
+            
+            
+        # token = int(msg.get("token")) # Ensure token is treated as an integer
+        # ltp = msg.get("last_traded_price")/100
+        # oi = msg.get("open_interest")/75
+        # volume = msg.get("volume_trade_for_the_day")/75
+        # open = msg.get("open_price_of_the_day")/75
+        # high = msg.get("high_price_of_the_day")/100
+        # low = msg.get("low_price_of_the_day")/100
+        # close = msg.get("closed_price")/100
+        # ltp_chg = ltp - close
+            
+            
+            if 'last_traded_price' in message:
+                ltp = float(message['last_traded_price'])
+                
+            if 'volume_trade_for_the_day' in message:
+                volume = float(message['volume_trade_for_the_day'])
+                
+                print(f"Volume: {volume}")
+            
+            if 'open_price_of_the_day' in  message:
+                open = float(message['open_price_of_the_day'])
+                
+            if 'high_price_of_the_day' in message:
+                high = float(message['high_price_of_the_day'])
+                
+            if 'low_price_of_the_day' in message:  
+                low = float(message['low_price_of_the_day'])
+            
+            if 'closed_price' in message:
+                close = float(message['closed_price'])
+                
+            if 'open_interest' in message:
+                Oi = float(message['open_interest'])
+                
+            ltp_chg = ltp - close
+
+                
+            volume = 1
+            
+            if str(token) == str(token):
+                print(message)
+            
+            #insert - If key ( Token ) Absent 
+            # we will get Token key always and trading symbol we will get only on 1st tick
+            
+            if token not in self.df_feed['Token'].values:
+                new_record = { 'Token': token, 
+                                'TradingSymbol': 'NA',
+                                'Open': open, 
+                                'High': high, 
+                                'Low': low, 
+                                'Close': close, 
+                                'Ltp': ltp,  
+                                'Vol': volume,
+                                'Oi': Oi,
+                                }
+            
+                #add new record to df
+                            
+                if ltp > 0: # Sometimes we get invalid token data from broker. This check will prevent adding 0 value to ltp, open etc
+                    self.df_feed.loc[len(self.df_feed)] = new_record
+                
+            else:
+                # Update existing record
+                
+                idx = self.df_feed.index[self.df_feed['Token'] == token]
+                
+                if not idx.empty:
+                    if ltp > 0:
+                        self.df_feed.at[idx[0], 'Ltp'] = ltp
+                        print(self.df_feed.tail(3))  # Print the last 3 row to check if it is updated
+
+                    if open > 0:
+                        self.df_feed.at[idx[0], 'Open'] = ltp
+
+                    if high > 0:
+                        self.df_feed.at[idx[0], 'High'] = open
+                        
+                    if low > 0:
+                        self.df_feed.at[idx[0], 'Low'] = high
+                        
+                    if close > 0:
+                        self.df_feed.at[idx[0], 'Close'] = close
+                
+                    if volume > 0:
+                        self.df_feed.at[idx[0], 'Vol'] = volume
+                
+        except Exception as e: 
+            print(f"Error in _event_handler_quote_update: {e}")
+        
+      
 
     def on_open(self, wsapp):
         print("on open new")
-        
-        # token_list = [
-        #     {
-        #         "exchangeType": 1,
-        #         "tokens": ["26009"]
-        #     }
-        # ]
         
         token_list = self.tokenList
         
@@ -207,114 +300,8 @@ class InterfaceAngelOne:
 
 
 
-    def close_connection():
+    def close_connection(self):
         self.sws.close_connection()
-
-
-    # def _event_handler_order_update(self, message):
-    #     print("order event: " + str(message))
-        
-    
-    # def _event_handler_quote_update(self, message):
-    #     try:
-    #         print("Received quote update from broker------------------------------------------------------")
-    #         print("quote event: " + str(message))
-    #         # OHLC Data
-            
-    #         ltp = 0
-    #         open = 0
-    #         high = 0
-    #         low = 0
-    #         close = 0
-    #         volume = 0
-    #         Oi = 0
-            
-    #         token = message['tk']
-            
-            
-    #         if 'lp' in message:
-    #             ltp = float(message['lp'])
-                
-    #         if 'v' in message:
-    #             volume = float(message['v'])
-                
-    #             print(f"Volume: {volume}")
-            
-    #         if 'O' in  message:
-    #             open = float(message['O'])
-                
-    #         if 'h' in message:
-    #             high = float(message['h'])
-                
-    #         if 'l' in message:  
-    #             low = float(message['l'])
-            
-    #         if 'c' in message:
-    #             close = float(message['c'])
-                
-    #         if 'oi' in message:
-    #             Oi = float(message['oi'])
-                
-    #         volume = 1
-            
-    #         if str(token) == str(token):
-    #             print(message)
-            
-    #         #insert - If key ( Token ) Absent 
-    #         # we will get Token key always and trading symbol we will get only on 1st tick
-            
-    #         if token not in self.df_feed['Token'].values:
-    #             new_record = { 'Token': token, 
-    #                            'TradingSymbol': 'NA',
-    #                            'Open': open, 
-    #                            'High': high, 
-    #                            'Low': low, 
-    #                            'Close': close, 
-    #                            'Ltp': ltp,  
-    #                            'Vol': volume,
-    #                            'Oi': Oi,
-    #                            }
-            
-    #             #add new record to df
-                            
-    #             if ltp > 0: # Sometimes we get invalid token data from broker. This check will prevent adding 0 value to ltp, open etc
-    #                 self.df_feed.loc[len(self.df_feed)] = new_record
-                
-    #         else:
-    #             # Update existing record
-                
-    #             idx = self.df_feed.index[self.df_feed['Token'] == token]
-                
-    #             if not idx.empty:
-    #                 if ltp > 0:
-    #                     self.df_feed.at[idx[0], 'Ltp'] = ltp
-    #                     print(self.df_feed.tail(3))  # Print the last 3 row to check if it is updated
-    
-    #                 if open > 0:
-    #                     self.df_feed.at[idx[0], 'Open'] = ltp
-
-    #                 if high > 0:
-    #                     self.df_feed.at[idx[0], 'High'] = open
-                        
-    #                 if low > 0:
-    #                     self.df_feed.at[idx[0], 'Low'] = high
-                        
-    #                 if close > 0:
-    #                     self.df_feed.at[idx[0], 'Close'] = close
-                
-    #                 if volume > 0:
-    #                     self.df_feed.at[idx[0], 'Vol'] = volume
-            
-    #     except Exception as e: 
-    #         print(f"Error in _event_handler_quote_update: {e}")
-
-
-    # def _open_callback(self):   
-    #     self._ManageWebSocketConnectionOpen() # we have to call this function earlier to know web socket is open or not
-
-
-    # #end of callbacks
-
             
     def StartStreamingUsingWebSocket(self, tokenList) -> None:
         try:
@@ -346,34 +333,11 @@ class InterfaceAngelOne:
 
         except Exception as e:
             print(f"Error starting WebSocket: {e}")
-            
-       # For Dynamic requirement     
-    # def SubscribeTokenToBroker(self, tokenList):
-    #     try:
-    #         if self.IsWebSocketConnectionOpened() == False:
-    #             print("Error !! WebSocket connection failure")
-    #             return #Early return
-            
-    #         if isinstance(tokenList, list):
-    #             #handle this function to List Collection
-    #             print("Bulk subscribe to Broker...")
-    #             self.on_open(tokenList)
-                
-    #     except Exception as e:
-    #         print(f"Error subscribing to token: {e}")
-            
-    # Is web socket connection is open or not Price()
-    
-    def _ManageWebSocketConnectionOpen(self):
-        try:
-            self._isWebSocketConnected = True
-        except Exception as e:
-            print(f"Error checking WebSocket connection: {e}")
-            
+         
     # Allow client(Trading Engine) to know web socket Connected or NOT
 
-    def IsWebSocketConnectionOpened(self):
-        return self._isWebSocketConnected
+    # def IsWebSocketConnectionOpened(self):
+    #     return self._isWebSocketConnected
     
     # Get complete order book from trading venue (Broker)
     
@@ -460,23 +424,127 @@ class InterfaceAngelOne:
         
         
     
-    # def TransmitExitOrderToBrokerOMS(self, order_id):
-    #     try:
-    #         print(f"Exiting order with ID: {order_id}")
-    #         if self.IsConnect() == False:
-    #             print("Connection Failure. Please connect To Broker than use Exit Order Request")
-    #             return None
+    def TransmitExitOrderToBrokerOMS(self, order_id):
+        try:
+            print(f"Exiting order with ID: {order_id}")
+            if self.IsConnect() == False:
+                print("Connection Failure. Please connect To Broker than use Exit Order Request")
+                return None
             
-    #         # Succesfully execute the block
+            # Succesfully execute the block
             
-    #         exit_order = self._shoonyAPi.exit_order(order_id)
+            exitOrderPayload = {
+                "variety":"NORMAL",
+                "orderid":order_id,
+                }
             
-    #         if exit_order == None:
-    #             print("No packet received from broker panel")
-    #             return
+            exit_order = self.smartApi.cancelOrder(exitOrderPayload)
             
-    #         print("Exit Order Response:", exit_order)
+            if exit_order == None:
+                print("No packet received from broker panel")
+                return
             
-    #     except Exception as e:
-    #         print(f"Error Occured while exiting order: {e}")
-    #         return None
+            print("Exit Order Response:", exit_order)
+            
+        except Exception as e:
+            print(f"Error Occured while exiting order: {e}")
+            return None
+        
+        
+    def GetGreeksValue(self, payload) :
+        
+        try: 
+           
+            greeks = self.smartApi.optionGreek(payload)
+            
+            print("Greeks Value:", greeks)
+            
+            if greeks['status'] != "true":
+                print("Failed to get Greeks Value from Broker")
+                return None
+                
+            TradingSymbol = greeks['data']['tradingSymbol']
+            expiry = greeks['data']['expiry']
+            optionType = greeks['data']['optionType']
+            
+            print(f"Greeks Value: {TradingSymbol}, {expiry}, {strikePrice}, {optionType}, {delta}, {gamma}, {theta}, {vega}, {impliedVolatility}, {tradeVolume}")
+            
+            if 'strikePrice' in greeks['data']:
+                strikePrice = float(greeks['data']['strikePrice'])
+                
+            if 'impliedVolatility' in greeks['data']:
+                impliedVolatility = float(greeks['data']['impliedVolatility'])
+                
+            if 'tradeVolume' in greeks['data']:
+                tradeVolume = float(greeks['data']['tradeVolume'])
+            
+            if 'delta' in greeks['data']:
+                delta = float(greeks['data']['delta'])
+                
+            if 'gamma' in greeks['data']:
+                gamma = float(greeks['data']['gamma'])
+            
+            if 'theta' in greeks['data']:
+                theta = float(greeks['data']['theta'])
+            
+            if 'vega' in greeks['data']:
+                vega = float(greeks['data']['vega'])
+                
+            
+                
+           
+           
+            #insert - If key ( Token ) Absent 
+            # we will get Token key always and trading symbol we will get only on 1st tick
+            
+            if TradingSymbol not in self.df_greek_feed['TradingSymbol'].values:
+                new_record = { 'TradingSymbol': TradingSymbol, 
+                                'expiry': expiry,
+                                'strikePrice': strikePrice, 
+                                'optionType': optionType, 
+                                'delta': delta, 
+                                'gamma': gamma, 
+                                'theta': theta, 
+                                'vega': vega,  
+                                'impliedVolatility': impliedVolatility,
+                                'tradeVolume': tradeVolume
+                                }
+            
+                #add new record to Grek dataframe 
+                            
+                self.df_greek_feed.loc[len(self.df_greek_feed)] = new_record
+                
+            else:
+                # Update existing record
+                
+                idx = self.df_greek_feed.index[self.df_greek_feed['TradingSymbol'] == TradingSymbol]
+                
+                if not idx.empty:
+                    if strikePrice > 0:
+                        self.df_greek_feed.at[idx[0], 'strikePrice'] = strikePrice
+
+                    if impliedVolatility > 0:
+                        self.df_greek_feed.at[idx[0], 'impliedVolatility'] = impliedVolatility
+
+                    if tradeVolume > 0:
+                        self.df_greek_feed.at[idx[0], 'tradeVolume'] = tradeVolume
+
+                    if delta > 0:
+                        self.df_greek_feed.at[idx[0], 'delta'] = delta
+
+                    if gamma > 0:
+                        self.df_greek_feed.at[idx[0], 'gamma'] = gamma
+
+                    if theta > 0:
+                        self.df_greek_feed.at[idx[0], 'theta'] = theta
+
+                    if vega > 0:
+                        self.df_greek_feed.at[idx[0], 'vega'] = vega
+        
+            
+        except Exception as e:
+            print(f"Error in GetGreeksValue: {e}")
+            return None
+           
+           
+  
