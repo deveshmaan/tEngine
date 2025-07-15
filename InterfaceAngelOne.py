@@ -11,7 +11,6 @@ from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 class InterfaceAngelOne:
     def __init__(self):
         print("*************** Connecting to AngelOne Broker **************")
-        # self._shoonyAPi = ShoonyaApiPy()
         self.sws = None
         self._isConnected = False
         self._isWebSocketConnected = False
@@ -133,25 +132,25 @@ class InterfaceAngelOne:
         
     # connection close forcefully - Logout
     
-    # def CloseAPI(self): 
-    #     try:
-    #         if self.IsConnect() == False:
-    #             print("Connection already closed.")
-    #             return
+    def CloseAPI(self): 
+        try:
+            if self.IsConnect() == False:
+                print("Connection already closed.")
+                return
             
-    #         result = self._shoonyAPi.logout()
-    #         if result['stat'] == 'Ok':
-    #             print("Successfully disconnected from Finvasia Broker.")
-    #         else:
-    #             print("Failed to disconnect from Finvasia Broker:", result['stat'])
+            # result = self.smartApi.logout()
+            # if result['stat'] == 'Ok':
+            #     print("Successfully disconnected from Finvasia Broker.")
+            # else:
+            #     print("Failed to disconnect from Finvasia Broker:", result['stat'])
             
-    #     except Exception as e:
-    #         print(f"Error in CloseAPI: {e}")
+        except Exception as e:
+            print(f"Error in CloseAPI: {e}")
             
             
     def TransmitOrderToBrokerOMS(self, orderparams):
         try:
-            print("Sending trade signals to broker OMS...")
+            print("Sending trade signals to broker OMS...",orderparams)
             
             
             order_message = self.smartApi.placeOrder(orderparams)
@@ -175,7 +174,7 @@ class InterfaceAngelOne:
     
     
     def on_data(self, wsapp, message):
-        logger.info("Ticks: {}".format(message))
+        print("Ticks: {}".format(message))
         
         try:
         
@@ -286,7 +285,10 @@ class InterfaceAngelOne:
         print("on open new")
         
         token_list = self.tokenList
-        
+
+
+        print("Subscribing to tokens:", token_list)
+                
         self.sws.subscribe(CredentialAngelOne.CORRELATION_ID , self.mode, token_list)
         # sws.unsubscribe(correlation_id, mode, token_list1)
 
@@ -303,11 +305,11 @@ class InterfaceAngelOne:
     def close_connection(self):
         self.sws.close_connection()
             
-    def StartStreamingUsingWebSocket(self, tokenList) -> None:
+    def StartStreamingUsingWebSocket(self, tokenListData) -> None:
         try:
-            print("Task streaming data <Price, Order> from Trading venue...")
+            print("Task streaming data <Price, Order> from Trading venue...", tokenListData)
             # Connection Failed 
-            self.tokenList = tokenList
+            self.tokenList = tokenListData
             
             if self.IsConnect() == False:
                 print("Connection Failure. Please connect To Broker than using streaming function")

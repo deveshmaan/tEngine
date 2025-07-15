@@ -57,7 +57,7 @@ class TradingEngine():
             if len(self.df_futureOptions) <= 0:
                 raise ValueError("future Options is empty.")
             
-            token_list = list(self.df_futureOptions['Token'])
+            token_list = list(self.df_futureOptions['token'])
             
             print(f"Token List Activating Feed: {token_list}")       
               
@@ -205,51 +205,64 @@ class TradingEngine():
         
     def doji_strategy(self):
         try:
-            
+            print("Applying Doji strategy...")
+            tradingsymbol = "NIFTY17JUL2524900CE"
+            _token =  "47269"
+            price = "102.00"
+            self.take_new_entry()
+
             if self._angelOneInstance.IsConnect() == True:
+                
+                print("Doji strategy is applied...",self._angelOneInstance.df_feed)
+                
+                tradingsymbol = "NIFTY17JUL2524900CE",
+                _token =  "47269",
+                price = "102.00"
+                self.take_new_entry(tradingsymbol,_token,price)
+
             
             # Df_feed - Record + Validate
             # Token , TradingSymbol, Ltp, High, Low, close, Volume, Open
             
-                for idx, row in self._angelOneInstance.df_feed.iterrows():
+                # for idx, row in self._angelOneInstance.df_feed.iterrows():
                     
-                    # LTP > High -> Conditional Strategy 1
-                    _ltp = row['Ltp']
+                #     # LTP > High -> Conditional Strategy 1
+                #     _ltp = row['Ltp']
                     
-                    if _ltp <= 0.0:
-                        continue
+                #     if _ltp <= 0.0:
+                #         continue
                     
-                    _high = row['High']
-                    _low = row['Low']
-                    _token = row['Token']
-                    stockname = row['TradingSymbol']
+                #     _high = row['High']
+                #     _low = row['Low']
+                #     _token = row['Token']
+                #     stockname = row['TradingSymbol']
                     
-                    openInterest = row['TradingSymbol']
+                #     openInterest = row['TradingSymbol']
                     
-                    if (_high - _low) <= 0.0:
-                        continue
+                #     if (_high - _low) <= 0.0:
+                #         continue
                     
-                    _open = row['Open']
-                    _close = row['Close']
+                #     _open = row['Open']
+                #     _close = row['Close']
                     
-                    body_length = abs(_open - _close)
-                    threshold = 5
+                #     body_length = abs(_open - _close)
+                #     threshold = 5
                     
-                    has_upper_wick = _high > max(_open, _close)
-                    has_lower_wick = _low < min(_open, _close)
+                #     has_upper_wick = _high > max(_open, _close)
+                #     has_lower_wick = _low < min(_open, _close)
                     
-                    if (body_length <= threshold) and ( (has_upper_wick == True) and ( has_lower_wick == True) ):
-                        print(f"Doji Candle Detected: {_token} : {stockname} {_ltp} > {_high}")
-                        # Implement your strategy logic here                     
+                #     if (body_length <= threshold) and ( (has_upper_wick == True) and ( has_lower_wick == True) ):
+                #         print(f"Doji Candle Detected: {_token} : {stockname} {_ltp} > {_high}")
+                #         # Implement your strategy logic here                     
                         
-                        tradingsymbol=stockname # Unique id of contract on which order to be placed. (use url encoding to avoid special char error for symbols like M&M
-                        price= 0.05  # Price in paise, 100.00 is sent as 10000
+                #         tradingsymbol=stockname # Unique id of contract on which order to be placed. (use url encoding to avoid special char error for symbols like M&M
+                #         price= 0.05  # Price in paise, 100.00 is sent as 10000
                         
-                        self.take_new_entry(tradingsymbol,_token,price)
+                #         # self.take_new_entry(tradingsymbol,_token,price)
                 
             
         except Exception as e:
-            print(f"Failed to apply conditional strategy: {e}")
+            print(f"Failed to apply doji strategy: {e}")
             
      
     # Hammer Bullish standard candle pattern strategy      
@@ -368,7 +381,7 @@ class TradingEngine():
         except Exception as e:
             print(f"Failed to start trading: {e}")
             
-    def take_new_entry(self, tradingsymbol, token, price):
+    def take_new_entry(self):
         
         """ Take new entry based on the strategies """
         try:
@@ -376,38 +389,52 @@ class TradingEngine():
             print("Taking new entry...")
             # NSE , 2093, 1, TATATECH,  TATATECH-EQ, EQ, 0.05
             
+            # orderparams = {
+            #     "variety": "NORMAL",
+            #     "tradingsymbol": "NIFTY17JUL2524900CE",
+            #     "symboltoken": "47269",
+            #     "exchange": "NFO",
+            #     "ordertype": "LIMIT",
+            #     "producttype": "INTRADAY",
+            #     "duration": "DAY",
+            #     "price": "102.00",
+            #     "squareoff": "0",
+            #     "stoploss": "0",
+            #     "quantity": "1"
+            # }
+            
             orderparams = {
-                "variety": "NORMAL",
-                "tradingsymbol": tradingsymbol,
-                "symboltoken": token,
-                "transactiontype": "BUY",
-                "exchange": "NFO",
-                "ordertype": "LIMIT",
-                "producttype": "INTRADAY",
-                "duration": "DAY",
-                "price": price,
-                "squareoff": "0",
-                "stoploss": "0",
-                "quantity": "1"
+                "variety":"NORMAL",
+                "tradingsymbol":"NIFTY17JUL2524900CE",
+                "symboltoken":"47269",
+                "transactiontype":"BUY",
+                "exchange":"NFO",
+                "ordertype":"MARKET",
+                "producttype":"INTRADAY",
+                "duration":"DAY",
+                "price":"105.50",
+                "squareoff":"0",
+                "stoploss":"0",
+                "quantity":"75"
                 }
             
             # for STOP LOSS
             
-            orderparams = {
-                "variety": "STOPLOSS",
-                "tradingsymbol": tradingsymbol,
-                "symboltoken": token,
-                "transactiontype": "BUY",
-                "exchange": "NFO",
-                "ordertype": "STOPLOSS_LIMIT",
-                "producttype": "INTRADAY",
-                "duration": "DAY",
-                "price": price,
-                "squareoff": "0",
-                "stoploss": "0",
-                "quantity": "1",
-                "triggerprice": price + 0.05  # Example trigger price for stop loss
-                }
+            # orderparams = {
+            #     "variety": "STOPLOSS",
+            #     "tradingsymbol": tradingsymbol,
+            #     "symboltoken": token,
+            #     "transactiontype": "BUY",
+            #     "exchange": "NFO",
+            #     "ordertype": "STOPLOSS_LIMIT",
+            #     "producttype": "INTRADAY",
+            #     "duration": "DAY",
+            #     "price": price,
+            #     "squareoff": "0",
+            #     "stoploss": "0",
+            #     "quantity": "1",
+            #     "triggerprice": price + 0.05  # Example trigger price for stop loss
+            #     }
             
             
             

@@ -1,4 +1,4 @@
 instrument_list = ['OPTIDX'] # this will be index option instrument type
 futureOption_list = ['NIFTY'] # this will be index name NIFTY, BANKNIFTY
 option_list = ['CE', 'PE']
-expiry_list = ['25SEP2025']
+expiry_list = ['17JUL2025']
