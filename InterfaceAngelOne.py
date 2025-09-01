@@ -25,7 +25,7 @@ class InterfaceAngelOne:
         
         
     def __set_up_feed(self):
-        feed_col = ['Token', 'TradingSymbol', 'Open', 'High', 'Low', 'Close', 'Ltp', 'Vol', 'Oi']
+        feed_col = ['Token','Open', 'High', 'Low', 'Close', 'Ltp', 'Vol', 'Oi']
         self.df_feed = pd.DataFrame(columns=feed_col)
         
     def __set_up_greek_feed(self):
@@ -101,6 +101,8 @@ class InterfaceAngelOne:
     def _successfully_connected(self):
         try:
             self._isConnected = True
+            ## Now we are connected to broker and cursor goes to Trading engine module handler.StartEngine()
+
         except Exception as e:
             print(f"Error in _successfully_connected: {e}")
             
@@ -236,7 +238,7 @@ class InterfaceAngelOne:
             
             if token not in self.df_feed['Token'].values:
                 new_record = { 'Token': token, 
-                                'TradingSymbol': 'NA',
+                                # 'TradingSymbol': 'NA',
                                 'Open': open, 
                                 'High': high, 
                                 'Low': low, 
@@ -247,6 +249,8 @@ class InterfaceAngelOne:
                                 }
             
                 #add new record to df
+
+                ## TODO: Add breakpoint here to check if new record is added correctly
                             
                 if ltp > 0: # Sometimes we get invalid token data from broker. This check will prevent adding 0 value to ltp, open etc
                     self.df_feed.loc[len(self.df_feed)] = new_record

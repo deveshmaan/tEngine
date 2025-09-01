@@ -1,3 +1,5 @@
 CredentialTo
-envt
-logs
+envt/
+logs/
+__pycache__
+SmartApi/

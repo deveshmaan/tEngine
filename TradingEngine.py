@@ -171,14 +171,15 @@ class TradingEngine():
             count += 1
             
             self.start_trading()
-                        
-        
-    # Conditional to filter out stocks, Index, etc
+            
+            
+       # Conditional to filter out stocks, Index, etc
     
     def conditional_strategy(self):
         try:
             
             if self._angelOneInstance.IsConnect() == True:
+                
             
             # Df_feed - Record + Validate
                 for idx, row in self._angelOneInstance.df_feed.iterrows():
@@ -191,228 +192,54 @@ class TradingEngine():
                     
                     _high = row['High']
                     _token = row['Token']
-                    stockname = row['TradingSymbol']
                     
-                    if _ltp > _high:
-                        print(f"Stocks under SC1:  {_token} : {stockname} {_ltp} > {_high}")
-                        # Implement your strategy logic here
+                    # if _ltp > _high:
+                    #     print(f"Stocks under SC1:  {_token} :  {_ltp} > {_high}")
+                    self.take_new_entry(_token,_ltp)
             
         except Exception as e:
             print(f"Failed to apply conditional strategy: {e}")
-            
-            
-        # Doji standard candle strategy
-        
-    def doji_strategy(self):
-        try:
-            print("Applying Doji strategy...")
-            tradingsymbol = "NIFTY17JUL2524900CE"
-            _token =  "47269"
-            price = "102.00"
-            self.take_new_entry()
-
-            if self._angelOneInstance.IsConnect() == True:
-                
-                print("Doji strategy is applied...",self._angelOneInstance.df_feed)
-                
-                tradingsymbol = "NIFTY17JUL2524900CE",
-                _token =  "47269",
-                price = "102.00"
-                self.take_new_entry(tradingsymbol,_token,price)
-
-            
-            # Df_feed - Record + Validate
-            # Token , TradingSymbol, Ltp, High, Low, close, Volume, Open
-            
-                # for idx, row in self._angelOneInstance.df_feed.iterrows():
-                    
-                #     # LTP > High -> Conditional Strategy 1
-                #     _ltp = row['Ltp']
-                    
-                #     if _ltp <= 0.0:
-                #         continue
-                    
-                #     _high = row['High']
-                #     _low = row['Low']
-                #     _token = row['Token']
-                #     stockname = row['TradingSymbol']
-                    
-                #     openInterest = row['TradingSymbol']
-                    
-                #     if (_high - _low) <= 0.0:
-                #         continue
-                    
-                #     _open = row['Open']
-                #     _close = row['Close']
-                    
-                #     body_length = abs(_open - _close)
-                #     threshold = 5
-                    
-                #     has_upper_wick = _high > max(_open, _close)
-                #     has_lower_wick = _low < min(_open, _close)
-                    
-                #     if (body_length <= threshold) and ( (has_upper_wick == True) and ( has_lower_wick == True) ):
-                #         print(f"Doji Candle Detected: {_token} : {stockname} {_ltp} > {_high}")
-                #         # Implement your strategy logic here                     
                         
-                #         tradingsymbol=stockname # Unique id of contract on which order to be placed. (use url encoding to avoid special char error for symbols like M&M
-                #         price= 0.05  # Price in paise, 100.00 is sent as 10000
-                        
-                #         # self.take_new_entry(tradingsymbol,_token,price)
-                
-            
-        except Exception as e:
-            print(f"Failed to apply doji strategy: {e}")
-            
-     
-    # Hammer Bullish standard candle pattern strategy      
-      
-    def conditional_strategy3(self):
-        
-        """ Hammer candle Pattern """
-        try:
-            
-            if self._angelOneInstance.IsConnect() == True:
-            
-            # Df_feed - Record + Validate
-            # Token , TradingSymbol, Ltp, High, Low, close, Volume, Open
-            
-                for idx, row in self._angelOneInstance.df_feed.iterrows():
-                    
-                    print(f"Classify hammer ( Bullish ) candle pattern...")
-                    
-                    # LTP > High -> Conditional Strategy 1
-                    _ltp = row['Ltp']
-                    
-                    if _ltp <= 0.0:
-                        continue
-                    
-                    _high = row['High']
-                    _low = row['Low']
-                    _token = row['Token']
-                    stockname = row['TradingSymbol']
-                    
-                    if (_high - _low) <= 0.0:
-                        continue
-                    
-                    _open = row['Open']
-                    _close = row['Close']
-                    stockname = row['TradingSymbol']
-                    
-                    body_length = abs(_open - _close)
-                    threshold = 5
-                    
-                    lower_wick = min(_open, _close) - _low
-                    has_large_lower_wick = lower_wick > (2 * body_length)
-                    
-                    upper_wick = abs(_high - max(_open, _close))
-                    has_upper_wick_in_range = upper_wick < (0.5 * body_length)
-                    
-                    
-                    if ( body_length <= threshold) and (has_upper_wick_in_range == True) and (has_large_lower_wick == True):
-                        print(f"Stocks under Hammer Candle pattern: {_token} : {stockname} {_ltp} > {_high}")
-                        # Implement your strategy logic here
-                
-            
-        except Exception as e:
-            print(f"Failed to apply conditional strategy: {e}")
-            
-            
-    # Shooting star bearish reversal candle pattern strategy        
-    def conditional_strategy4(self):
-        """ Shooting star Bearish reversal candle Pattern """
-        
-        try:
-            if self._angelOneInstance.IsConnect() == True:
-            
-            # Df_feed - Record + Validate
-            # Token , TradingSymbol, Ltp, High, Low, close, Volume, Open
-            
-                for idx, row in self._angelOneInstance.df_feed.iterrows():
-                    
-                    print(f"Classify Shooting Star ( Bearish ) candle pattern...")
-                    
-                    # LTP > High -> Conditional Strategy 1
-                    _ltp = row['Ltp']
-                    
-                    if _ltp <= 0.0:
-                        continue
-                    
-                    _high = row['High']
-                    _low = row['Low']
-                    _token = row['Token']
-                    stockname = row['TradingSymbol']
-                    
-                    if (_high - _low) <= 0.0:
-                        continue
-                    
-                    _open = row['Open']
-                    _close = row['Close']
-                    stockname = row['TradingSymbol']
-                    
-                    body_length = abs(_open - _close)
-                    threshold = 5
-                    
-                    upper_wick = _high - max(_open, _close)
-                    has_upper_wick_in_range = upper_wick >= (2 * body_length)
-                    
-                    lower_wick = min(_open, _close) - _low
-                    has_larger_lower_wick = lower_wick < (0.1 * body_length)
-                    
-                    
-                    if ( body_length <= threshold) and (has_upper_wick_in_range == True) and (has_larger_lower_wick == True):
-                        print(f"Stocks under Shooting Star Candle pattern: {_token} : {stockname} {_ltp} > {_high}")
-                        # Take new entry
-                        
-        except Exception as e:
-            print(f"Failed to apply conditional4 strategy: {e}")
-            
+          
     def start_trading(self):
         """ Start trading based on the strategies """
         try:
             print("Starting trading...")
             # Implement your trading logic here
-            
-            # self.conditional_strategy()
-            self.doji_strategy()
-            # self.conditional_strategy3()
-            # self.conditional_strategy4()
+    
+            self.conditional_strategy()
+     
             
         except Exception as e:
             print(f"Failed to start trading: {e}")
             
-    def take_new_entry(self):
+    def take_new_entry(self, token, price):
         
         """ Take new entry based on the strategies """
         try:
             
-            print("Taking new entry...")
-            # NSE , 2093, 1, TATATECH,  TATATECH-EQ, EQ, 0.05
+            TradingSymbol = ""
+            Token = token   # token from df_feed data ( websocket streaming data)
             
-            # orderparams = {
-            #     "variety": "NORMAL",
-            #     "tradingsymbol": "NIFTY17JUL2524900CE",
-            #     "symboltoken": "47269",
-            #     "exchange": "NFO",
-            #     "ordertype": "LIMIT",
-            #     "producttype": "INTRADAY",
-            #     "duration": "DAY",
-            #     "price": "102.00",
-            #     "squareoff": "0",
-            #     "stoploss": "0",
-            #     "quantity": "1"
-            # }
+            for idx, row in self.df_futureOptions.iterrows():
+                masterDataToken = row['token']
+                
+                if masterDataToken == Token:
+                    TradingSymbol = row['symbol']
+
+            
+            print("-------------------------------------------------- Taking new entry ------------------------- ", TradingSymbol)
             
             orderparams = {
                 "variety":"NORMAL",
-                "tradingsymbol":"NIFTY17JUL2524900CE",
-                "symboltoken":"47269",
+                "tradingsymbol":TradingSymbol,
+                "symboltoken":token,
                 "transactiontype":"BUY",
                 "exchange":"NFO",
                 "ordertype":"MARKET",
                 "producttype":"INTRADAY",
                 "duration":"DAY",
-                "price":"105.50",
+                "price":price,
                 "squareoff":"0",
                 "stoploss":"0",
                 "quantity":"75"
