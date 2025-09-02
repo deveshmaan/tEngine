@@ -2,4 +2,5 @@ CredentialTo
 envt/
 logs/
 __pycache__
-SmartApi/
+.conda
+.DS_Store
