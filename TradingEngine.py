@@ -10,7 +10,7 @@ from datetime import date
 
 class TradingEngine():
     
-    def __init__(self):
+    def __init__(self, angelOneInstance=None):
         print("Welcome to Trading Engine...")  
         self._angelOneInstance = InterfaceAngelOne.InterfaceAngelOne()
         # self.df_cash = pd.DataFrame()
@@ -76,7 +76,7 @@ class TradingEngine():
                 }
 
             self._angelOneInstance.StartStreamingUsingWebSocket(formatted_token_list)
-            self._angelOneInstance.GetGreeksValue(greeksPayload)
+            # self._angelOneInstance.GetGreeksValue(greeksPayload)
                             
         except Exception as e:
             print(f"Failed to activate market feed: {e}")
@@ -171,6 +171,7 @@ class TradingEngine():
             count += 1
             
             self.start_trading()
+            pass
             
             
        # Conditional to filter out stocks, Index, etc
@@ -178,9 +179,11 @@ class TradingEngine():
     def conditional_strategy(self):
         try:
             
+            print("Applying conditional strategy...self._angelOneInstance.IsConnect()",self._angelOneInstance.IsConnect())
+            
             if self._angelOneInstance.IsConnect() == True:
                 
-            
+                print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^Applying conditional strategy...")
             # Df_feed - Record + Validate
                 for idx, row in self._angelOneInstance.df_feed.iterrows():
                     
@@ -193,9 +196,9 @@ class TradingEngine():
                     _high = row['High']
                     _token = row['Token']
                     
-                    # if _ltp > _high:
-                    #     print(f"Stocks under SC1:  {_token} :  {_ltp} > {_high}")
-                    self.take_new_entry(_token,_ltp)
+                    if _ltp > _high:
+                        print(f"Stocks under SC1:  {_token} :  {_ltp} > {_high}")
+                        self.take_new_entry(_token,_ltp)
             
         except Exception as e:
             print(f"Failed to apply conditional strategy: {e}")
@@ -229,7 +232,8 @@ class TradingEngine():
 
             
             print("-------------------------------------------------- Taking new entry ------------------------- ", TradingSymbol)
-            
+            print("-------------------------------------------------- Taking new entry ------------------------- ", price)
+
             orderparams = {
                 "variety":"NORMAL",
                 "tradingsymbol":TradingSymbol,
@@ -245,6 +249,8 @@ class TradingEngine():
                 "quantity":"75"
                 }
             
+            print("-------------------------------------------------- ORDER PARAMS ------------------------- ", orderparams)
+
             # for STOP LOSS
             
             # orderparams = {

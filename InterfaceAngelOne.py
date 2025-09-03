@@ -6,7 +6,9 @@ import datetime
 import time
 import pandas as pd
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-
+import threading
+import TradingEngine as te
+ 
 
 class InterfaceAngelOne:
     def __init__(self):
@@ -22,6 +24,7 @@ class InterfaceAngelOne:
         self.mode = 3 # 3 for live data snap quote
         self.tokenList = []
         self.smartApi = None
+
         
         
     def __set_up_feed(self):
@@ -249,11 +252,10 @@ class InterfaceAngelOne:
                                 }
             
                 #add new record to df
-
-                ## TODO: Add breakpoint here to check if new record is added correctly
                             
                 if ltp > 0: # Sometimes we get invalid token data from broker. This check will prevent adding 0 value to ltp, open etc
                     self.df_feed.loc[len(self.df_feed)] = new_record
+                    print(self.df_feed.tail(3))  # Print the last 3 row to check if it is added
                 
             else:
                 # Update existing record
@@ -331,14 +333,29 @@ class InterfaceAngelOne:
             self.sws.on_data = self.on_data
             self.sws.on_error = self.on_error
             self.sws.on_close = self.on_close
+            
+            
+            def run_ws():
+                self.sws.connect()
 
-            self.sws.connect()
+            # Run WebSocket in background thread
+            ws_thread = threading.Thread(target=run_ws, daemon=True)
+            ws_thread.start()
 
-            time.sleep(5)  # Allow some time for the WebSocket to establish connection
+            # self.sws.connect(threaded=True)
+            
+            # handler = te.TradingEngine()
+
+            # # ✅ Start trading logic in a separate thread
+            # t = threading.Thread(target=handler.start, daemon=True)
+            # handler.start()
+            # self.tradingEngineInstance.start()
             print("Streaming request completed")
 
         except Exception as e:
             print(f"Error starting WebSocket: {e}")
+            
+    
          
     # Allow client(Trading Engine) to know web socket Connected or NOT
 

@@ -1,6 +1,6 @@
 CredentialTo
 envt/
 logs/
-__pycache__
+__pycache__/
 .conda
 .DS_Store
