@@ -1,3 +1,4 @@
+from CredentialTo.CredentialToBrokerAPI import CredentialAngelOne
 import InterfaceAngelOne
 import Utility.SystemCol as cl
 import settings
@@ -5,6 +6,10 @@ import pandas as pd
 import StrategyEngine.TradingStrategy as ts
 import requests
 from datetime import date
+from pandasai import SmartDataframe
+import openai
+from langchain_openai import ChatOpenAI
+import os
 
 
 
@@ -184,6 +189,22 @@ class TradingEngine():
             if self._angelOneInstance.IsConnect() == True:
                 
                 print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^Applying conditional strategy...")
+                
+                os.environ["OPENAI_API_KEY"] = "your_api_key_here"
+            
+                # # Connect with OpenAI
+                
+                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+                
+                df = SmartDataframe(
+                    self._angelOneInstance.df_feed,
+                    config={
+                        "llm": llm
+                    }
+                )
+                            
+                # df = SmartDataframe(self._angelOneInstance.df_feed, config={"llm": openai.OpenAI(model=MODEL_NAME, temperature=0, max_tokens=500)})
+                print(df.chat("Analyze the dataframe and provide insights."))
             # Df_feed - Record + Validate
                 for idx, row in self._angelOneInstance.df_feed.iterrows():
                     
