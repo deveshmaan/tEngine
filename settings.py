@@ -7,7 +7,7 @@ instrument_list = ['OPTIDX'] # this will be index option instrument type
 
 
 instrument_list_upstox = ['INDEX']
-expiry_list_upstox = ['2025-09-09'] # format: YYYY-MM-DD
+expiry_list_upstox = ['2025-09-16'] # format: YYYY-MM-DD
 segment = ['NSE_FO'] # NSE_FO for Futures and Options
 
 
