@@ -4,3 +4,4 @@ logs/
 __pycache__/
 .conda
 .DS_Store
+.env
