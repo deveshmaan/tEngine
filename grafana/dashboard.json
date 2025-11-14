@@ -1,0 +1,180 @@
+{
+  "title": "Intraday BUY Engine",
+  "timezone": "browser",
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "PnL (₹)",
+      "id": 1,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROM_DS__"
+      },
+      "targets": [
+        {
+          "expr": "pnl_net_rupees",
+          "legendFormat": "PnL",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Risk State",
+      "id": 2,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROM_DS__"
+      },
+      "targets": [
+        {
+          "expr": "risk_halt_state",
+          "legendFormat": "halted",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ACTIVE"
+                },
+                "1": {
+                  "text": "HALTED"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Orders vs Fills",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROM_DS__"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(orders_submitted_total[5m]))",
+          "legendFormat": "submitted",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(orders_filled_total[5m]))",
+          "legendFormat": "filled",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rejected Orders",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROM_DS__"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(orders_rejected_total[5m])) by (reason)",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency p95",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROM_DS__"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(order_latency_ms_bucketed_bucket[5m])) by (le))",
+          "legendFormat": "p95 latency",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Per-instrument LTP",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROM_DS__"
+      },
+      "targets": [
+        {
+          "expr": "ltp_underlying",
+          "legendFormat": "{{instrument}}",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "expr": "option_iv",
+          "legendFormat": "{{instrument}} IV",
+          "refId": "B",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "expr": "option_iv_zscore",
+          "legendFormat": "{{instrument}} IV z",
+          "refId": "C",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
+    }
+  ],
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "5s"
+}
