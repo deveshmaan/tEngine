@@ -85,13 +85,19 @@ while True:
             inst = _label_value(k, "instrument")
             if not inst:
                 continue
+            symbol = None
+            for sym_key in m.keys():
+                if sym_key.startswith("instrument_trading_symbol{") and inst in sym_key:
+                    symbol = sym_key.split('symbol="')[1].split('"')[0]
+
             rows.append({
                 "instrument": inst,
+                "symbol": symbol,
                 "ltp": v,
                 "iv": m.get(f'option_iv{{instrument="{inst}"}}', float("nan")),
                 "iv_z": m.get(f'option_iv_zscore{{instrument="{inst}"}}', float("nan")),
             })
-        df = pd.DataFrame(rows).sort_values("instrument") if rows else pd.DataFrame(columns=["instrument","ltp","iv","iv_z"])
+        df = pd.DataFrame(rows).sort_values("instrument") if rows else pd.DataFrame(columns=["instrument","symbol","ltp","iv","iv_z"])
         st.subheader("Per-instrument snapshot")
         st.dataframe(df, use_container_width=True)
 

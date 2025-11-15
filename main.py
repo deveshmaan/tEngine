@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # %% [markdown]
 # # Upstox Intraday BUY Options Trading Engine (Refined)
 #
@@ -37,6 +39,7 @@
 # The engine writes lightweight state to `./engine_state.sqlite` and keeps cache files under `./cache`. Adjust the directories below if needed.
 
 # %%
+import argparse
 import os
 import sys
 import time
@@ -44,6 +47,8 @@ import math
 import json
 import gzip
 import io
+import csv
+import random
 import queue
 import sqlite3
 import threading
@@ -60,10 +65,11 @@ import requests
 from engine_metrics import EngineMetrics, NULL_METRICS
 
 try:
-    import upstox_client
-    from upstox_client.rest import ApiException
-except ImportError as exc:  # pragma: no cover
-    raise ImportError("Install the official Upstox SDK via `pip install upstox-python-sdk`.") from exc
+    import upstox_client  # type: ignore
+    from upstox_client.rest import ApiException  # type: ignore
+except ImportError:  # pragma: no cover
+    upstox_client = None  # type: ignore
+    ApiException = Exception  # type: ignore
 
 pd.options.display.max_rows = 200
 pd.options.display.width = 140
@@ -96,7 +102,7 @@ class RiskConfig:
     stop_pct: float = float(os.getenv("EXIT_STOP_PCT_BUY", 0.035))
     daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT_R", 3000))
     daily_profit_cap: float = float(os.getenv("DAILY_PROFIT_CAP_R", 6000))
-    square_off_hhmm: str = os.getenv("SQUARE_OFF_HHMM", "15:20")
+    square_off_hhmm: str = os.getenv("SQUARE_OFF_HHMM", "16:20")
     entry_cutoff_hhmm: str = os.getenv("ENTRY_CUTOFF_HHMM", "15:00")
 
 @dataclass
@@ -168,6 +174,8 @@ class UpstoxSession:
         self.charge_api: Optional[upstox_client.ChargeApi] = None
 
     def connect(self):
+        if upstox_client is None:
+            raise ImportError("Install the official Upstox SDK via `pip install upstox-python-sdk` to use live connectivity.")
         token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTE2OTM4NzNmNWNhODRkMDdjMzkzNDAiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzMDg3MjM5LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjMxNTc2MDB9._iEdxQbD2nU4rkPN72Be66dJ3bimMm-eFkB5JYRqy9I").strip()
         if not token:
             raise RuntimeError("UPSTOX_ACCESS_TOKEN not set. Complete OAuth flow and export the token.")
@@ -226,17 +234,27 @@ def _normalize_master_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_instrument_master(cache_path: Path, ttl_hours: int) -> pd.DataFrame:
     if cache_path.exists():
+        if ttl_hours <= 0:
+            with gzip.open(cache_path, "rt") as fp:
+                return _normalize_master_columns(pd.read_json(fp))
         age_h = (time.time() - cache_path.stat().st_mtime) / 3600
         if age_h <= ttl_hours:
             with gzip.open(cache_path, "rt") as fp:
                 return _normalize_master_columns(pd.read_json(fp))
-    resp = requests.get(MASTER_URL, timeout=30)
-    resp.raise_for_status()
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "wb") as fh:
-        fh.write(resp.content)
-    with gzip.open(io.BytesIO(resp.content), "rt") as fp:
-        return _normalize_master_columns(pd.read_json(fp))
+    try:
+        resp = requests.get(MASTER_URL, timeout=30)
+        resp.raise_for_status()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as fh:
+            fh.write(resp.content)
+        with gzip.open(io.BytesIO(resp.content), "rt") as fp:
+            return _normalize_master_columns(pd.read_json(fp))
+    except Exception as exc:
+        if cache_path.exists():
+            print(f"[WARN] Unable to refresh instrument master ({exc}); using cached copy at {cache_path}.")
+            with gzip.open(cache_path, "rt") as fp:
+                return _normalize_master_columns(pd.read_json(fp))
+        raise
 
 def option_chain(df: pd.DataFrame, underlying: str, window: int) -> pd.DataFrame:
     u = underlying.upper()
@@ -439,9 +457,12 @@ class MarketDataHub:
             self.health[key] = self._validate_tick(state)
             health_state = self.health.get(key, "unknown")
             iv_z = self.iv_zscore(key)
+            trading_symbol = self.chain_df.loc[self.chain_df["instrument_key"] == key, "trading_symbol"]
+            symbol_val = trading_symbol.iloc[0] if not trading_symbol.empty else None
             if key != self.index_key:
                 self.metrics.update_market(
                     instrument=key,
+                    trading_symbol=symbol_val,
                     ltp=ltp if np.isfinite(ltp) else None,
                     iv=state.iv if isinstance(state.iv, float) else None,
                     iv_z=iv_z if np.isfinite(iv_z) else None,
@@ -560,9 +581,10 @@ class SignalEngine:
             return []
         spot = self.update_spot()
         trend = self.spot_state.slope()
-        if abs(trend) < self.cfg.strategy.spot_momentum_min:
+        min_trend = self.cfg.strategy.spot_momentum_min
+        if min_trend > 0 and abs(trend) < min_trend:
             return []
-        side_filter = "CE" if trend > 0 else "PE"
+        side_filter = "CE" if (trend > 0 or min_trend <= 0) else "PE"
         eligible = snapshot.copy()
         eligible = eligible[eligible.option_type.str.upper().eq(side_filter)]
         eligible = eligible[eligible.health.eq("ok")]
@@ -736,6 +758,8 @@ class OrderManager:
             latency_ms = (time.perf_counter() - start) * 1000.0
             self.metrics.order_submitted(plan.instrument_key, latency_ms)
             return "SIM-ORDER"
+        if upstox_client is None:
+            raise RuntimeError("Live order placement requires `pip install upstox-python-sdk`.")
         price = self._pegged_price(plan.instrument_key, plan.entry_price) if self.cfg.strategy.execution_style == "pegged" else 0.0
         body = upstox_client.PlaceOrderV3Request(
             quantity=int(plan.qty),
@@ -827,15 +851,21 @@ class TradingEngine:
         self.risk = RiskManager(cfg, self.ledger, metrics=self.metrics)
         self.portfolio: Optional[PortfolioWatcher] = None
 
-    def bootstrap(self):
-        self.session.connect()
+    def bootstrap(self, *, connect_live: bool = True, start_streams: bool = True):
+        if connect_live:
+            self.session.connect()
+        else:
+            print("[BOOT] Replay-only mode: skipping Upstox session connect.")
         self.market = MarketDataHub(self.session, self.cfg, CHAIN_DF, metrics=self.metrics)
         self.signals = SignalEngine(self.cfg, self.market, metrics=self.metrics)
         self.order_mgr = OrderManager(self.session, self.cfg, self.market, self.risk, metrics=self.metrics)
         self.portfolio = PortfolioWatcher(self.session, self.risk)
-        self.market.start()
-        self.portfolio.start()
-        print("Engine bootstrap complete.")
+        if connect_live and start_streams:
+            self.market.start()
+            self.portfolio.start()
+            print("Engine bootstrap complete (live streams running).")
+        else:
+            print("Engine bootstrap complete (use ReplayStreamer to feed data).")
 
     def run(self, runtime_minutes: float = 60):
         if not all([self.market, self.signals, self.order_mgr]):
@@ -882,14 +912,21 @@ def show_day_pnl(ledger: PnLLedger):
 # %% [markdown]
 # ## 11. Execution Instructions
 #
-# ```python
-# # 1. Bootstrap (after tokens and configs are set)
+# Keep the notebook instructions as documentation so this module does not
+# accidentally re-import itself (which was causing EngineMetrics to bind twice).
+EXECUTION_INSTRUCTIONS = """
+```python
+# 1. Bootstrap (after tokens and configs are set)
+from main import ReplayStreamer, ENGINE
 ENGINE.bootstrap()
-ENGINE.run(runtime_minutes=90)  # or longer
+ReplayStreamer("sample_ticks.csv", speed=2.0).start()
+ENGINE.run(runtime_minutes=10)
+
+# ENGINE.bootstrap()
+# ENGINE.run(runtime_minutes=90)  # or longer
 
 
-#
-# # 2. Inspect market health before arming the loop
+# 2. Inspect market health before arming the loop
 while True:
     snap = ENGINE.market.snapshot()
     if not snap.empty:
@@ -898,10 +935,10 @@ while True:
     time.sleep(1)
 # show_live_snapshot(ENGINE.market)
 #
-# # 3. Run the engine during market hours (paper trade first)
+# 3. Run the engine during market hours (paper trade first)
 # ENGINE.run(runtime_minutes=90)
 #
-# # 4. Monitor risk & PnL
+# 4. Monitor risk & PnL
 show_positions(ENGINE.risk)
 show_day_pnl(ENGINE.order_mgr.risk.ledger if ENGINE.order_mgr else LEDGER)
 # ```
@@ -910,5 +947,324 @@ show_day_pnl(ENGINE.order_mgr.risk.ledger if ENGINE.order_mgr else LEDGER)
 # 1. Market data feed is stable (`health == ok`) for subscribed contracts.
 # 2. Portfolio watcher receives fills correctly (verify SQLite ledger rows).
 # 3. Strategy performance has been validated against NSE option-chain data and back-tests (you can reuse the `ReplayStreamer` from earlier notebooks with this architecture).
+"""
 
 # %%
+class ReplayStreamer:
+    """Streams recorded ticks (CSV) into the MarketDataHub for offline testing.
+
+    Expected columns: ts_ms, instrument_key or instrument_token, ltp, bidP, askP, bidQ, askQ.
+    Additional columns like delta/iv are optional.
+    """
+
+    def __init__(self, path: str, speed: float = 1.0, engine: Optional[TradingEngine] = None):
+        self.path = Path(path)
+        self.speed = max(0.1, float(speed))
+        self.engine = engine or ENGINE
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def start(self):
+        if not self.path.exists():
+            raise FileNotFoundError(self.path)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print(f"[REPLAY] streaming from {self.path} at {self.speed}x")
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _require_market(self) -> MarketDataHub:
+        if not self.engine:
+            raise RuntimeError("ReplayStreamer requires a TradingEngine instance.")
+        if not self.engine.market:
+            raise RuntimeError("Call ENGINE.bootstrap() before starting ReplayStreamer.")
+        return self.engine.market
+
+    def _run(self):
+        market = self._require_market()
+        prev_ts = None
+        try:
+            with self.path.open("r", newline="") as handle:
+                rdr = csv.DictReader(handle)
+                for row in rdr:
+                    if self._stop.is_set():
+                        break
+                    key = self._resolve_key(row)
+                    if not key:
+                        continue
+                    feed = self._build_feed(row)
+                    market._ingest_tick(key, feed)
+                    ts_ms = self._extract_ts(row)
+                    if ts_ms is not None and prev_ts is not None:
+                        delay = max(0.0, (ts_ms - prev_ts) / 1000.0) / self.speed
+                        if delay > 0 and self._stop.wait(min(delay, 1.0)):
+                            break
+                    prev_ts = ts_ms if ts_ms is not None else prev_ts
+        except Exception as exc:
+            print(f"[REPLAY] error: {exc}")
+        finally:
+            print("[REPLAY] stopped.")
+
+    def _resolve_key(self, row: Dict[str, str]) -> Optional[str]:
+        key = (row.get("instrument_key")
+               or row.get("instrumentKey")
+               or row.get("instrument"))
+        if key:
+            return key.strip()
+        token = row.get("instrument_token") or row.get("instrumentToken")
+        if token:
+            try:
+                token_val = int(float(token))
+            except ValueError:
+                token_val = None
+            if token_val is not None:
+                match = CHAIN_DF.loc[CHAIN_DF["instrument_token"] == token_val, "instrument_key"]
+                if not match.empty:
+                    return match.iloc[0]
+        symbol = row.get("trading_symbol") or row.get("tradingSymbol")
+        if symbol:
+            match = CHAIN_DF.loc[CHAIN_DF["trading_symbol"] == symbol, "instrument_key"]
+            if not match.empty:
+                return match.iloc[0]
+        return None
+
+    def _build_feed(self, row: Dict[str, str]) -> dict:
+        def _to_float(val) -> float:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return 0.0
+
+        ltp = _to_float(row.get("ltp") or row.get("LTP"))
+        bid = _to_float(row.get("bidP") or row.get("bid_price") or row.get("bid"))
+        ask = _to_float(row.get("askP") or row.get("ask_price") or row.get("ask"))
+        bidq = _to_float(row.get("bidQ") or row.get("bid_qty") or row.get("bidQuantity"))
+        askq = _to_float(row.get("askQ") or row.get("ask_qty") or row.get("askQuantity"))
+        delta = row.get("delta") or row.get("Delta")
+        iv = row.get("iv") or row.get("IV")
+        depth = {
+            "bidP": bid,
+            "askP": ask,
+            "bidQ": bidq,
+            "askQ": askq,
+        }
+        greeks = {}
+        try:
+            if delta is not None and delta != "":
+                greeks["delta"] = float(delta)
+        except ValueError:
+            pass
+        try:
+            if iv is not None and iv != "":
+                greeks["iv"] = float(iv)
+        except ValueError:
+            pass
+        feed = {
+            "ltpc": {"ltp": ltp},
+            "firstLevel": {"firstDepth": depth},
+        }
+        if greeks:
+            feed["firstLevelWithGreeks"] = {"firstDepth": depth, "optionGreeks": greeks}
+        return feed
+
+    def _extract_ts(self, row: Dict[str, str]) -> Optional[int]:
+        ts_fields = [
+            row.get("ts_ms"),
+            row.get("timestamp_ms"),
+            row.get("timestamp"),
+            row.get("ts"),
+        ]
+        for val in ts_fields:
+            if val is None:
+                continue
+            try:
+                ts = int(float(val))
+            except ValueError:
+                continue
+            if len(str(ts)) <= 10:  # seconds
+                ts *= 1000
+            return ts
+        return None
+
+
+def _select_contracts(chain_df: pd.DataFrame, option_type: str, atm: int, count: int = 2) -> List[pd.Series]:
+    subset = chain_df[chain_df.option_type.str.upper() == option_type.upper()].copy()
+    if subset.empty:
+        return []
+    subset["atm_gap"] = (subset["strike"] - atm).abs()
+    ordered = subset.sort_values("atm_gap")
+    return [row for _, row in ordered.head(count).iterrows()]
+
+
+def generate_sample_replay(csv_path: Path, chain_df: pd.DataFrame, idx_key: str,
+                           rows_per_contract: int = 36) -> Path:
+    """Builds a deterministic replay CSV with deep books and steady momentum."""
+    atm = int(nearest_strike(float(chain_df["strike"].median()), STRIKE_STEP))
+    ces = _select_contracts(chain_df, "CE", atm, count=2)
+    pes = _select_contracts(chain_df, "PE", atm, count=2)
+    selected = ces + pes
+    if not selected:
+        raise RuntimeError("Instrument chain is empty; cannot synthesize replay ticks.")
+    contract_meta = []
+    for idx, contract in enumerate(ces):
+        contract_meta.append((contract, True, idx))
+    for idx, contract in enumerate(pes, start=len(ces)):
+        contract_meta.append((contract, False, idx))
+    base_ts = int(time.time() * 1000)
+    rows: List[dict] = []
+    spot_price = float(atm) - 25.0
+
+    for step in range(rows_per_contract):
+        for order, (contract, upward, meta_idx) in enumerate(contract_meta):
+            strike_val = float(contract["strike"])
+            base = max(18.0, 0.04 * abs(strike_val - atm) + 35.0 + meta_idx)
+            drift = (0.22 + 0.02 * meta_idx) * step
+            move = drift if upward else -drift * 0.5
+            ltp = round(base + move + random.uniform(-0.15, 0.15), 2)
+            spread = 0.8 + 0.02 * step
+            bid = round(max(ltp - spread / 2, 0.1), 2)
+            ask = round(bid + spread, 2)
+            bidq = max(90, 240 - meta_idx * 10)
+            askq = max(15, 35 + step + meta_idx * 3)
+            delta = 0.55 - 0.004 * step
+            delta = max(0.3, min(0.54, delta))
+            iv = 14.5 + meta_idx * 0.4 + step * 0.05
+            rows.append({
+                "ts_ms": base_ts + step * 600 + order * 8,
+                "instrument_key": contract["instrument_key"],
+                "ltp": ltp,
+                "bidP": bid,
+                "askP": ask,
+                "bidQ": bidq,
+                "askQ": askq,
+                "delta": delta,
+                "iv": round(iv, 3),
+            })
+        spot_price += 1.5 + random.uniform(-0.6, 0.6)
+        rows.append({
+            "ts_ms": base_ts + step * 600 + len(contract_meta) * 8,
+            "instrument_key": idx_key,
+            "ltp": round(spot_price, 2),
+            "bidP": round(spot_price - 0.5, 2),
+            "askP": round(spot_price + 0.5, 2),
+            "bidQ": 1000,
+            "askQ": 900,
+            "delta": "",
+            "iv": "",
+        })
+
+    fieldnames = ["ts_ms", "instrument_key", "ltp", "bidP", "askP", "bidQ", "askQ", "delta", "iv"]
+    with csv_path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[REPLAY] Generated {len(rows)} synthetic ticks at {csv_path} (ATM {atm}).")
+    return csv_path
+
+
+def ensure_sample_replay(csv_path: Path, chain_df: pd.DataFrame, idx_key: str, *, force: bool = False) -> Path:
+    def needs_regeneration(path: Path) -> bool:
+        if not path.exists() or path.stat().st_size == 0:
+            return True
+        try:
+            with path.open("r") as fh:
+                line_count = sum(1 for _ in fh)
+        except Exception:
+            return True
+        # Expect hundreds of rows (header + ticks). Anything too small likely unusable.
+        return line_count <= 80
+
+    if force or needs_regeneration(csv_path):
+        print(f"[REPLAY] {csv_path} missing/empty; synthesizing dataset.")
+        return generate_sample_replay(csv_path, chain_df, idx_key)
+    return csv_path
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def main_cli():
+    parser = argparse.ArgumentParser(description="Intraday BUY Engine runner")
+    parser.add_argument(
+        "--runtime-minutes",
+        type=float,
+        default=float(os.getenv("ENGINE_RUNTIME_MINUTES", "1000")),
+        help="How long to run the engine loop (default 0.5 minutes for quick replay).",
+    )
+    parser.add_argument(
+        "--replay-csv",
+        default=os.getenv("REPLAY_CSV", "sample_ticks.csv"),
+        help="CSV file for ReplayStreamer (auto-generated if missing).",
+    )
+    parser.add_argument(
+        "--replay-speed",
+        type=float,
+        default=float(os.getenv("REPLAY_SPEED", "5.0")),
+        help="Speed multiplier for ReplayStreamer ticks.",
+    )
+    parser.add_argument(
+        "--skip-replay",
+        action="store_true",
+        help="Do not start ReplayStreamer (use live feeds only).",
+    )
+    parser.add_argument(
+        "--regenerate-sample",
+        action="store_true",
+        help="Force regeneration of the sample replay CSV before running.",
+    )
+    parser.add_argument(
+        "--replay-only",
+        dest="replay_only",
+        action="store_true",
+        default=env_flag("REPLAY_ONLY", True),
+        help="Skip live Upstox streams and rely purely on replay data.",
+    )
+    parser.add_argument(
+        "--live",
+        dest="replay_only",
+        action="store_false",
+        help="Connect to live feeds even if REPLAY_ONLY env is set.",
+    )
+    args = parser.parse_args()
+
+    connect_live = not args.replay_only
+    engine = ENGINE
+    if args.replay_only:
+        engine.cfg.risk.entry_cutoff_hhmm = "23:59"
+        engine.cfg.risk.square_off_hhmm = "23:59"
+        engine.cfg.risk.daily_loss_limit = 1e9
+        engine.cfg.risk.daily_profit_cap = 0.0
+        engine.cfg.strategy.spot_momentum_min = 0.0
+        engine.risk._trading_halted = False
+        print("[CLI] Replay mode: entry window extended to 23:59 for offline testing.")
+    engine.bootstrap(connect_live=connect_live, start_streams=connect_live)
+
+    replay_stream = None
+    if not args.skip_replay:
+        csv_path = ensure_sample_replay(Path(args.replay_csv), CHAIN_DF, engine.session.index_key(),
+                                        force=args.regenerate_sample)
+        replay_stream = ReplayStreamer(str(csv_path), speed=args.replay_speed, engine=engine)
+        replay_stream.start()
+    else:
+        print("[CLI] Replay disabled; waiting on live feeds.")
+
+    try:
+        engine.run(runtime_minutes=max(0.1, args.runtime_minutes))
+    except KeyboardInterrupt:
+        print("\n[CLI] Stopped via keyboard interrupt.")
+    finally:
+        if replay_stream:
+            replay_stream.stop()
+            print("[CLI] Replay stopped.")
+
+
+if __name__ == "__main__":
+    main_cli()

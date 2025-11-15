@@ -72,6 +72,12 @@ class EngineMetrics:
         self.ltp_gauge = Gauge("ltp_underlying", "Last traded price per instrument", ["instrument"], registry=self.registry)
         self.iv_gauge = Gauge("option_iv", "Option IV snapshot", ["instrument"], registry=self.registry)
         self.ivz_gauge = Gauge("option_iv_zscore", "Option IV z-score snapshot", ["instrument"], registry=self.registry)
+        self.trading_symbol_gauge = Gauge(
+            "instrument_trading_symbol",
+            "Trading symbol for instrument (gauge holds a dummy value of 1)",
+            ["instrument", "symbol"],
+            registry=self.registry
+        )
         self.health_gauge = Gauge(
             "instrument_health_state",
             "Market data health per instrument (reason label indicates status)",
@@ -128,7 +134,8 @@ class EngineMetrics:
             return
         self.orders_rejected_ctr.labels(instrument=self._label(instrument), reason=reason or "unknown").inc()
 
-    def update_market(self, instrument: Optional[str], ltp: Optional[float], iv: Optional[float], iv_z: Optional[float]) -> None:
+    def update_market(self, instrument: Optional[str], trading_symbol: Optional[str],
+                      ltp: Optional[float], iv: Optional[float], iv_z: Optional[float]) -> None:
         if not self.enabled:
             return
         label = self._label(instrument)
@@ -138,6 +145,8 @@ class EngineMetrics:
             self.iv_gauge.labels(instrument=label).set(float(iv))
         if iv_z is not None:
             self.ivz_gauge.labels(instrument=label).set(float(iv_z))
+        if trading_symbol:
+            self.trading_symbol_gauge.labels(instrument=label, symbol=trading_symbol).set(1.0)
 
     def set_health(self, instrument: Optional[str], reason: str, value: float = 1.0) -> None:
         if not self.enabled:

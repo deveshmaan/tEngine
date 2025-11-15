@@ -435,9 +435,12 @@ class MarketDataHub:
             self.health[key] = self._validate_tick(state)
             health_state = self.health.get(key, "unknown")
             iv_z = self.iv_zscore(key)
+            trading_symbol = self.chain_df.loc[self.chain_df["instrument_key"] == key, "trading_symbol"]
+            symbol_val = trading_symbol.iloc[0] if not trading_symbol.empty else None
             if key != self.index_key:
                 self.metrics.update_market(
                     instrument=key,
+                    trading_symbol=symbol_val,
                     ltp=ltp if np.isfinite(ltp) else None,
                     iv=state.iv if isinstance(state.iv, float) else None,
                     iv_z=iv_z if np.isfinite(iv_z) else None,
