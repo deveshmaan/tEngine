@@ -92,10 +92,19 @@ class StrategyConfig:
     iv_z_ceiling: float = float(os.getenv("IV_Z_MAX", 2.5))
     iv_percentile_min: float = float(os.getenv("IV_PERCENTILE_MIN", 0.35))
     oi_percentile_min: float = float(os.getenv("OI_PERCENTILE_MIN", 0.25))
+    min_oi_surge_pct: float = float(os.getenv("MIN_OI_SURGE_PCT", 0.15))
     lookback_ticks: int = int(os.getenv("LOOKBACK_TICKS", 180))
     spot_momentum_min: float = float(os.getenv("SPOT_MOMENTUM_MIN", 0.0008))
     max_candidates: int = int(os.getenv("MAX_CONCURRENT_POS", 2))
     execution_style: str = os.getenv("EXECUTION_STYLE", "pegged").lower()
+    trend_fast_ticks: int = int(os.getenv("TREND_FAST_TICKS", 60))
+    trend_slow_ticks: int = int(os.getenv("TREND_SLOW_TICKS", 180))
+    breakout_buffer_pct: float = float(os.getenv("BREAKOUT_BUFFER_PCT", 0.0005))
+    prev_day_high: float = float(os.getenv("PREV_DAY_HIGH", "0") or 0)
+    prev_day_low: float = float(os.getenv("PREV_DAY_LOW", "0") or 0)
+    atr_lookback: int = int(os.getenv("ATR_LOOKBACK_TICKS", 60))
+    atr_stop_mult: float = float(os.getenv("ATR_STOP_MULT", 1.5))
+    atr_target_mult: float = float(os.getenv("ATR_TARGET_MULT", 2.4))
 
 @dataclass
 class RiskConfig:
@@ -107,6 +116,10 @@ class RiskConfig:
     daily_profit_cap: float = float(os.getenv("DAILY_PROFIT_CAP_R", 6000))
     square_off_hhmm: str = os.getenv("SQUARE_OFF_HHMM", "16:20")
     entry_cutoff_hhmm: str = os.getenv("ENTRY_CUTOFF_HHMM", "15:00")
+    brokerage_per_order: float = float(os.getenv("BROKERAGE_PER_ORDER", 20.0))
+    statutory_cost_pct: float = float(os.getenv("STATUTORY_COST_PCT", 0.0006))
+    min_expected_edge: float = float(os.getenv("MIN_EXPECTED_EDGE", 100.0))
+    max_hold_minutes: float = float(os.getenv("MAX_HOLD_MINUTES", 25))
 
 @dataclass
 class DataIntegrityConfig:
@@ -147,6 +160,17 @@ IDX_MAP = {
     "BANKNIFTY": "NSE_INDEX|Nifty Bank",
 }
 STRIKE_STEP = 50 if CONFIG.underlying == "NIFTY" else 100
+
+
+class TradeCostModel:
+    def __init__(self, brokerage_per_order: float = 20.0, statutory_pct: float = 0.0006):
+        self.brokerage = brokerage_per_order
+        self.statutory_pct = statutory_pct
+
+    def estimate(self, price: float, quantity: int) -> float:
+        notional = max(price * quantity, 0.0)
+        statutory = self.statutory_pct * notional
+        return float(self.brokerage + statutory)
 
 def hhmm_now() -> str:
     return dt.datetime.now().strftime("%H:%M")
@@ -587,6 +611,34 @@ class MarketDataHub:
         snap = snap[~snap["instrument_key"].eq(self.index_key)]
         return snap.sort_values(["strike","option_type"])
 
+    def option_atr(self, key: str, lookback: int) -> float:
+        history = self.price_history.get(key)
+        if not history or len(history) < 2:
+            return np.nan
+        arr = np.array(history, dtype=float)
+        arr = arr[~np.isnan(arr)]
+        if arr.size < 2:
+            return np.nan
+        recent = arr[-min(len(arr), lookback):]
+        diffs = np.abs(np.diff(recent))
+        if diffs.size == 0:
+            return np.nan
+        return float(np.nanmean(diffs))
+
+    def oi_surge_ratio(self, key: str, lookback: int) -> float:
+        series = self.oi_history.get(key)
+        if not series or len(series) < max(5, lookback):
+            return np.nan
+        arr = np.array(series, dtype=float)
+        arr = arr[~np.isnan(arr)]
+        if arr.size < max(5, lookback):
+            return np.nan
+        recent = arr[-1]
+        base = np.nanmean(arr[-(lookback+1):-1]) if arr.size > lookback else np.nanmean(arr[:-1])
+        if not np.isfinite(base) or base <= 0:
+            return np.nan
+        return float(recent / base)
+
 MARKET_DATA = None
 
 # %% [markdown]
@@ -622,12 +674,22 @@ class SpotMomentum:
         last = self.window[-1]
         return pct_move(first, last)
 
+    def ema(self, period: int) -> float:
+        if len(self.window) < period or period <= 1:
+            return float("nan")
+        alpha = 2.0 / (period + 1.0)
+        ema_val = self.window[0]
+        for price in list(self.window)[1:]:
+            ema_val = alpha * price + (1 - alpha) * ema_val
+        return float(ema_val)
+
 class SignalEngine:
     def __init__(self, cfg: EngineConfig, market: MarketDataHub, metrics: EngineMetrics = NULL_METRICS):
         self.cfg = cfg
         self.market = market
         self.spot_state = SpotMomentum(lookback=cfg.strategy.lookback_ticks)
         self.metrics = metrics
+        self.cost_model = TradeCostModel(cfg.risk.brokerage_per_order, cfg.risk.statutory_cost_pct)
 
     def update_spot(self):
         st = self.market.state.get(self.market.session.index_key()) if self.market else None
@@ -650,7 +712,16 @@ class SignalEngine:
         min_trend = self.cfg.strategy.spot_momentum_min
         if min_trend > 0 and abs(trend) < min_trend:
             return []
+        fast_trend, slow_trend = self._trend_values()
+        if not (np.isfinite(fast_trend) and np.isfinite(slow_trend)):
+            return []
         side_filter = "CE" if (trend > 0 or min_trend <= 0) else "PE"
+        if side_filter == "CE" and fast_trend <= slow_trend:
+            return []
+        if side_filter == "PE" and fast_trend >= slow_trend:
+            return []
+        if not self._breakout_confirmed(side_filter, spot):
+            return []
         eligible = snapshot.copy()
         eligible = eligible[eligible.option_type.str.upper().eq(side_filter)]
         eligible = eligible[eligible.health.eq("ok")]
@@ -668,6 +739,8 @@ class SignalEngine:
             eligible = eligible[eligible["iv_pct"].isna() | (eligible["iv_pct"]>=iv_min)]
         if oi_min > 0:
             eligible = eligible[eligible["oi_pct"].isna() | (eligible["oi_pct"]>=oi_min)]
+        if self.cfg.strategy.min_oi_surge_pct > 0:
+            eligible = eligible[eligible["instrument_key"].apply(self._passes_oi_surge)]
         if eligible.empty:
             return []
         eligible["atm_gap"] = (eligible["strike"] - nearest_strike(spot, STRIKE_STEP)).abs()
@@ -682,9 +755,14 @@ class SignalEngine:
             lot = self.cfg.lot_size_map.get(row.instrument_key, 1)
             lots = max(1, int(self.cfg.risk.capital_per_trade // max(price * lot, 1)))
             qty = lots * lot
-            stop = price * (1 - self.cfg.risk.stop_pct)
-            target = price * (1 + self.cfg.risk.target_pct)
+            stop, target = self._dynamic_exits(row.instrument_key, price)
+            if not np.isfinite(stop) or not np.isfinite(target) or stop <= 0 or target <= price:
+                continue
             token_val = row.get("instrument_token") if hasattr(row, "get") else None
+            expected_gain = (target - price) * qty
+            trade_cost = self.cost_model.estimate(price, qty)
+            if expected_gain <= trade_cost + self.cfg.risk.min_expected_edge:
+                continue
             plans.append(TradePlan(
                 instrument_key=row.instrument_key,
                 instrument_token=str(token_val) if token_val else None,
@@ -700,6 +778,40 @@ class SignalEngine:
         for plan in plans:
             self.metrics.record_signal(plan.instrument_key, duration_ms)
         return plans
+
+    def _trend_values(self) -> Tuple[float, float]:
+        fast_ticks = max(5, self.cfg.strategy.trend_fast_ticks)
+        slow_ticks = max(fast_ticks + 5, self.cfg.strategy.trend_slow_ticks)
+        fast = self.spot_state.ema(fast_ticks)
+        slow = self.spot_state.ema(slow_ticks)
+        return fast, slow
+
+    def _breakout_confirmed(self, side: str, spot: float) -> bool:
+        if not np.isfinite(spot):
+            return False
+        buffer_pct = self.cfg.strategy.breakout_buffer_pct
+        if side == "CE" and self.cfg.strategy.prev_day_high > 0:
+            return spot >= self.cfg.strategy.prev_day_high * (1 - buffer_pct)
+        if side == "PE" and self.cfg.strategy.prev_day_low > 0:
+            return spot <= self.cfg.strategy.prev_day_low * (1 + buffer_pct)
+        return True
+
+    def _passes_oi_surge(self, key: str) -> bool:
+        ratio = self.market.oi_surge_ratio(key, self.cfg.strategy.atr_lookback)
+        if not np.isfinite(ratio):
+            return True
+        required = 1.0 + self.cfg.strategy.min_oi_surge_pct
+        return ratio >= required
+
+    def _dynamic_exits(self, instrument_key: str, price: float) -> Tuple[float, float]:
+        atr = self.market.option_atr(instrument_key, self.cfg.strategy.atr_lookback)
+        if not np.isfinite(atr) or atr <= 0:
+            atr = price * 0.05
+        atr_stop = atr * self.cfg.strategy.atr_stop_mult
+        atr_target = atr * self.cfg.strategy.atr_target_mult
+        stop_abs = price - max(price * self.cfg.risk.stop_pct, atr_stop)
+        target_abs = price + max(price * self.cfg.risk.target_pct, atr_target)
+        return stop_abs, target_abs
 
 SIGNALS = None
 
@@ -1057,6 +1169,14 @@ class TradingEngine:
             ltp = float(row.get("ltp") or row.get("bid") or row.get("ask") or 0.0)
             stop = pos.get("stop")
             target = pos.get("target")
+            entry_ts = pos.get("entry_ts")
+            max_hold = self.cfg.risk.max_hold_minutes
+            if max_hold > 0 and entry_ts:
+                held_minutes = (time.time() - entry_ts) / 60.0
+                if held_minutes >= max_hold:
+                    self.risk.flag_exit_pending(key, "time_exit")
+                    self.order_mgr.close_position(key, qty, "time_exit")
+                    continue
             if stop and ltp <= stop:
                 self.risk.flag_exit_pending(key, "stop_hit")
                 self.order_mgr.close_position(key, qty, "stop_hit")
