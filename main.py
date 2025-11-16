@@ -86,9 +86,12 @@ class StrategyConfig:
     delta_min: float = float(os.getenv("DELTA_MIN_BUY", 0.25))
     delta_max: float = float(os.getenv("DELTA_MAX_BUY", 0.55))
     spread_max: float = float(os.getenv("SPREAD_MAX_BUY", 3.0))
+    spread_pct_max: float = float(os.getenv("SPREAD_PCT_MAX", 0.08))
     imbalance_min: float = float(os.getenv("IMBALANCE_ABS_MIN", 0.2))
     iv_z_floor: float = float(os.getenv("IV_Z_FLOOR", -0.2))
     iv_z_ceiling: float = float(os.getenv("IV_Z_MAX", 2.5))
+    iv_percentile_min: float = float(os.getenv("IV_PERCENTILE_MIN", 0.35))
+    oi_percentile_min: float = float(os.getenv("OI_PERCENTILE_MIN", 0.25))
     lookback_ticks: int = int(os.getenv("LOOKBACK_TICKS", 180))
     spot_momentum_min: float = float(os.getenv("SPOT_MOMENTUM_MIN", 0.0008))
     max_candidates: int = int(os.getenv("MAX_CONCURRENT_POS", 2))
@@ -176,7 +179,7 @@ class UpstoxSession:
     def connect(self):
         if upstox_client is None:
             raise ImportError("Install the official Upstox SDK via `pip install upstox-python-sdk` to use live connectivity.")
-        token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTE2OTM4NzNmNWNhODRkMDdjMzkzNDAiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzMDg3MjM5LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjMxNTc2MDB9._iEdxQbD2nU4rkPN72Be66dJ3bimMm-eFkB5JYRqy9I").strip()
+        token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
         if not token:
             raise RuntimeError("UPSTOX_ACCESS_TOKEN not set. Complete OAuth flow and export the token.")
         cfg = upstox_client.Configuration(sandbox=self.config.use_sandbox)
@@ -220,6 +223,7 @@ def _normalize_master_columns(df: pd.DataFrame) -> pd.DataFrame:
         "optiontype": "option_type",
         "ticksize": "tick_size",
         "lotsize": "lot_size",
+        "token": "instrument_token",
     }
     for col in df.columns:
         key = str(col).lower().replace(" ", "_").replace("-", "_")
@@ -263,7 +267,16 @@ def option_chain(df: pd.DataFrame, underlying: str, window: int) -> pd.DataFrame
         df.instrument_type.isin(["CE","PE"]) &
         df.name.str.upper().eq(u)
     )
-    required_cols = ["instrument_key","trading_symbol","name","expiry","strike_price","option_type","lot_size","tick_size"]
+    required_cols = [
+        "instrument_key",
+        "trading_symbol",
+        "name",
+        "expiry",
+        "strike_price",
+        "option_type",
+        "lot_size",
+        "tick_size"
+    ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise KeyError(f"Instrument master missing columns {missing}. Check API response format.")
@@ -282,12 +295,29 @@ def option_chain(df: pd.DataFrame, underlying: str, window: int) -> pd.DataFrame
     chain = chain[chain.expiry.eq(next_exp)].sort_values(["strike","option_type"])
     if chain.empty:
         raise RuntimeError(f"No contracts found for {underlying} and expiry {next_exp}. Verify master data.")
+    if "instrument_token" not in chain.columns:
+        token_guess = chain["instrument_key"].astype(str).str.split("|").str[-1]
+        token_guess = pd.to_numeric(token_guess, errors="coerce")
+        chain["instrument_token"] = token_guess
     print(f"Loaded {len(chain)} contracts for {underlying} expiry {next_exp.date()}. Live ATM filtering happens later.")
     return chain.reset_index(drop=True)
+
+
+def token_map_from_chain(chain_df: pd.DataFrame) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for _, row in chain_df.iterrows():
+        key = row["instrument_key"]
+        token = row.get("instrument_token")
+        mapping[key] = key
+        if token is not None and pd.notna(token):
+            mapping[token] = key
+            mapping[str(int(token)) if isinstance(token, (int, float)) else str(token)] = key
+    return mapping
 
 MASTER_DF = load_instrument_master(CONFIG.data.master_cache, CONFIG.data.cache_ttl_hours)
 CHAIN_DF = option_chain(MASTER_DF, CONFIG.underlying, CONFIG.strategy.option_window)
 CONFIG.lot_size_map = dict(zip(CHAIN_DF.instrument_key, CHAIN_DF.lot_size))
+TOKEN_TO_KEY = token_map_from_chain(CHAIN_DF)
 CHAIN_DF.head()
 
 # %% [markdown]
@@ -306,6 +336,7 @@ class TickState:
     ask_qty: float = 0.0
     delta: float = np.nan
     iv: float = np.nan
+    oi: float = np.nan
     last_ts: float = 0.0
     spread: float = np.nan
     imbalance: float = 0.0
@@ -321,6 +352,7 @@ class MarketDataHub:
         self.state: Dict[str, TickState] = {}
         self.price_history: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=cfg.strategy.lookback_ticks))
         self.iv_history: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=cfg.strategy.lookback_ticks))
+        self.oi_history: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=cfg.strategy.lookback_ticks))
         self.streamer = None
         self.health: Dict[str, str] = {}
         self._stop = threading.Event()
@@ -433,6 +465,19 @@ class MarketDataHub:
         greeks = first.get("optionGreeks") or feed.get("optionGreeks") or {}
         delta = greeks.get("delta")
         iv = greeks.get("iv") or first.get("iv") or feed.get("iv")
+        oi_raw = (
+            feed.get("oi")
+            or feed.get("open_interest")
+            or first.get("oi")
+            or first.get("openInterest")
+            or (feed.get("marketFF") or {}).get("openInterest") if isinstance(feed.get("marketFF"), dict) else None
+        )
+        oi_val = None
+        try:
+            if oi_raw is not None:
+                oi_val = float(oi_raw)
+        except (TypeError, ValueError):
+            oi_val = None
         ts = time.time()
         spread = (ask - bid) if (ask > 0 and bid > 0) else np.nan
         imbalance = ((bidq - askq) / (bidq + askq)) if (bidq + askq) > 0 else 0.0
@@ -446,6 +491,7 @@ class MarketDataHub:
             state.ask_qty = askq
             state.delta = float(delta) if delta is not None else state.delta
             state.iv = float(iv) if isinstance(iv, (int, float)) else state.iv
+            state.oi = float(oi_val) if oi_val is not None else state.oi
             state.last_ts = ts
             state.spread = spread
             state.imbalance = imbalance
@@ -454,6 +500,8 @@ class MarketDataHub:
                 self.price_history[key].append(ltp)
             if isinstance(state.iv, float):
                 self.iv_history[key].append(state.iv)
+            if isinstance(state.oi, float):
+                self.oi_history[key].append(state.oi)
             self.health[key] = self._validate_tick(state)
             health_state = self.health.get(key, "unknown")
             iv_z = self.iv_zscore(key)
@@ -494,6 +542,22 @@ class MarketDataHub:
             return 0.0
         return float((arr[-1] - mu) / sd)
 
+    def _percentile_from_history(self, series: Optional[Deque[float]]) -> float:
+        if not series:
+            return np.nan
+        arr = np.array([val for val in series if np.isfinite(val)], dtype=float)
+        if arr.size == 0:
+            return np.nan
+        x = arr[-1]
+        rank = float(np.sum(arr <= x))
+        return float(rank / arr.size)
+
+    def iv_percentile(self, key: str) -> float:
+        return self._percentile_from_history(self.iv_history.get(key))
+
+    def oi_percentile(self, key: str) -> float:
+        return self._percentile_from_history(self.oi_history.get(key))
+
     def snapshot(self) -> pd.DataFrame:
         with self.lock:
             if not self.state:
@@ -509,14 +573,15 @@ class MarketDataHub:
                     "imbalance": st.imbalance,
                     "delta": st.delta,
                     "iv": st.iv,
+                    "oi": st.oi,
                     "tick_age": time.time() - st.last_ts,
                     "iv_z": self.iv_zscore(key),
+                    "iv_pct": self.iv_percentile(key),
+                    "oi_pct": self.oi_percentile(key),
                     "health": self.health.get(key, "unknown")
                 })
         snap = pd.DataFrame(rows)
-        print(f"snapshot: {snap}")
         if snap.empty:
-            print("snapshot is empty")
             return snap
         snap = snap.merge(self.chain_df, on="instrument_key", how="left")
         snap = snap[~snap["instrument_key"].eq(self.index_key)]
@@ -540,6 +605,7 @@ class TradePlan:
     stop_price: float
     target_price: float
     reason: str
+    instrument_token: Optional[str] = None
 
 class SpotMomentum:
     def __init__(self, lookback: int = 60):
@@ -590,9 +656,18 @@ class SignalEngine:
         eligible = eligible[eligible.health.eq("ok")]
         eligible = eligible[np.isfinite(eligible["delta"])]
         eligible = eligible[(eligible["delta"]>=self.cfg.strategy.delta_min) & (eligible["delta"]<=self.cfg.strategy.delta_max)]
+        eligible = eligible[np.isfinite(eligible["ltp"])]
+        eligible["spread_pct"] = eligible["spread"] / eligible["ltp"].replace({0: np.nan})
         eligible = eligible[(eligible["spread"]<=self.cfg.strategy.spread_max)]
+        eligible = eligible[(eligible["spread_pct"]<=self.cfg.strategy.spread_pct_max)]
         eligible = eligible[eligible["imbalance"].abs()>=self.cfg.strategy.imbalance_min]
         eligible = eligible[eligible["iv_z"].between(self.cfg.strategy.iv_z_floor, self.cfg.strategy.iv_z_ceiling)]
+        iv_min = self.cfg.strategy.iv_percentile_min
+        oi_min = self.cfg.strategy.oi_percentile_min
+        if iv_min > 0:
+            eligible = eligible[eligible["iv_pct"].isna() | (eligible["iv_pct"]>=iv_min)]
+        if oi_min > 0:
+            eligible = eligible[eligible["oi_pct"].isna() | (eligible["oi_pct"]>=oi_min)]
         if eligible.empty:
             return []
         eligible["atm_gap"] = (eligible["strike"] - nearest_strike(spot, STRIKE_STEP)).abs()
@@ -609,8 +684,10 @@ class SignalEngine:
             qty = lots * lot
             stop = price * (1 - self.cfg.risk.stop_pct)
             target = price * (1 + self.cfg.risk.target_pct)
+            token_val = row.get("instrument_token") if hasattr(row, "get") else None
             plans.append(TradePlan(
                 instrument_key=row.instrument_key,
+                instrument_token=str(token_val) if token_val else None,
                 option_type=row.option_type,
                 strike=int(row.strike or 0),
                 qty=qty,
@@ -687,16 +764,46 @@ class RiskManager:
         self.open_positions: Dict[str, dict] = {}
         self._trading_halted = False
         self.metrics = metrics
+        self.planned_exits: Dict[str, TradePlan] = {}
 
-    def update_position(self, instrument_key: str, qty: int, avg_price: float, side: str):
+    def set_planned_exit(self, plan: TradePlan):
+        self.planned_exits[plan.instrument_key] = plan
+
+    def flag_exit_pending(self, instrument_key: str, reason: str):
+        pos = self.open_positions.get(instrument_key)
+        if pos:
+            pos["pending_exit"] = reason
+
+    def update_position(self, instrument_key: str, qty: int, avg_price: float, side: str,
+                        plan: Optional[TradePlan] = None):
         pos = self.open_positions.get(instrument_key, {"qty":0,"avg_price":0.0})
         if side == "BUY":
             new_qty = pos["qty"] + qty
             new_avg = ((pos["avg_price"] * pos["qty"]) + avg_price * qty) / max(1, new_qty)
-            self.open_positions[instrument_key] = {"qty": new_qty, "avg_price": new_avg}
+            plan_meta = plan or self.planned_exits.get(instrument_key)
+            stop = plan_meta.stop_price if plan_meta else pos.get("stop")
+            target = plan_meta.target_price if plan_meta else pos.get("target")
+            reason = plan_meta.reason if plan_meta else pos.get("reason")
+            entry_ts = time.time() if plan_meta else pos.get("entry_ts", time.time())
+            self.open_positions[instrument_key] = {
+                "qty": new_qty,
+                "avg_price": new_avg,
+                "stop": stop,
+                "target": target,
+                "reason": reason,
+                "entry_ts": entry_ts,
+                "pending_exit": None,
+            }
+            if plan_meta:
+                self.planned_exits.pop(instrument_key, None)
         else:
-            new_qty = pos["qty"] - qty
-            self.open_positions[instrument_key] = {"qty": max(0, new_qty), "avg_price": pos["avg_price"]}
+            new_qty = max(0, pos.get("qty", 0) - qty)
+            if new_qty <= 0:
+                self.open_positions.pop(instrument_key, None)
+                self.planned_exits.pop(instrument_key, None)
+            else:
+                pos.update({"qty": new_qty, "pending_exit": None})
+                self.open_positions[instrument_key] = pos
         self.metrics.set_open_positions(sum(1 for p in self.open_positions.values() if p.get("qty", 0) > 0))
 
     def should_block(self) -> bool:
@@ -711,9 +818,11 @@ class RiskManager:
         self.metrics.set_risk_state(self._trading_halted)
         return self._trading_halted
 
-    def register_fill(self, instrument_key: str, side: str, qty: int, price: float, charges: float = 0.0):
+    def register_fill(self, instrument_key: str, side: str, qty: int, price: float,
+                      charges: float = 0.0, plan: Optional[TradePlan] = None):
+        plan_meta = plan or self.planned_exits.get(instrument_key)
         self.ledger.record_fill(instrument_key, side, qty, price, charges)
-        self.update_position(instrument_key, qty, price, side)
+        self.update_position(instrument_key, qty, price, side, plan=plan_meta)
         self.metrics.order_filled(instrument_key)
         self.metrics.set_pnl(self.ledger.realized_today())
 
@@ -734,6 +843,15 @@ class OrderManager:
         self.market = market
         self.risk = risk
         self.metrics = metrics
+        self.instrument_tokens = {
+            key: str(token)
+            for key, token in zip(market.chain_df["instrument_key"], market.chain_df["instrument_token"])
+            if pd.notna(token)
+        }
+
+    def _resolve_token(self, key: str, default: Optional[str] = None) -> str:
+        token = self.instrument_tokens.get(key) or default or key
+        return str(token)
 
     def _best_quote(self, token: str) -> Tuple[float, float]:
         st = self.market.state.get(token)
@@ -754,12 +872,13 @@ class OrderManager:
         start = time.perf_counter()
         if self.cfg.dry_run:
             print(f"[DRY BUY] {plan.instrument_key} qty={plan.qty} @~{plan.entry_price:.2f} reason={plan.reason}")
-            self.risk.register_fill(plan.instrument_key, "BUY", plan.qty, plan.entry_price)
+            self.risk.register_fill(plan.instrument_key, "BUY", plan.qty, plan.entry_price, plan=plan)
             latency_ms = (time.perf_counter() - start) * 1000.0
             self.metrics.order_submitted(plan.instrument_key, latency_ms)
             return "SIM-ORDER"
         if upstox_client is None:
             raise RuntimeError("Live order placement requires `pip install upstox-python-sdk`.")
+        instrument_token = plan.instrument_token or self._resolve_token(plan.instrument_key)
         price = self._pegged_price(plan.instrument_key, plan.entry_price) if self.cfg.strategy.execution_style == "pegged" else 0.0
         body = upstox_client.PlaceOrderV3Request(
             quantity=int(plan.qty),
@@ -767,7 +886,7 @@ class OrderManager:
             validity="DAY",
             price=float(price),
             tag=self.cfg.app_tag,
-            instrument_token=plan.instrument_key,
+            instrument_token=instrument_token,
             order_type="LIMIT" if self.cfg.strategy.execution_style == "pegged" else "MARKET",
             transaction_type="BUY",
             disclosed_quantity=0,
@@ -789,6 +908,42 @@ class OrderManager:
             self.metrics.order_rejected(plan.instrument_key, "risk_halt")
             return None
         return self._place_order(plan)
+
+    def close_position(self, instrument_key: str, qty: int, reason: str) -> Optional[str]:
+        if qty <= 0:
+            return None
+        start = time.perf_counter()
+        state = self.market.state.get(instrument_key)
+        px = state.bid if state and state.bid else (state.last_price if state else 0.0)
+        token = self._resolve_token(instrument_key)
+        if self.cfg.dry_run:
+            print(f"[DRY EXIT] {instrument_key} qty={qty} reason={reason}")
+            self.risk.register_fill(instrument_key, "SELL", qty, px or 0.0)
+            latency_ms = (time.perf_counter() - start) * 1000.0
+            self.metrics.order_submitted(instrument_key, latency_ms)
+            return "SIM-EXIT"
+        if upstox_client is None:
+            raise RuntimeError("Live order placement requires `pip install upstox-python-sdk` for exits.")
+        body = upstox_client.PlaceOrderV3Request(
+            quantity=int(qty),
+            product="I",
+            validity="DAY",
+            price=float(px or 0.0),
+            tag=f"{self.cfg.app_tag}-EXIT",
+            instrument_token=token,
+            order_type="MARKET" if not px else "LIMIT",
+            transaction_type="SELL",
+            disclosed_quantity=0,
+            trigger_price=0.0,
+            is_amo=False,
+            slice=True
+        )
+        resp = self.session.order_api.place_order(body, algo_id=self.cfg.app_tag)
+        data = resp.to_dict() if hasattr(resp, "to_dict") else resp
+        order_id = (data.get("data") or {}).get("order_id") or data.get("order_id")
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        self.metrics.order_submitted(instrument_key, latency_ms)
+        return order_id
 
 ORDERS = None
 
@@ -822,7 +977,8 @@ class PortfolioWatcher:
                     price = float(data.get("average_price") or data.get("price") or 0.0)
                     side = (data.get("transaction_type") or data.get("transactionType") or "").upper()
                     if tok and qty>0:
-                        self.risk.register_fill(tok, side, qty, price)
+                        instr = TOKEN_TO_KEY.get(tok) or TOKEN_TO_KEY.get(str(tok)) or tok
+                        self.risk.register_fill(instr, side, qty, price)
 
         self.stream.on("message", lambda msg: on_message(msg))
         self.stream.auto_reconnect(True, 5, 20)
@@ -878,12 +1034,36 @@ class TradingEngine:
                 continue
             plans = self.signals.generate(snap, self.risk.open_positions)
             for plan in plans:
+                self.risk.set_planned_exit(plan)
                 self.order_mgr.execute(plan)
+            self._evaluate_exits(snap)
             if hhmm_now() >= self.cfg.risk.square_off_hhmm:
                 print("Square-off window reached; stop initiating new trades.")
                 break
             self.metrics.heartbeat()
         print("Engine loop finished.")
+
+    def _evaluate_exits(self, snapshot: pd.DataFrame):
+        if snapshot.empty:
+            return
+        snap_idx = snapshot.set_index("instrument_key")
+        for key, pos in list(self.risk.open_positions.items()):
+            qty = pos.get("qty", 0)
+            if qty <= 0 or pos.get("pending_exit"):
+                continue
+            if key not in snap_idx.index:
+                continue
+            row = snap_idx.loc[key]
+            ltp = float(row.get("ltp") or row.get("bid") or row.get("ask") or 0.0)
+            stop = pos.get("stop")
+            target = pos.get("target")
+            if stop and ltp <= stop:
+                self.risk.flag_exit_pending(key, "stop_hit")
+                self.order_mgr.close_position(key, qty, "stop_hit")
+                continue
+            if target and ltp >= target:
+                self.risk.flag_exit_pending(key, "target_hit")
+                self.order_mgr.close_position(key, qty, "target_hit")
 
 ENGINE = TradingEngine(CONFIG)
 
@@ -1046,6 +1226,7 @@ class ReplayStreamer:
         askq = _to_float(row.get("askQ") or row.get("ask_qty") or row.get("askQuantity"))
         delta = row.get("delta") or row.get("Delta")
         iv = row.get("iv") or row.get("IV")
+        oi_val = row.get("oi") or row.get("OI") or row.get("open_interest")
         depth = {
             "bidP": bid,
             "askP": ask,
@@ -1067,6 +1248,11 @@ class ReplayStreamer:
             "ltpc": {"ltp": ltp},
             "firstLevel": {"firstDepth": depth},
         }
+        try:
+            if oi_val is not None and oi_val != "":
+                feed["oi"] = float(oi_val)
+        except ValueError:
+            pass
         if greeks:
             feed["firstLevelWithGreeks"] = {"firstDepth": depth, "optionGreeks": greeks}
         return feed
@@ -1143,6 +1329,7 @@ def generate_sample_replay(csv_path: Path, chain_df: pd.DataFrame, idx_key: str,
                 "askQ": askq,
                 "delta": delta,
                 "iv": round(iv, 3),
+                "oi": 100000 + step * 2500 + meta_idx * 500,
             })
         spot_price += 1.5 + random.uniform(-0.6, 0.6)
         rows.append({
@@ -1155,9 +1342,10 @@ def generate_sample_replay(csv_path: Path, chain_df: pd.DataFrame, idx_key: str,
             "askQ": 900,
             "delta": "",
             "iv": "",
+            "oi": "",
         })
 
-    fieldnames = ["ts_ms", "instrument_key", "ltp", "bidP", "askP", "bidQ", "askQ", "delta", "iv"]
+    fieldnames = ["ts_ms", "instrument_key", "ltp", "bidP", "askP", "bidQ", "askQ", "delta", "iv", "oi"]
     with csv_path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -1207,7 +1395,7 @@ def main_cli():
     parser.add_argument(
         "--replay-speed",
         type=float,
-        default=float(os.getenv("REPLAY_SPEED", "5.0")),
+        default=float(os.getenv("REPLAY_SPEED", "2.0")),
         help="Speed multiplier for ReplayStreamer ticks.",
     )
     parser.add_argument(
@@ -1245,6 +1433,10 @@ def main_cli():
         engine.cfg.strategy.spot_momentum_min = 0.0
         engine.risk._trading_halted = False
         print("[CLI] Replay mode: entry window extended to 23:59 for offline testing.")
+        if env_flag("RELAX_REPLAY_FILTERS", True):
+            engine.cfg.strategy.iv_percentile_min = float(os.getenv("IV_PERCENTILE_MIN_REPLAY", 0.0))
+            engine.cfg.strategy.oi_percentile_min = float(os.getenv("OI_PERCENTILE_MIN_REPLAY", 0.0))
+            print("[CLI] Replay mode: IV/OI percentile filters relaxed (set RELAX_REPLAY_FILTERS=false for live thresholds).")
     engine.bootstrap(connect_live=connect_live, start_streams=connect_live)
 
     replay_stream = None

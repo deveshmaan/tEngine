@@ -53,7 +53,7 @@ while True:
 
     with placeholder.container():
         cols = st.columns(4)
-        cols[0].metric("Signals", int(m.get("buy_signals_total", 0)))
+        cols[0].metric("Signals", int(sum(v for k, v in m.items() if k.startswith("buy_signals_total"))))
         cols[1].metric("Orders Submitted", int(sum(v for k, v in m.items() if k.startswith("orders_submitted_total"))))
         cols[2].metric("Fills", int(sum(v for k, v in m.items() if k.startswith("orders_filled_total"))))
         cols[3].metric("Rejects", int(sum(v for k, v in m.items() if k.startswith("orders_rejected_total"))))
@@ -75,7 +75,7 @@ while True:
         if not hist_df.empty:
             hist_df["ts"] = pd.to_datetime(hist_df["ts"], unit="s")
             hist_df = hist_df.set_index("ts")
-            st.line_chart(hist_df, use_container_width=True)
+            st.line_chart(hist_df, width="stretch")
 
         # Per-instrument table
         rows = []
@@ -99,7 +99,7 @@ while True:
             })
         df = pd.DataFrame(rows).sort_values("instrument") if rows else pd.DataFrame(columns=["instrument","symbol","ltp","iv","iv_z"])
         st.subheader("Per-instrument snapshot")
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
 
         # Health bar
         health_rows = []
@@ -117,11 +117,11 @@ while True:
         if not health_df.empty:
             st.subheader("Feed health (reason counts)")
             reason_summary = health_df.groupby("reason")["value"].sum().reset_index()
-            st.dataframe(reason_summary, use_container_width=True)
+            st.dataframe(reason_summary, width="stretch")
             bad = health_df[health_df["reason"] != "ok"]
             if not bad.empty:
                 st.subheader("Contracts needing attention")
-                st.dataframe(bad, use_container_width=True)
+                st.dataframe(bad, width="stretch")
 
     if not auto_refresh:
         break
