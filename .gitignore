@@ -4,8 +4,9 @@ logs/
 __pycache__/
 .conda
 .DS_Store
-.env
+.env/
 data/
 cache/
 prometheus/
 trading_resource/
+.env

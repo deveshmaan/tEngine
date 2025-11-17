@@ -132,7 +132,7 @@ class DataIntegrityConfig:
 @dataclass
 class EngineConfig:
     underlying: str = os.getenv("UNDERLYING", "NIFTY").upper()
-    dry_run: bool = os.getenv("DRY_RUN", "true").lower() in ("1","true","yes")
+    dry_run: bool = os.getenv("DRY_RUN", "false").lower() in ("1","true","yes")
     use_sandbox: bool = os.getenv("USE_SANDBOX", "false").lower() in ("1","true","yes")
     app_tag: str = os.getenv("UPSTOX_APP_NAME", "BUY-ENßßßGINE-NB")
     db_path: Path = Path(os.getenv("UPSTOX_ENGINE_DB", "engine_state.sqlite"))
@@ -143,6 +143,7 @@ class EngineConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     data: DataIntegrityConfig = field(default_factory=DataIntegrityConfig)
     lot_size_map: Dict[str, int] = field(default_factory=dict)
+    margin_segment: str = os.getenv("MARGIN_SEGMENT", "NSE_FO").upper()
 
     @staticmethod
     def load() -> "EngineConfig":
@@ -192,6 +193,19 @@ def pct_move(old: float, new: float) -> float:
 # Wraps authentication, REST clients, and websocket factories. This keeps token handling in one place and ensures the correct sandbox/live base URL is used (per Upstox Open-API recommendations).
 
 # %%
+def _map_segment_for_funds(raw: Optional[str]) -> str:
+    if not raw:
+        return "SEC"
+    seg = raw.replace(" ", "").upper()
+    equity_aliases = {"SEC", "EQUITY", "NSE_FO", "NSEFO", "FNO", "FO", "DERIVATIVE", "DERIVATIVES"}
+    commodity_aliases = {"COM", "COMMODITY", "MCX"}
+    if seg in equity_aliases:
+        return "SEC"
+    if seg in commodity_aliases:
+        return "COM"
+    return "SEC"
+
+
 class UpstoxSession:
     def __init__(self, config: EngineConfig):
         self.config = config
@@ -199,11 +213,13 @@ class UpstoxSession:
         self.order_api: Optional[upstox_client.OrderApiV3] = None
         self.quote_api: Optional[upstox_client.MarketQuoteApi] = None
         self.charge_api: Optional[upstox_client.ChargeApi] = None
+        self._access_token: Optional[str] = None
+        self.user_api: Optional[upstox_client.UserApi] = None
 
     def connect(self):
         if upstox_client is None:
             raise ImportError("Install the official Upstox SDK via `pip install upstox-python-sdk` to use live connectivity.")
-        token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+        token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTFhZGZmOWVmNjIyNjBhYTYwNDFlYWIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzMzY4OTUzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjM0MTY4MDB9.mDvbYEK7rqzvv5dJjhpxpTd96GatH0pDdwILlZ48hdY").strip()
         if not token:
             raise RuntimeError("UPSTOX_ACCESS_TOKEN not set. Complete OAuth flow and export the token.")
         cfg = upstox_client.Configuration(sandbox=self.config.use_sandbox)
@@ -212,6 +228,8 @@ class UpstoxSession:
         self.order_api = upstox_client.OrderApiV3(self._api_client)
         self.quote_api = upstox_client.MarketQuoteApi(self._api_client)
         self.charge_api = upstox_client.ChargeApi(self._api_client)
+        self.user_api = upstox_client.UserApi(self._api_client)
+        self._access_token = token
         print("Connected to Upstox; sandbox=", self.config.use_sandbox)
 
     def market_streamer(self):
@@ -226,6 +244,30 @@ class UpstoxSession:
 
     def index_key(self) -> str:
         return IDX_MAP.get(self.config.underlying, "NSE_INDEX|Nifty 50")
+
+    def fetch_available_margin(self) -> Optional[float]:
+        if self.config.dry_run:
+            return None
+        seg = _map_segment_for_funds(getattr(self.config, "margin_segment", None))
+        try:
+            resp = self.user_api.get_user_fund_margin("2.0", segment=seg)  # type: ignore[arg-type]
+        except ApiException as e:  # type: ignore[name-defined]
+            print(f"[WARN] Unable to fetch margin via SDK: {e}")
+            return None
+        try:
+            sanitized = upstox_client.ApiClient().sanitize_for_serialization(resp)
+        except Exception:
+            sanitized = resp
+        data = (sanitized or {}).get("data") if isinstance(sanitized, dict) else {}
+        equity = data.get("equity") or {}
+        commodity = data.get("commodity") or {}
+        available = (
+            equity.get("available_margin")
+            or equity.get("usable_margin")
+            or commodity.get("available_margin")
+            or commodity.get("usable_margin")
+        )
+        return float(available) if available is not None else None
 
 SESSION = UpstoxSession(CONFIG)
 
@@ -1118,6 +1160,7 @@ class TradingEngine:
         self.ledger = PnLLedger(cfg.db_path)
         self.risk = RiskManager(cfg, self.ledger, metrics=self.metrics)
         self.portfolio: Optional[PortfolioWatcher] = None
+        self._last_margin_poll = 0.0
 
     def bootstrap(self, *, connect_live: bool = True, start_streams: bool = True):
         if connect_live:
@@ -1153,6 +1196,7 @@ class TradingEngine:
                 print("Square-off window reached; stop initiating new trades.")
                 break
             self.metrics.heartbeat()
+            self._poll_margin()
         print("Engine loop finished.")
 
     def _evaluate_exits(self, snapshot: pd.DataFrame):
@@ -1184,6 +1228,17 @@ class TradingEngine:
             if target and ltp >= target:
                 self.risk.flag_exit_pending(key, "target_hit")
                 self.order_mgr.close_position(key, qty, "target_hit")
+
+    def _poll_margin(self):
+        if self.cfg.dry_run:
+            return
+        now = time.time()
+        if now - self._last_margin_poll < 30:
+            return
+        self._last_margin_poll = now
+        margin = self.session.fetch_available_margin()
+        if margin is not None:
+            self.metrics.set_margin_available(margin)
 
 ENGINE = TradingEngine(CONFIG)
 
@@ -1532,7 +1587,7 @@ def main_cli():
         "--replay-only",
         dest="replay_only",
         action="store_true",
-        default=env_flag("REPLAY_ONLY", True),
+        default=env_flag("REPLAY_ONLY", False),
         help="Skip live Upstox streams and rely purely on replay data.",
     )
     parser.add_argument(
@@ -1553,7 +1608,7 @@ def main_cli():
         engine.cfg.strategy.spot_momentum_min = 0.0
         engine.risk._trading_halted = False
         print("[CLI] Replay mode: entry window extended to 23:59 for offline testing.")
-        if env_flag("RELAX_REPLAY_FILTERS", True):
+        if env_flag("RELAX_REPLAY_FILTERS", False):
             engine.cfg.strategy.iv_percentile_min = float(os.getenv("IV_PERCENTILE_MIN_REPLAY", 0.0))
             engine.cfg.strategy.oi_percentile_min = float(os.getenv("OI_PERCENTILE_MIN_REPLAY", 0.0))
             print("[CLI] Replay mode: IV/OI percentile filters relaxed (set RELAX_REPLAY_FILTERS=false for live thresholds).")
