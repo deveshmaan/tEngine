@@ -10,6 +10,17 @@ if [ -f "$ROOT_DIR/.env" ]; then
   source "$ROOT_DIR/.env"
 fi
 
+if ! python - <<'PY' >/dev/null 2>&1; then
+import importlib
+importlib.import_module("upstox_client")
+PY
+  pip install --upgrade upstox-python-sdk >/dev/null
+  python - <<'PY' >/dev/null 2>&1
+import importlib
+importlib.import_module("upstox_client")
+PY
+fi
+
 PROM_BIN="${PROM_BIN:-$ROOT_DIR/prometheus/prometheus}"
 PROM_CONFIG="${PROM_CONFIG:-$ROOT_DIR/prometheus/prometheus.yml}"
 PROM_STORAGE="${PROM_STORAGE:-$ROOT_DIR/prometheus/data}"

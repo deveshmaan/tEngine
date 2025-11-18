@@ -1,12 +1,18 @@
 
 # streamlit_app.py — live UI for the BUY engine (Python 3.12.11)
+import datetime as dt
 import os
 import time
 import re
-import requests
+import sqlite3
 import pandas as pd
 import streamlit as st
 from prometheus_client.parser import text_string_to_metric_families
+
+from brokerage.upstox_client import IST
+
+from brokerage.upstox_client import UpstoxSession as BrokerSession
+from market.instrument_cache import InstrumentCache
 
 PROM_URL = os.getenv("PROM_URL", "http://127.0.0.1:9103/metrics")
 
@@ -25,12 +31,36 @@ def fetch_metrics(url: str) -> dict:
             out[key] = value
     return out
 
-placeholder = st.empty()
+
+def fetch_risk_events(limit: int = 10):
+    path = os.getenv("ENGINE_DB_PATH", "engine_state.sqlite")
+    if not os.path.exists(path):
+        return []
+    try:
+        with sqlite3.connect(path) as conn:
+            rows = conn.execute(
+                "SELECT ts, instrument, reason, code FROM risk_events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return rows
+    except Exception:
+        return []
+
 if "pnl_history" not in st.session_state:
     st.session_state["pnl_history"] = []
 
 auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
 interval = st.sidebar.slider("Refresh (sec)", 1, 10, 2)
+if st.sidebar.button("Warm Option Cache (Phase 1)"):
+    try:
+        session = BrokerSession()
+        cache = InstrumentCache(os.getenv("ENGINE_DB_PATH", "engine_state.sqlite"))
+        expiry, _ = cache.nearest_weekly_and_monthly_expiries("NIFTY", session)
+        count = cache.refresh_option_chain("NIFTY", expiry, session)
+        cache.close()
+        st.sidebar.success(f"Warmed {count} rows for {expiry}")
+    except Exception as exc:
+        st.sidebar.error(f"Cache warm failed: {exc}")
 
 while True:
     try:
@@ -40,10 +70,11 @@ while True:
         time.sleep(3)
         continue
 
-    # Layout
     pnl_val = float(m.get("pnl_net_rupees", 0.0))
     st.session_state["pnl_history"].append({"ts": time.time(), "pnl": pnl_val})
-    st.session_state["pnl_history"] = st.session_state["pnl_history"][-240:]  # keep last ~8 minutes if 2s refresh
+    st.session_state["pnl_history"] = st.session_state["pnl_history"][-240:]
+
+    runtime_tab, metrics_tab = st.tabs(["Runtime", "Metrics"])
 
     def _label_value(key: str, label: str) -> str | None:
         needle = f'{label}="'
@@ -51,7 +82,34 @@ while True:
             return None
         return key.split(needle)[1].split('"')[0]
 
-    with placeholder.container():
+    with runtime_tab:
+        state = "UNKNOWN"
+        for k, v in m.items():
+            if k.startswith("engine_state_indicator{") and v >= 1:
+                state = _label_value(k, "state") or state
+                break
+        hb_ts = float(m.get("engine_heartbeat_ts", 0.0))
+        hb_age = time.time() - hb_ts if hb_ts else 0.0
+        cols = st.columns(3)
+        cols[0].metric("Engine State", state)
+        cols[1].metric("Session Clock (IST)", dt.datetime.now(IST).strftime("%H:%M:%S"))
+        cols[2].metric("Heartbeat Age (s)", f"{hb_age:.1f}")
+        cols = st.columns(3)
+        cols[0].metric("Open Positions", int(m.get("open_positions", 0)))
+        cols[1].metric("Tick latency (ms)", f"{m.get('tick_to_bus_ms_last', 0):.2f}")
+        cols[2].metric("Signal→Post (ms)", f"{m.get('signal_to_post_ms_last', 0):.2f}")
+        cols = st.columns(2)
+        cols[0].metric("Post→Ack (ms)", f"{m.get('post_to_ack_ms_last', 0):.2f}")
+        cols[1].metric("Ack→State (ms)", f"{m.get('ack_to_state_ms_last', 0):.2f}")
+        st.subheader("Recent Risk Rejects")
+        risk_rows = fetch_risk_events()
+        if risk_rows:
+            risk_df = pd.DataFrame(risk_rows, columns=["ts", "instrument", "reason", "code"])
+            st.table(risk_df)
+        else:
+            st.write("No risk rejects logged yet.")
+
+    with metrics_tab:
         cols = st.columns(4)
         cols[0].metric("Signals", int(sum(v for k, v in m.items() if k.startswith("buy_signals_total"))))
         cols[1].metric("Orders Submitted", int(sum(v for k, v in m.items() if k.startswith("orders_submitted_total"))))
@@ -115,9 +173,9 @@ while True:
             })
         health_df = pd.DataFrame(health_rows)
         if not health_df.empty:
-            st.subheader("Feed health (reason counts)")
-            reason_summary = health_df.groupby("reason")["value"].sum().reset_index()
-            st.dataframe(reason_summary, width="stretch")
+        st.subheader("Feed health (reason counts)")
+        reason_summary = health_df.groupby("reason")["value"].sum().reset_index()
+        st.dataframe(reason_summary, width="stretch")
             bad = health_df[health_df["reason"] != "ok"]
             if not bad.empty:
                 st.subheader("Contracts needing attention")
