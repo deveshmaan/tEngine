@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from collections import deque
 from typing import Any, Awaitable, Callable, Deque, Iterable, List, Optional, Protocol, Sequence, Union
@@ -12,6 +13,7 @@ from brokerage.upstox_client import UpstoxConfig, UpstoxSession
 from engine.config import BrokerConfig
 from engine.logging_utils import get_logger
 from engine.oms import BrokerOrderAck, BrokerOrderView, Order
+from engine.instruments import InstrumentResolver
 
 
 class BrokerError(Exception):
@@ -62,6 +64,8 @@ class UpstoxBroker:
         session_factory: Optional[Callable[[Optional[str]], UpstoxSession]] = None,
         stream_client: Optional[MarketStreamClient] = None,
         token_refresh_cb: Optional[Callable[[], Union[str, Awaitable[str]]]] = None,
+        ws_failure_callback: Optional[Callable[[int], Union[None, Awaitable[None]]]] = None,
+        instrument_resolver: Optional[InstrumentResolver] = None,
     ):
         self._cfg = config
         self._session_factory = session_factory or self._default_session_factory
@@ -73,6 +77,8 @@ class UpstoxBroker:
         self._watchdog: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._logger = get_logger("UpstoxBroker")
+        self._ws_failure_cb = ws_failure_callback
+        self._resolver = instrument_resolver
 
     async def start(self) -> None:
         if self._stream and not self._watchdog:
@@ -92,8 +98,11 @@ class UpstoxBroker:
             await self._stream.close()
 
     async def submit_order(self, order: Order) -> BrokerOrderAck:
+        instrument_symbol = order.symbol
+        if self._resolver:
+            instrument_symbol = await self._resolver.resolve_symbol(order.symbol)
         payload = upstox_client.PlaceOrderV3Request(
-            instrument_token=order.symbol,
+            instrument_token=instrument_symbol,
             transaction_type=order.side.upper(),
             order_type=order.order_type,
             product="I",
@@ -191,16 +200,19 @@ class UpstoxBroker:
 
     async def _stream_watchdog(self) -> None:
         backoffs = self._cfg.ws_backoff_seconds or (1, 2, 5, 10)
-        index = 0
+        failures = 0
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stream.heartbeat(), timeout=self._cfg.ws_heartbeat_interval)  # type: ignore[arg-type]
                 await asyncio.sleep(self._cfg.ws_heartbeat_interval)
-                index = 0
+                failures = 0
             except Exception:
-                delay = backoffs[min(index, len(backoffs) - 1)]
-                index = min(index + 1, len(backoffs) - 1)
-                await asyncio.sleep(delay)
+                failures += 1
+                idx = min(failures - 1, len(backoffs) - 1)
+                delay = backoffs[idx]
+                await asyncio.sleep(delay + random.uniform(0, delay))
+                if self._ws_failure_cb and failures >= len(backoffs):
+                    await self._notify_ws_failure(failures)
                 try:
                     await self._stream.close()  # type: ignore[union-attr]
                 except Exception:
@@ -213,6 +225,14 @@ class UpstoxBroker:
     def _default_session_factory(token: Optional[str]) -> UpstoxSession:
         cfg = UpstoxConfig(access_token=token, sandbox=False) if token else None  # type: ignore[arg-type]
         return UpstoxSession(cfg)
+
+    async def _notify_ws_failure(self, failures: int) -> None:
+        if not self._ws_failure_cb:
+            return
+        cb = self._ws_failure_cb
+        result = cb(failures)
+        if asyncio.iscoroutine(result):
+            await result
 
 
 __all__ = ["BrokerError", "MarketStreamClient", "RateLimiter", "UpstoxBroker"]

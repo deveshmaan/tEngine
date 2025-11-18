@@ -3,6 +3,7 @@ envt/
 logs/
 __pycache__/
 .conda
+.engine-env/
 .DS_Store
 .env/
 data/

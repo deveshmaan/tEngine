@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, Optional, Set
 
 import yaml
 
+from engine.time_machine import now as engine_now
+
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 
 
@@ -108,6 +110,15 @@ class OMSConfig:
 
 
 @dataclass(frozen=True)
+class AlertConfig:
+    throttle_seconds: float = 30.0
+
+    @staticmethod
+    def from_dict(payload: Dict[str, Any]) -> "AlertConfig":
+        return AlertConfig(throttle_seconds=float(payload.get("throttle_seconds", 30.0)))
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     run_id: str
     persistence_path: Path
@@ -116,6 +127,7 @@ class EngineConfig:
     broker: BrokerConfig
     oms: OMSConfig
     strategy_tag: str
+    alerts: AlertConfig
 
     @staticmethod
     def load(path: Optional[str | Path] = None) -> "EngineConfig":
@@ -124,13 +136,14 @@ class EngineConfig:
             raise FileNotFoundError(f"Engine configuration {cfg_path} not found")
         with cfg_path.open("r", encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
-        run_id = str(raw.get("run_id") or f"run-{dt.datetime.now(IST).strftime('%Y%m%d')}")
+        run_id = str(raw.get("run_id") or f"run-{engine_now(IST).strftime('%Y%m%d')}")
         persistence_path = Path(raw.get("persistence_path", "engine_state.sqlite"))
         risk = RiskLimits.from_dict(raw["risk"])
         data = DataConfig.from_dict(raw["data"])
         broker = BrokerConfig.from_dict(raw.get("broker", {}))
         oms = OMSConfig.from_dict(raw.get("oms", {}))
         strategy_tag = str(raw.get("strategy_tag", "intraday-buy"))
+        alerts = AlertConfig.from_dict(raw.get("alerts", {}))
         return EngineConfig(
             run_id=run_id,
             persistence_path=persistence_path,
@@ -139,10 +152,12 @@ class EngineConfig:
             broker=broker,
             oms=oms,
             strategy_tag=strategy_tag,
+            alerts=alerts,
         )
 
 
 __all__ = [
+    "AlertConfig",
     "DataConfig",
     "EngineConfig",
     "IST",

@@ -10,7 +10,8 @@ class StructuredLogger(logging.LoggerAdapter):
     """Thin adapter that enforces structured JSON logging."""
 
     def log_event(self, level: int, event: str, **fields: Any) -> None:
-        payload: Dict[str, Any] = {"event": event, "ts": dt.datetime.utcnow().isoformat()}
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        payload: Dict[str, Any] = {"event": event, "ts": stamp}
         payload.update(fields)
         message = json.dumps(payload, default=str, separators=(",", ":"))
         self.logger.log(level, message)

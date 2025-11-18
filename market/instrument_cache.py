@@ -211,6 +211,8 @@ class InstrumentCache:
         payload = session.get_option_chain(underlying_key, expiry_date)
         contracts = self._parse_option_chain(payload)
         if not contracts:
+            contracts = self._contracts_from_master(symbol, expiry_date)
+        if not contracts:
             logging.warning("Option chain empty for %s %s", symbol, expiry_date)
             return 0
         now = self._now_str()
@@ -323,6 +325,53 @@ class InstrumentCache:
                         "price_band_high": item.get("price_band_upper") or item.get("priceBandUpper"),
                     })
 
+        return tuple(contracts)
+
+    def _contracts_from_master(self, symbol: str, expiry_date: str) -> Tuple[Dict[str, str], ...]:
+        data = self._load_master_data()
+        if not data:
+            return tuple()
+        target = dt.date.fromisoformat(expiry_date)
+        symbol_upper = symbol.upper()
+        contracts: list[Dict[str, str]] = []
+        for row in data:
+            segment = str(row.get("segment") or row.get("Segment") or "").upper()
+            if segment != "NSE_FO":
+                continue
+            inst_type = str(row.get("instrument_type") or row.get("instrumentType") or "").upper()
+            if inst_type not in {"CE", "PE"}:
+                continue
+            name = str(row.get("name") or row.get("tradingsymbol") or row.get("trading_symbol") or "").upper()
+            if symbol_upper not in name:
+                continue
+            expiry_val = row.get("expiry") or row.get("expiry_date") or row.get("expiryDate")
+            if not expiry_val:
+                continue
+            if isinstance(expiry_val, (int, float)):
+                exp_dt = dt.datetime.fromtimestamp(float(expiry_val) / 1000.0).date()
+            else:
+                try:
+                    exp_dt = dt.datetime.fromisoformat(str(expiry_val)).date()
+                except ValueError:
+                    continue
+            if exp_dt != target:
+                continue
+            strike = row.get("strike_price") or row.get("strikePrice") or row.get("strike")
+            instrument_key = row.get("instrument_key") or row.get("instrumentKey")
+            if not strike or not instrument_key:
+                continue
+            contracts.append(
+                {
+                    "instrument_key": str(instrument_key),
+                    "strike": float(strike),
+                    "type": inst_type,
+                    "lot_size": row.get("lot_size") or row.get("lotSize"),
+                    "tick_size": row.get("tick_size") or row.get("tickSize"),
+                    "freeze_qty": row.get("freeze_quantity") or row.get("freezeQuantity"),
+                    "price_band_low": row.get("price_band_lower") or row.get("priceBandLower"),
+                    "price_band_high": row.get("price_band_upper") or row.get("priceBandUpper"),
+                }
+            )
         return tuple(contracts)
 
     # ----- Lookup helpers -------------------------------------------------

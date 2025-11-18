@@ -1,186 +1,156 @@
+from __future__ import annotations
 
-# streamlit_app.py — live UI for the BUY engine (Python 3.12.11)
 import datetime as dt
+import json
 import os
-import time
-import re
 import sqlite3
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
 import pandas as pd
+import requests
 import streamlit as st
 from prometheus_client.parser import text_string_to_metric_families
+from yaml import safe_load
 
-from brokerage.upstox_client import IST
-
-from brokerage.upstox_client import UpstoxSession as BrokerSession
-from market.instrument_cache import InstrumentCache
-
+DEFAULT_DB = Path(os.getenv("ENGINE_DB_PATH", "engine_state.sqlite"))
 PROM_URL = os.getenv("PROM_URL", "http://127.0.0.1:9103/metrics")
-
-st.set_page_config(page_title="Intraday BUY Options — Engine UI", layout="wide")
-st.title("Intraday BUY Options — Engine UI")
-
-def fetch_metrics(url: str) -> dict:
-    r = requests.get(url, timeout=3)
-    r.raise_for_status()
-    out = {}
-    for fam in text_string_to_metric_families(r.text):
-        for s in fam.samples:
-            # sample: (name, labels, value, timestamp, exemplar)
-            name, labels, value, *_ = s
-            key = name + ("{" + ",".join([f'{k}="{v}"' for k,v in labels.items()]) + "}" if labels else "")
-            out[key] = value
-    return out
+ENGINE_CONFIG = Path(os.getenv("ENGINE_CONFIG", "engine_config.yaml"))
 
 
-def fetch_risk_events(limit: int = 10):
-    path = os.getenv("ENGINE_DB_PATH", "engine_state.sqlite")
-    if not os.path.exists(path):
-        return []
+def load_risk_limits() -> Dict[str, float]:
+    if not ENGINE_CONFIG.exists():
+        return {}
+    with ENGINE_CONFIG.open("r", encoding="utf-8") as handle:
+        raw = safe_load(handle) or {}
+    return raw.get("risk", {})
+
+
+def fetch_metrics() -> Dict[str, float]:
     try:
-        with sqlite3.connect(path) as conn:
-            rows = conn.execute(
-                "SELECT ts, instrument, reason, code FROM risk_events ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return rows
+        resp = requests.get(PROM_URL, timeout=2)
+        resp.raise_for_status()
     except Exception:
-        return []
+        return {}
+    parsed: Dict[str, float] = {}
+    for fam in text_string_to_metric_families(resp.text):
+        for sample in fam.samples:
+            name, labels, value = sample[:3]
+            key = name
+            if labels:
+                label_text = ",".join(f'{k}="{v}"' for k, v in labels.items())
+                key = f"{name}{{{label_text}}}"
+            parsed[key] = value
+    return parsed
 
-if "pnl_history" not in st.session_state:
-    st.session_state["pnl_history"] = []
 
-auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
-interval = st.sidebar.slider("Refresh (sec)", 1, 10, 2)
-if st.sidebar.button("Warm Option Cache (Phase 1)"):
-    try:
-        session = BrokerSession()
-        cache = InstrumentCache(os.getenv("ENGINE_DB_PATH", "engine_state.sqlite"))
-        expiry, _ = cache.nearest_weekly_and_monthly_expiries("NIFTY", session)
-        count = cache.refresh_option_chain("NIFTY", expiry, session)
-        cache.close()
-        st.sidebar.success(f"Warmed {count} rows for {expiry}")
-    except Exception as exc:
-        st.sidebar.error(f"Cache warm failed: {exc}")
+def fetch_df(conn: sqlite3.Connection, query: str, params: tuple[Any, ...]) -> pd.DataFrame:
+    return pd.read_sql_query(query, conn, params=params)
 
-while True:
-    try:
-        m = fetch_metrics(PROM_URL)
-    except Exception as e:
-        st.error(f"Failed to fetch metrics from {PROM_URL}: {e}")
-        time.sleep(3)
-        continue
 
-    pnl_val = float(m.get("pnl_net_rupees", 0.0))
-    st.session_state["pnl_history"].append({"ts": time.time(), "pnl": pnl_val})
-    st.session_state["pnl_history"] = st.session_state["pnl_history"][-240:]
+def fetch_latest_snapshot(conn: sqlite3.Connection, run_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        "SELECT ts, realized, unrealized, fees, net, per_symbol FROM pnl_snapshots WHERE run_id=? ORDER BY ts DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return None
+    entry = dict(row)
+    entry["per_symbol"] = json.loads(entry["per_symbol"] or "{}")
+    return entry
 
-    runtime_tab, metrics_tab = st.tabs(["Runtime", "Metrics"])
 
-    def _label_value(key: str, label: str) -> str | None:
-        needle = f'{label}="'
-        if needle not in key:
-            return None
-        return key.split(needle)[1].split('"')[0]
+def fetch_pnl_history(conn: sqlite3.Connection, run_id: str, limit: int = 200) -> pd.DataFrame:
+    rows = conn.execute(
+        "SELECT ts, net FROM pnl_snapshots WHERE run_id=? ORDER BY ts DESC LIMIT ?",
+        (run_id, limit),
+    ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["ts", "net"])
+    df = pd.DataFrame(rows, columns=["ts", "net"])
+    df["ts"] = pd.to_datetime(df["ts"])
+    return df.sort_values("ts")
 
-    with runtime_tab:
-        state = "UNKNOWN"
-        for k, v in m.items():
-            if k.startswith("engine_state_indicator{") and v >= 1:
-                state = _label_value(k, "state") or state
-                break
-        hb_ts = float(m.get("engine_heartbeat_ts", 0.0))
-        hb_age = time.time() - hb_ts if hb_ts else 0.0
-        cols = st.columns(3)
-        cols[0].metric("Engine State", state)
-        cols[1].metric("Session Clock (IST)", dt.datetime.now(IST).strftime("%H:%M:%S"))
-        cols[2].metric("Heartbeat Age (s)", f"{hb_age:.1f}")
-        cols = st.columns(3)
-        cols[0].metric("Open Positions", int(m.get("open_positions", 0)))
-        cols[1].metric("Tick latency (ms)", f"{m.get('tick_to_bus_ms_last', 0):.2f}")
-        cols[2].metric("Signal→Post (ms)", f"{m.get('signal_to_post_ms_last', 0):.2f}")
-        cols = st.columns(2)
-        cols[0].metric("Post→Ack (ms)", f"{m.get('post_to_ack_ms_last', 0):.2f}")
-        cols[1].metric("Ack→State (ms)", f"{m.get('ack_to_state_ms_last', 0):.2f}")
-        st.subheader("Recent Risk Rejects")
-        risk_rows = fetch_risk_events()
-        if risk_rows:
-            risk_df = pd.DataFrame(risk_rows, columns=["ts", "instrument", "reason", "code"])
-            st.table(risk_df)
-        else:
-            st.write("No risk rejects logged yet.")
 
-    with metrics_tab:
-        cols = st.columns(4)
-        cols[0].metric("Signals", int(sum(v for k, v in m.items() if k.startswith("buy_signals_total"))))
-        cols[1].metric("Orders Submitted", int(sum(v for k, v in m.items() if k.startswith("orders_submitted_total"))))
-        cols[2].metric("Fills", int(sum(v for k, v in m.items() if k.startswith("orders_filled_total"))))
-        cols[3].metric("Rejects", int(sum(v for k, v in m.items() if k.startswith("orders_rejected_total"))))
+def insert_control_intent(conn: sqlite3.Connection, run_id: str, action: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    ts = dt.datetime.utcnow().isoformat()
+    conn.execute(
+        "INSERT INTO control_intents(run_id, ts, action, payload_json) VALUES (?, ?, ?, ?)",
+        (run_id, ts, action, json.dumps(payload) if payload else None),
+    )
+    conn.commit()
 
-        cols = st.columns(3)
-        cols[0].metric("PnL (₹)", f"{pnl_val:,.0f}")
-        cols[1].metric("Avail Margin (₹)", f"{m.get('margin_available_rupees', 0):,.0f}")
-        cols[2].metric("Open Positions", int(m.get("open_positions", 0)))
 
-        cols = st.columns(3)
-        risk_state = "HALTED" if m.get("risk_halt_state", 0) >= 1 else "ACTIVE"
-        cols[0].metric("Risk State", risk_state)
-        hb_age = time.time() - float(m.get("engine_heartbeat_ts", time.time()))
-        cols[1].metric("Heartbeat Age (s)", f"{hb_age:.1f}")
-        cols[2].metric("Last Latency (ms)", f"{m.get('last_execution_latency_ms', 0):,.1f}")
+st.set_page_config(page_title="Trading Engine Console", layout="wide")
+st.title("Trading Engine Console")
 
-        st.subheader("PnL trend (session)")
-        hist_df = pd.DataFrame(st.session_state["pnl_history"])
-        if not hist_df.empty:
-            hist_df["ts"] = pd.to_datetime(hist_df["ts"], unit="s")
-            hist_df = hist_df.set_index("ts")
-            st.line_chart(hist_df, width="stretch")
+db_path = Path(st.sidebar.text_input("State DB", value=str(DEFAULT_DB)))
+run_id = st.sidebar.text_input("Run ID", value="dev-run")
+auto = st.sidebar.checkbox("Auto refresh", value=True)
+interval = st.sidebar.slider("Refresh seconds", min_value=1, max_value=10, value=2)
+if auto:
+    st.sidebar.caption("Streaming updates enabled")
 
-        # Per-instrument table
-        rows = []
-        for k, v in m.items():
-            if not k.startswith("ltp_underlying{"):
-                continue
-            inst = _label_value(k, "instrument")
-            if not inst:
-                continue
-            symbol = None
-            for sym_key in m.keys():
-                if sym_key.startswith("instrument_trading_symbol{") and inst in sym_key:
-                    symbol = sym_key.split('symbol="')[1].split('"')[0]
+metrics_data = fetch_metrics()
+limits = load_risk_limits()
 
-            rows.append({
-                "instrument": inst,
-                "symbol": symbol,
-                "ltp": v,
-                "iv": m.get(f'option_iv{{instrument="{inst}"}}', float("nan")),
-                "iv_z": m.get(f'option_iv_zscore{{instrument="{inst}"}}', float("nan")),
-            })
-        df = pd.DataFrame(rows).sort_values("instrument") if rows else pd.DataFrame(columns=["instrument","symbol","ltp","iv","iv_z"])
-        st.subheader("Per-instrument snapshot")
-        st.dataframe(df, width="stretch")
+with sqlite3.connect(db_path) as conn:
+    conn.row_factory = sqlite3.Row
+    positions = fetch_df(conn, "SELECT symbol, qty, avg_price, opened_at, closed_at FROM positions WHERE run_id=?", (run_id,))
+    orders = fetch_df(
+        conn,
+        "SELECT client_order_id, symbol, side, qty, state, last_update FROM orders WHERE run_id=? ORDER BY last_update DESC LIMIT 100",
+        (run_id,),
+    )
+    incidents = fetch_df(conn, "SELECT ts, code, payload FROM incidents WHERE run_id=? ORDER BY ts DESC LIMIT 50", (run_id,))
+    snapshot = fetch_latest_snapshot(conn, run_id)
+    pnl_history = fetch_pnl_history(conn, run_id)
 
-        # Health bar
-        health_rows = []
-        for k, v in m.items():
-            if not k.startswith("instrument_health_state{"):
-                continue
-            inst_match = re.search(r'instrument="([^"]+)"', k)
-            reason_match = re.search(r'reason="([^"]+)"', k)
-            health_rows.append({
-                "instrument": inst_match.group(1) if inst_match else "unknown",
-                "reason": reason_match.group(1) if reason_match else "unknown",
-                "value": v,
-            })
-        health_df = pd.DataFrame(health_rows)
-        if not health_df.empty:
-        st.subheader("Feed health (reason counts)")
-        reason_summary = health_df.groupby("reason")["value"].sum().reset_index()
-        st.dataframe(reason_summary, width="stretch")
-            bad = health_df[health_df["reason"] != "ok"]
-            if not bad.empty:
-                st.subheader("Contracts needing attention")
-                st.dataframe(bad, width="stretch")
+run_col1, run_col2, run_col3 = st.columns(3)
+heartbeat = metrics_data.get("heartbeat_ts", 0.0)
+lag = time.time() - heartbeat if heartbeat else float("nan")
+run_col1.metric("Heartbeat", f"{heartbeat:.0f}")
+run_col2.metric("Lag (s)", f"{lag:.1f}" if heartbeat else "n/a")
+run_col3.metric("Open Orders", int(metrics_data.get("order_queue_depth", 0)))
 
-    if not auto_refresh:
-        break
+st.subheader("Risk Dials")
+risk_cols = st.columns(3)
+realized = snapshot["realized"] if snapshot else 0.0
+unrealized = snapshot["unrealized"] if snapshot else 0.0
+fees = snapshot["fees"] if snapshot else 0.0
+net = realized + unrealized - fees
+daily_limit = limits.get("daily_pnl_stop", 0.0)
+risk_cols[0].metric("Realized PnL", f"{realized:,.0f}", delta=None)
+risk_cols[1].metric("Unrealized PnL", f"{unrealized:,.0f}", delta=None)
+risk_cols[2].metric("Net PnL vs Stop", f"{net:,.0f}", delta=f"-{daily_limit:,.0f}" if daily_limit else None)
+
+st.subheader("Open Positions")
+st.dataframe(positions, use_container_width=True)
+
+st.subheader("Orders")
+st.dataframe(orders, use_container_width=True)
+
+st.subheader("Incidents")
+st.dataframe(incidents, use_container_width=True)
+
+st.subheader("PnL Trend")
+if not pnl_history.empty:
+    st.line_chart(pnl_history.set_index("ts"))
+else:
+    st.write("No PnL snapshots yet.")
+
+st.subheader("Controls")
+ctrl_cols = st.columns(2)
+with sqlite3.connect(db_path) as conn:
+    conn.row_factory = sqlite3.Row
+    if ctrl_cols[0].button("Kill Switch"):
+        insert_control_intent(conn, run_id, "KILL", {"source": "ui"})
+        st.success("Kill intent posted")
+    if ctrl_cols[1].button("Square-Off"):
+        insert_control_intent(conn, run_id, "SQUARE_OFF", {"source": "ui"})
+        st.success("Square-off intent posted")
+
+if auto:
     time.sleep(interval)
+    st.rerun()

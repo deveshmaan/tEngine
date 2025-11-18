@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import sqlite3
 import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING
+
+from persistence.db import connect_db, run_migrations
+
+try:  # Optional dependency on engine.time_machine without creating strong cycle
+    from engine.time_machine import utc_now as engine_utc_now
+except Exception:  # pragma: no cover - fallback when engine module unavailable
+    engine_utc_now = lambda: dt.datetime.now(dt.timezone.utc)  # type: ignore
 
 if TYPE_CHECKING:  # pragma: no cover - for type checkers only
     from engine.oms import Order, OrderState
@@ -17,87 +23,12 @@ class SQLiteStore:
     def __init__(self, path: str | Path, run_id: str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys=ON;")
-        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn = connect_db(self.path)
         self._lock = threading.Lock()
         self.run_id = run_id
         self._latest_ts = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-        self._migrate()
+        run_migrations(self._conn)
         self._ensure_run()
-
-    # ------------------------------------------------------------------ schema
-    def _migrate(self) -> None:
-        cur = self._conn.cursor()
-        version = cur.execute("PRAGMA user_version").fetchone()[0]
-        if version < 1:
-            cur.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS runs (
-                    run_id TEXT PRIMARY KEY,
-                    started_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS orders (
-                    run_id TEXT NOT NULL,
-                    client_order_id TEXT NOT NULL,
-                    strategy TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    qty INTEGER NOT NULL,
-                    price REAL,
-                    state TEXT NOT NULL,
-                    last_update TEXT NOT NULL,
-                    broker_order_id TEXT,
-                    UNIQUE(run_id, client_order_id)
-                );
-                CREATE TABLE IF NOT EXISTS order_transitions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    client_order_id TEXT NOT NULL,
-                    prev_state TEXT,
-                    new_state TEXT NOT NULL,
-                    ts TEXT NOT NULL,
-                    reason TEXT
-                );
-                CREATE TABLE IF NOT EXISTS executions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    client_order_id TEXT NOT NULL,
-                    ts TEXT NOT NULL,
-                    qty INTEGER NOT NULL,
-                    price REAL NOT NULL,
-                    liquidity TEXT
-                );
-                CREATE TABLE IF NOT EXISTS risk_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    ts TEXT NOT NULL,
-                    code TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    symbol TEXT,
-                    context TEXT
-                );
-                CREATE TABLE IF NOT EXISTS incidents (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    ts TEXT NOT NULL,
-                    code TEXT NOT NULL,
-                    payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS cost_ledger (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    ts TEXT NOT NULL,
-                    symbol TEXT,
-                    amount REAL NOT NULL,
-                    kind TEXT NOT NULL,
-                    note TEXT
-                );
-                """
-            )
-            cur.execute("PRAGMA user_version = 1;")
-        self._conn.commit()
 
     def _ensure_run(self) -> None:
         with self._lock:
@@ -110,7 +41,7 @@ class SQLiteStore:
 
     # ----------------------------------------------------------------- helpers
     def _ts(self, ts: Optional[dt.datetime] = None) -> str:
-        current = (ts or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+        current = (ts or engine_utc_now()).astimezone(dt.timezone.utc)
         if current <= self._latest_ts:
             current = self._latest_ts + dt.timedelta(microseconds=1)
         self._latest_ts = current
@@ -127,8 +58,8 @@ class SQLiteStore:
             ts = self._ts(order.updated_at)
             self._conn.execute(
                 """
-                INSERT INTO orders(run_id, client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO orders(run_id, client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id, idempotency_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, client_order_id) DO UPDATE SET
                     strategy=excluded.strategy,
                     symbol=excluded.symbol,
@@ -137,7 +68,8 @@ class SQLiteStore:
                     price=excluded.price,
                     state=excluded.state,
                     last_update=excluded.last_update,
-                    broker_order_id=excluded.broker_order_id
+                    broker_order_id=excluded.broker_order_id,
+                    idempotency_key=excluded.idempotency_key
                 """,
                 (
                     self.run_id,
@@ -150,6 +82,7 @@ class SQLiteStore:
                     order.state.value,
                     ts,
                     order.broker_order_id,
+                    order.idempotency_key,
                 ),
             )
             self._conn.commit()
@@ -167,15 +100,26 @@ class SQLiteStore:
             self._conn.commit()
 
     # ------------------------------------------------------------- executions
-    def record_execution(self, client_order_id: str, qty: int, price: float, liquidity: str = "UNKNOWN", ts: Optional[dt.datetime] = None) -> None:
+    def record_execution(
+        self,
+        order_id: str,
+        *,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        venue: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        ts: Optional[dt.datetime] = None,
+    ) -> None:
         with self._lock:
             stamp = self._ts(ts)
             self._conn.execute(
                 """
-                INSERT INTO executions(run_id, client_order_id, ts, qty, price, liquidity)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO executions(run_id, order_id, symbol, side, qty, price, ts, venue, idempotency_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (self.run_id, client_order_id, stamp, qty, price, liquidity),
+                (self.run_id, order_id, symbol, side, qty, price, stamp, venue, idempotency_key),
             )
             self._conn.commit()
 
@@ -205,16 +149,108 @@ class SQLiteStore:
             )
             self._conn.commit()
 
-    # -------------------------------------------------------------- cost ledger
-    def record_cost(self, symbol: Optional[str], amount: float, kind: str, note: Optional[str] = None, ts: Optional[dt.datetime] = None) -> None:
+    # ---------------------------------------------------------- market events
+    def record_market_event(self, event_type: str, payload: Dict[str, Any], ts: Optional[dt.datetime] = None) -> None:
         with self._lock:
             stamp = self._ts(ts)
             self._conn.execute(
                 """
-                INSERT INTO cost_ledger(run_id, ts, symbol, amount, kind, note)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO event_log(run_id, ts, event_type, payload)
+                VALUES (?, ?, ?, ?)
                 """,
-                (self.run_id, stamp, symbol, amount, kind, note),
+                (self.run_id, stamp, event_type, self._json(payload) or "{}"),
+            )
+            self._conn.commit()
+
+    # -------------------------------------------------------------- cost ledger
+    def record_cost(
+        self,
+        exec_id: str,
+        *,
+        category: str,
+        amount: float,
+        currency: str = "INR",
+        note: Optional[str] = None,
+        ts: Optional[dt.datetime] = None,
+    ) -> None:
+        with self._lock:
+            stamp = self._ts(ts)
+            self._conn.execute(
+                """
+                INSERT INTO cost_ledger(run_id, exec_id, category, amount, currency, ts, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (self.run_id, exec_id, category, amount, currency, stamp, note),
+            )
+            self._conn.commit()
+
+    def record_pnl_snapshot(
+        self,
+        *,
+        ts: dt.datetime,
+        realized: float,
+        unrealized: float,
+        fees: float,
+        per_symbol: Dict[str, Any],
+    ) -> None:
+        net = realized + unrealized - fees
+        payload = json.dumps(per_symbol, separators=(",", ":"))
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO pnl_snapshots(run_id, ts, realized, unrealized, fees, net, per_symbol)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (self.run_id, ts.isoformat(), realized, unrealized, fees, net, payload),
+            )
+            self._conn.commit()
+
+    def upsert_position(
+        self,
+        *,
+        symbol: str,
+        expiry: Optional[str],
+        strike: Optional[float],
+        opt_type: Optional[str],
+        qty: int,
+        avg_price: float,
+        opened_at: dt.datetime,
+        closed_at: Optional[dt.datetime],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO positions(run_id, symbol, expiry, strike, opt_type, qty, avg_price, opened_at, closed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, symbol, expiry, strike, opt_type) DO UPDATE SET
+                    qty=excluded.qty,
+                    avg_price=excluded.avg_price,
+                    opened_at=excluded.opened_at,
+                    closed_at=excluded.closed_at
+                """,
+                (
+                    self.run_id,
+                    symbol,
+                    expiry,
+                    strike,
+                    opt_type,
+                    qty,
+                    avg_price,
+                    opened_at.isoformat(),
+                    closed_at.isoformat() if closed_at else None,
+                ),
+            )
+            self._conn.commit()
+
+    def insert_control_intent(self, action: str, payload: Optional[Dict[str, Any]] = None, ts: Optional[dt.datetime] = None) -> None:
+        with self._lock:
+            stamp = self._ts(ts)
+            self._conn.execute(
+                """
+                INSERT INTO control_intents(run_id, ts, action, payload_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (self.run_id, stamp, action, self._json(payload)),
             )
             self._conn.commit()
 
@@ -244,6 +280,104 @@ class SQLiteStore:
             (self.run_id,),
         )
         return [(row[0], row[1], row[2]) for row in cur.fetchall()]
+
+    def list_cost_ledger(self) -> List[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT exec_id, category, amount, currency, ts, note FROM cost_ledger WHERE run_id=? ORDER BY ts",
+            (self.run_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def list_pnl_snapshots(self) -> List[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT ts, realized, unrealized, fees, net, per_symbol FROM pnl_snapshots WHERE run_id=? ORDER BY ts",
+            (self.run_id,),
+        )
+        rows = []
+        for row in cur.fetchall():
+            rows.append(
+                {
+                    "ts": row["ts"],
+                    "realized": row["realized"],
+                    "unrealized": row["unrealized"],
+                    "fees": row["fees"],
+                    "net": row["net"],
+                    "per_symbol": json.loads(row["per_symbol"] or "{}"),
+                }
+            )
+        return rows
+
+    def iter_market_events(self) -> Iterable[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT ts, event_type, payload FROM event_log WHERE run_id=? ORDER BY ts",
+            (self.run_id,),
+        )
+        for row in cur.fetchall():
+            yield {
+                "ts": row["ts"],
+                "type": row["event_type"],
+                "payload": json.loads(row["payload"] or "{}"),
+            }
+
+    def fetch_market_events_for(self, source_run_id: str) -> List[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT ts, event_type, payload FROM event_log WHERE run_id=? ORDER BY ts",
+            (source_run_id,),
+        )
+        events: List[Dict[str, Any]] = []
+        for row in cur.fetchall():
+            events.append(
+                {
+                    "ts": row["ts"],
+                    "type": row["event_type"],
+                    "payload": json.loads(row["payload"] or "{}"),
+                }
+            )
+        return events
+
+    def load_active_orders(self) -> List[Dict[str, Any]]:
+        cur = self._conn.execute(
+            """
+            SELECT client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id, idempotency_key
+            FROM orders
+            WHERE run_id=? AND state NOT IN ('FILLED','REJECTED','CANCELED')
+            """,
+            (self.run_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def find_order_by_idempotency(self, key: str) -> Optional[Dict[str, Any]]:
+        cur = self._conn.execute(
+            """
+            SELECT client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id, idempotency_key
+            FROM orders WHERE run_id=? AND idempotency_key=?
+            """,
+            (self.run_id, key),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def control_intents_since(self, since_ts: Optional[str]) -> List[Dict[str, Any]]:
+        if since_ts:
+            cur = self._conn.execute(
+                "SELECT ts, action, payload_json FROM control_intents WHERE run_id=? AND ts>? ORDER BY ts",
+                (self.run_id, since_ts),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT ts, action, payload_json FROM control_intents WHERE run_id=? ORDER BY ts",
+                (self.run_id,),
+            )
+        intents = []
+        for row in cur.fetchall():
+            intents.append(
+                {
+                    "ts": row["ts"],
+                    "action": row["action"],
+                    "payload": json.loads(row["payload_json"] or "{}"),
+                }
+            )
+        return intents
 
 
 __all__ = ["SQLiteStore"]

@@ -27,9 +27,24 @@ PROM_STORAGE="${PROM_STORAGE:-$ROOT_DIR/prometheus/data}"
 PROM_PORT="${PROM_PORT:-9090}"
 METRICS_PORT="${METRICS_PORT:-9103}"
 STREAMLIT_PORT="${STREAMLIT_PORT:-8502}"
-ENGINE_CMD=(python "$ROOT_DIR/main.py")
-STREAMLIT_CMD=(streamlit run "$ROOT_DIR/streamlit_app.py" --server.port "$STREAMLIT_PORT")
+PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.engine-env/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python)"
+fi
+ENGINE_CMD=("$PYTHON_BIN" "$ROOT_DIR/main.py")
+STREAMLIT_BIN_DEFAULT="$ROOT_DIR/.engine-env/bin/streamlit"
+if [ -x "$STREAMLIT_BIN_DEFAULT" ]; then
+  STREAMLIT_BIN="$STREAMLIT_BIN_DEFAULT"
+else
+  STREAMLIT_BIN=$(command -v streamlit 2>/dev/null || true)
+fi
+STREAMLIT_CMD=("$STREAMLIT_BIN" run "$ROOT_DIR/streamlit_app.py" --server.port "$STREAMLIT_PORT")
+if ! [[ "$METRICS_PORT" =~ ^[0-9]+$ ]]; then
+  echo "[STACK] Invalid METRICS_PORT '$METRICS_PORT' - defaulting to 9103"
+  METRICS_PORT=9103
+fi
 export METRICS_PORT STREAMLIT_PORT PROM_PORT
+echo "[STACK] Metrics endpoint will listen on port $METRICS_PORT"
 
 mkdir -p "$PROM_STORAGE"
 
@@ -70,9 +85,8 @@ else
 fi
 
 echo "[STACK] Starting Streamlit UI"
-STREAMLIT_BIN=$(command -v streamlit 2>/dev/null || true)
 if [ -n "$STREAMLIT_BIN" ]; then
-  "$STREAMLIT_BIN" run "$ROOT_DIR/streamlit_app.py" --server.port "$STREAMLIT_PORT" &
+  "${STREAMLIT_CMD[@]}" &
   STREAMLIT_PID=$!
 else
   echo "[STACK] streamlit executable not found; please install streamlit"

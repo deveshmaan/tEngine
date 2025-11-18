@@ -8,6 +8,7 @@ from typing import Callable, Deque, Dict, Optional
 
 from engine.config import IST, RiskLimits
 from engine.logging_utils import get_logger
+from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 
 # Legacy imports kept for backwards compatibility with RiskGates
@@ -54,7 +55,7 @@ class RiskManager:
     def __init__(self, config: RiskLimits, store: SQLiteStore, *, clock: Optional[Callable[[], dt.datetime]] = None, logger: Optional[logging.Logger] = None):
         self.cfg = config
         self.store = store
-        self._clock = clock or (lambda: dt.datetime.now(IST))
+        self._clock = clock or (lambda: engine_now(IST))
         self._positions: Dict[str, PositionState] = {}
         self._order_timestamps: Deque[dt.datetime] = deque()
         self._halt_reason: Optional[str] = None
@@ -151,6 +152,30 @@ class RiskManager:
         self._kill_switch = True
         if not self._halt_reason:
             self._halt_reason = reason
+
+    def halt_new_entries(self, reason: str) -> None:
+        self._emit_event("HALT", reason, None)
+        self._kill_switch = True
+        self._halt_reason = reason
+
+    def square_off_all(self, reason: str) -> list[OrderBudget]:
+        budgets: list[OrderBudget] = []
+        for symbol, state in self._positions.items():
+            if state.net_qty <= 0:
+                continue
+            px = state.last_price if state.last_price is not None else state.avg_price
+            budgets.append(
+                OrderBudget(
+                    symbol=symbol,
+                    qty=state.net_qty,
+                    price=px,
+                    lot_size=max(state.lot_size, 1),
+                    side="SELL",
+                )
+            )
+        if budgets:
+            self.store.record_incident("SQUARE_OFF", {"reason": reason, "count": len(budgets)}, ts=self._clock())
+        return budgets
 
     # ------------------------------------------------------------------ helpers
     def _order_rate_ok(self, now: dt.datetime) -> bool:

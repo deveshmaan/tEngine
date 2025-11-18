@@ -1,0 +1,16 @@
+risk:
+  daily_pnl_stop: -15000
+  per_symbol_loss_stop: -5000
+  max_open_lots: 20
+  notional_premium_cap: 250000
+  no_new_entries_after: "15:10:00"
+  square_off_by: "15:22:00"
+
+alerts:
+  throttle_seconds: 30
+
+telemetry:
+  metrics_port_env: "METRICS_PORT"
+
+replay:
+  default_speed: 1.0

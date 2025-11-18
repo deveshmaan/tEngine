@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 
 def _require_token() -> str:
-    token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+    token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTFiZWQ1ZmIyNjM3MzRiMDhmNTU2N2YiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzNDM3OTE5LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjM1MDMyMDB9.PgRwZt2MLma5rPgfJhpti6gahabCHt9hmEBM2vkUHz0").strip()
     if not token:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     return token

@@ -4,12 +4,13 @@ import datetime as dt
 from typing import Iterable, Optional, Sequence, Set
 
 from engine.config import IST
+from engine.time_machine import now as engine_now
 
 
 def resolve_weekly_expiry(index_symbol: str, now_ist: Optional[dt.datetime] = None, holidays: Optional[Iterable[dt.date]] = None) -> dt.date:
     """Return the weekly expiry (Thursday) for the provided timestamp, falling back to the previous business day on holidays."""
 
-    now = (now_ist or dt.datetime.now(IST)).astimezone(IST)
+    now = (now_ist or engine_now(IST)).astimezone(IST)
     weekday = now.weekday()  # Monday=0
     if weekday <= 3:
         expiry = now.date() + dt.timedelta(days=3 - weekday)

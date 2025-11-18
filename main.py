@@ -1,18 +1,33 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import datetime as dt
+import os
 import random
 import signal
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
+from dataclasses import replace
+
+from engine.alerts import configure_alerts, notify_incident
 from engine.broker import UpstoxBroker
 from engine.config import EngineConfig, IST
 from engine.data import pick_strike_from_spot, resolve_weekly_expiry
+from engine.events import EventBus
+from engine.fees import load_fee_config
+from engine.instruments import InstrumentResolver
 from engine.logging_utils import configure_logging, get_logger
+from engine.metrics import EngineMetrics, start_http_server_if_available
 from engine.oms import OMS
+from engine.pnl import Execution as PnLExecution, PnLCalculator
+from engine.recovery import RecoveryManager
+from engine.replay import ReplayConfig, configure_runtime as configure_replay_runtime, replay
 from engine.risk import OrderBudget, RiskManager
+from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
+from market.instrument_cache import InstrumentCache
 
 try:  # pragma: no cover - optional acceleration
     import uvloop
@@ -25,21 +40,35 @@ except Exception:  # pragma: no cover
 class IntradayBuyStrategy:
     """Toy BUY-side strategy that demonstrates the risk→data→oms pipeline."""
 
-    def __init__(self, config: EngineConfig, risk: RiskManager, oms: OMS):
+    def __init__(self, config: EngineConfig, risk: RiskManager, oms: OMS, bus: EventBus):
         self.cfg = config
         self.risk = risk
         self.oms = oms
+        self.bus = bus
         self.logger = get_logger("IntradayStrategy")
-        self._last_spot = 0.0
 
     async def run(self, stop_event: asyncio.Event) -> None:
+        queue = await self.bus.subscribe("market/events", maxsize=1000)
         while not stop_event.is_set():
-            await asyncio.sleep(1.0)
-            ts = dt.datetime.now(IST)
-            mock_spot = self._mock_spot()
-            await self._maybe_trade(mock_spot, ts)
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            await self._handle_event(event)
 
-    async def _maybe_trade(self, spot: float, ts: dt.datetime) -> None:
+    async def _handle_event(self, event: dict) -> None:
+        evt_type = event.get("type")
+        if evt_type not in {"tick", "quote", "bar"}:
+            return
+        payload = event.get("payload") or {}
+        spot = self._extract_price(payload)
+        if spot is None:
+            return
+        ts = self._event_ts(event.get("ts"))
+        symbol_hint = payload.get("symbol")
+        await self._maybe_trade(spot, ts, symbol_hint)
+
+    async def _maybe_trade(self, spot: float, ts: dt.datetime, symbol_hint: Optional[str]) -> None:
         expiry = resolve_weekly_expiry(self.cfg.data.index_symbol, ts, self.cfg.data.holidays)
         strike = pick_strike_from_spot(
             spot,
@@ -47,8 +76,10 @@ class IntradayBuyStrategy:
             self.cfg.data.tick_size,
             price_band=(self.cfg.data.price_band_low, self.cfg.data.price_band_high),
         )
-        symbol = f"{self.cfg.data.index_symbol}-{expiry.isoformat()}-{int(strike)}"
+        option_type = "CE"
+        symbol = symbol_hint or f"{self.cfg.data.index_symbol}-{expiry.isoformat()}-{int(strike)}{option_type}"
         budget = OrderBudget(symbol=symbol, qty=self.cfg.data.lot_step, price=spot, lot_size=self.cfg.data.lot_step, side="BUY")
+        self.risk.on_tick(symbol, spot)
         if not self.risk.budget_ok_for(budget):
             return
         await self.oms.submit(
@@ -62,34 +93,70 @@ class IntradayBuyStrategy:
         )
         self.logger.log_event(20, "submitted", symbol=symbol, price=budget.price)
 
-    def _mock_spot(self) -> float:
-        if self._last_spot <= 0:
-            self._last_spot = 23000.0
-        drift = random.uniform(-5, 5)
-        self._last_spot = max(1.0, self._last_spot + drift)
-        return self._last_spot
+    def _event_ts(self, value: Optional[str]) -> dt.datetime:
+        return _parse_ts(value, IST)
+
+    def _extract_price(self, payload: dict) -> Optional[float]:
+        for key in ("ltp", "price", "close", "last"):
+            if key in payload and payload[key] is not None:
+                try:
+                    return float(payload[key])
+                except (TypeError, ValueError):
+                    continue
+        return None
 
 
 class EngineApp:
     def __init__(self, config: EngineConfig):
         self.cfg = config
         self.logger = get_logger("EngineApp")
+        self.bus = EventBus()
         self.store = SQLiteStore(config.persistence_path, run_id=config.run_id)
+        self.instrument_cache = InstrumentCache(str(config.persistence_path))
+        self.instrument_resolver = InstrumentResolver(self.instrument_cache)
+        self.metrics = EngineMetrics()
         self.risk = RiskManager(config.risk, self.store)
-        self.broker = UpstoxBroker(config=config.broker)
-        self.oms = OMS(broker=self.broker, store=self.store, config=config.oms)
-        self.strategy = IntradayBuyStrategy(config, self.risk, self.oms)
+        self.broker = UpstoxBroker(config=config.broker, ws_failure_callback=self._on_ws_failure, instrument_resolver=self.instrument_resolver)
+        self.oms = OMS(broker=self.broker, store=self.store, config=config.oms, bus=self.bus, metrics=self.metrics)
+        self.strategy = IntradayBuyStrategy(config, self.risk, self.oms, self.bus)
+        self.fee_config = load_fee_config()
+        self.pnl = PnLCalculator(self.store, self.fee_config)
+        configure_alerts(config.alerts.throttle_seconds)
         self._stop = asyncio.Event()
+        self._market_task: Optional[asyncio.Task] = None
+        self._square_task: Optional[asyncio.Task] = None
+        self._tasks: List[asyncio.Task] = []
 
-    async def run(self) -> None:
+    async def run(self, replay_cfg: Optional[ReplayConfig] = None) -> None:
         configure_logging("INFO")
+        self.logger.log_event(20, "engine_starting", run_id=self.cfg.run_id, persistence=str(self.cfg.persistence_path))
         self._install_signal_handlers()
+        configure_replay_runtime(bus=self.bus, store=self.store)
+        metrics_port = self._resolve_metrics_port()
+        metrics_started = start_http_server_if_available(metrics_port)
+        self.logger.log_event(20, "metrics_bootstrap", port=metrics_port, started=metrics_started)
+        self.metrics.engine_up.set(1)
         await self.broker.start()
-        square_task = asyncio.create_task(self._square_off_watchdog(), name="square-off")
+        await RecoveryManager(self.store, self.oms).reconcile()
+        self._square_task = asyncio.create_task(self._square_off_watchdog(), name="square-off")
         strat_task = asyncio.create_task(self.strategy.run(self._stop), name="strategy-loop")
+        if replay_cfg:
+            self._market_task = asyncio.create_task(self._run_replay_source(replay_cfg), name="replay-source")
+        else:
+            self._market_task = asyncio.create_task(self._live_market_feed(), name="market-feed")
+        fills_task = asyncio.create_task(self._consume_fills(), name="fills-consumer")
+        marks_task = asyncio.create_task(self._consume_market_marks(), name="pnl-marks")
+        snapshot_task = asyncio.create_task(self._pnl_snapshot_loop(), name="pnl-snapshot")
+        control_task = asyncio.create_task(self._watch_control_intents(), name="control-intents")
+        self._tasks = [task for task in [self._square_task, strat_task, self._market_task, fills_task, marks_task, snapshot_task, control_task] if task]
         await self._stop.wait()
-        strat_task.cancel()
-        square_task.cancel()
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await self._cleanup()
 
     async def trigger_shutdown(self, reason: str) -> None:
@@ -100,6 +167,7 @@ class EngineApp:
     async def _cleanup(self) -> None:
         await self.oms.cancel_all(reason="shutdown")
         await self.broker.stop()
+        self.metrics.engine_up.set(0)
         self.logger.log_event(20, "engine_stopped")
 
     def _install_signal_handlers(self) -> None:
@@ -109,20 +177,217 @@ class EngineApp:
 
     async def _square_off_watchdog(self) -> None:
         while not self._stop.is_set():
-            now = dt.datetime.now(IST)
+            now = engine_now(IST)
             deadline = dt.datetime.combine(now.date(), self.cfg.risk.square_off_by, tzinfo=IST)
             if now >= deadline:
                 self.risk.trigger_kill("SQUARE_OFF_DEADLINE")
+                self.metrics.risk_halts_total.inc()
+                await self._execute_square_off("SQUARE_OFF_DEADLINE")
+                notify_incident("WARN", "Square-off triggered", "Deadline reached", tags=["square_off"])
                 await self.oms.cancel_all(reason="square_off")
                 await self.trigger_shutdown("square_off")
                 return
             await asyncio.sleep((deadline - now).total_seconds())
 
+    async def _consume_fills(self) -> None:
+        queue = await self.bus.subscribe("orders/fill", maxsize=500)
+        while not self._stop.is_set():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                expiry, strike, opt_type = self._instrument_meta(str(event["symbol"]))
+                exec_obj = PnLExecution(
+                    exec_id=str(event.get("exec_id") or event["order_id"]),
+                    order_id=str(event["order_id"]),
+                    symbol=str(event["symbol"]),
+                    side=str(event["side"]),
+                    qty=int(event["qty"]),
+                    price=float(event["price"]),
+                    ts=_parse_ts(event.get("ts"), IST),
+                    expiry=expiry,
+                    strike=strike,
+                    opt_type=opt_type,
+                )
+            except (KeyError, ValueError, TypeError):
+                continue
+            self.pnl.on_execution(exec_obj)
+            self.metrics.fills_total.inc()
 
-async def main() -> None:
-    cfg = EngineConfig.load()
+    async def _consume_market_marks(self) -> None:
+        queue = await self.bus.subscribe("market/events", maxsize=500)
+        while not self._stop.is_set():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if event.get("type") != "tick":
+                continue
+            payload = event.get("payload") or {}
+            symbol = payload.get("symbol") or payload.get("underlying")
+            price = payload.get("ltp") or payload.get("price")
+            if symbol and price is not None:
+                try:
+                    self.pnl.mark_to_market({symbol: float(price)})
+                except (TypeError, ValueError):
+                    continue
+
+    async def _pnl_snapshot_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(30.0)
+            self.pnl.snapshot(engine_now())
+            realized, unrealized, fees = self.pnl.totals()
+            self.metrics.pnl_realized.set(realized)
+            self.metrics.pnl_unrealized.set(unrealized)
+            self.metrics.pnl_fees.set(fees)
+            self.metrics.pnl_net.set(realized + unrealized - fees)
+        self.pnl.snapshot(engine_now())
+        realized, unrealized, fees = self.pnl.totals()
+        self.metrics.pnl_realized.set(realized)
+        self.metrics.pnl_unrealized.set(unrealized)
+        self.metrics.pnl_fees.set(fees)
+        self.metrics.pnl_net.set(realized + unrealized - fees)
+
+    async def _watch_control_intents(self) -> None:
+        last_ts: Optional[str] = None
+        while not self._stop.is_set():
+            intents = self.store.control_intents_since(last_ts)
+            for intent in intents:
+                last_ts = intent["ts"]
+                action = intent["action"].upper()
+                if action == "KILL":
+                    self.risk.trigger_kill("CONTROL_KILL")
+                    notify_incident("WARN", "Kill switch intent", "Control intent requested halt")
+                    await self.trigger_shutdown("control_kill")
+                elif action == "SQUARE_OFF":
+                    await self._execute_square_off("CONTROL_SQUARE_OFF")
+            await asyncio.sleep(1.0)
+
+    def _instrument_meta(self, symbol: str) -> tuple[Optional[str], Optional[float], Optional[str]]:
+        meta = self.instrument_resolver.metadata_for(symbol)
+        if meta:
+            return meta.expiry_date, meta.strike, meta.option_type
+        parts = symbol.split("-")
+        if len(parts) < 3:
+            return None, None, None
+        raw_strike = parts[-1]
+        opt_type = None
+        if raw_strike.endswith(("CE", "PE")):
+            opt_type = raw_strike[-2:]
+            raw_strike = raw_strike[:-2]
+        try:
+            strike = float(raw_strike)
+        except ValueError:
+            strike = None
+        expiry = "-".join(parts[1:-1])
+        return expiry or None, strike, opt_type
+
+    async def _on_ws_failure(self, failures: int) -> None:
+        self.risk.halt_new_entries("WS_FAILURE")
+        self.metrics.risk_halts_total.inc()
+        notify_incident("ERROR", "WS reconnect failures", f"{failures} consecutive failures")
+
+    async def _execute_square_off(self, reason: str) -> None:
+        now = engine_now(IST)
+        for budget in self.risk.square_off_all(reason):
+            await self.oms.submit(
+                strategy=self.cfg.strategy_tag,
+                symbol=budget.symbol,
+                side="SELL",
+                qty=abs(budget.qty),
+                order_type="MARKET",
+                limit_price=budget.price,
+                ts=now,
+            )
+
+    async def _run_replay_source(self, cfg: ReplayConfig) -> None:
+        try:
+            await replay(cfg)
+        finally:
+            await self.trigger_shutdown("replay_complete")
+
+    async def _live_market_feed(self) -> None:
+        while not self._stop.is_set():
+            ts = engine_now(IST)
+            spot = self._mock_spot()
+            expiry = resolve_weekly_expiry(self.cfg.data.index_symbol, ts, self.cfg.data.holidays)
+            strike = pick_strike_from_spot(
+                spot,
+                self.cfg.data.lot_step,
+                self.cfg.data.tick_size,
+                price_band=(self.cfg.data.price_band_low, self.cfg.data.price_band_high),
+            )
+            symbol = f"{self.cfg.data.index_symbol}-{expiry.isoformat()}-{int(strike)}CE"
+            payload = {"underlying": self.cfg.data.index_symbol, "ltp": spot, "symbol": symbol}
+            event = {"ts": ts.isoformat(), "type": "tick", "payload": payload}
+            self.store.record_market_event("tick", payload, ts=ts)
+            await self.bus.publish("market/events", event)
+            self.metrics.beat()
+            await asyncio.sleep(1.0)
+
+    def _mock_spot(self) -> float:
+        base = getattr(self, "_last_spot", 23000.0)
+        drift = random.uniform(-5, 5)
+        base = max(1.0, base + drift)
+        self._last_spot = base
+        return base
+
+    def _resolve_metrics_port(self) -> int:
+        raw = os.getenv("METRICS_PORT", "9103")
+        try:
+            return int(raw)
+        except ValueError:
+            self.logger.log_event(30, "metrics_port_invalid", value=raw)
+            return 9103
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Async trading engine")
+    parser.add_argument("--config", type=Path, help="Path to engine_config.yaml", default=None)
+    parser.add_argument("--replay-from-run", dest="replay_from_run", help="Replay from persisted run id")
+    parser.add_argument("--replay-from-file", dest="replay_from_file", type=Path, help="Replay from JSONL feed")
+    parser.add_argument("--replay-speed", dest="replay_speed", type=float, default=1.0)
+    parser.add_argument("--replay-seed", dest="replay_seed", type=int, default=None)
+    return parser.parse_args(argv)
+
+
+async def main(argv: Optional[List[str]] = None) -> None:
+    args = _parse_args(argv)
+    cfg = EngineConfig.load(args.config)
+    replay_cfg = None
+    if args.replay_from_run or args.replay_from_file:
+        if args.replay_from_run and args.replay_from_file:
+            raise ValueError("Use either --replay-from-run or --replay-from-file")
+        replay_cfg = ReplayConfig(
+            run_id=args.replay_from_run,
+            input_path=args.replay_from_file,
+            speed=args.replay_speed,
+            seed=args.replay_seed,
+        )
+        cfg = _with_replay_run_id(cfg, replay_cfg)
     app = EngineApp(cfg)
-    await app.run()
+    await app.run(replay_cfg=replay_cfg)
+
+
+def _with_replay_run_id(cfg: EngineConfig, replay_cfg: ReplayConfig) -> EngineConfig:
+    suffix = replay_cfg.run_id or (replay_cfg.input_path.stem if replay_cfg.input_path else "file")
+    suffix = suffix.replace("/", "-")
+    stamp = engine_now(IST).strftime("%Y%m%d-%H%M%S")
+    new_id = f"{cfg.run_id}-replay-{suffix}-{stamp}"
+    return replace(cfg, run_id=new_id)
+
+
+def _parse_ts(value: Optional[str], tz: dt.tzinfo = IST) -> dt.datetime:
+    if not value:
+        return engine_now(tz)
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return engine_now(tz)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
 
 
 if __name__ == "__main__":

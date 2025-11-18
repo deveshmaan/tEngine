@@ -1,0 +1,9 @@
+brokerage_per_order: 2.0
+exchange_txn_rate_per_turnover: 0.0009
+sebi_rate_per_turnover: 0.000001
+gst_rate_on_services: 0.18
+stamp_duty_buy_rate: 0.00002
+stt_options_sell_rate: 0.0005
+clearing: 1.0
+other_fees:
+  platform_per_day: 0.0
