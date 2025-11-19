@@ -116,8 +116,15 @@ class EngineApp:
         self.instrument_resolver = InstrumentResolver(self.instrument_cache)
         self.metrics = EngineMetrics()
         self.risk = RiskManager(config.risk, self.store)
-        self.broker = UpstoxBroker(config=config.broker, ws_failure_callback=self._on_ws_failure, instrument_resolver=self.instrument_resolver)
+        self.broker = UpstoxBroker(
+            config=config.broker,
+            ws_failure_callback=self._on_ws_failure,
+            instrument_resolver=self.instrument_resolver,
+            metrics=self.metrics,
+            auth_halt_callback=self.risk.halt_new_entries,
+        )
         self.oms = OMS(broker=self.broker, store=self.store, config=config.oms, bus=self.bus, metrics=self.metrics)
+        self.broker.bind_reconcile_callback(self.oms.reconcile_from_broker)
         self.strategy = IntradayBuyStrategy(config, self.risk, self.oms, self.bus)
         self.fee_config = load_fee_config()
         self.pnl = PnLCalculator(self.store, self.fee_config)

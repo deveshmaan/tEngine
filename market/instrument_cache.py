@@ -1,23 +1,19 @@
 from __future__ import annotations
 
 import datetime as dt
-import gzip
-import io
-import json
 import logging
 import os
 import sqlite3
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-import requests
+from pathlib import Path
+from threading import Lock
+from typing import Callable, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 from brokerage.upstox_client import INDEX_INSTRUMENT_KEYS, IST, UpstoxSession
 
-CACHE_TTL_SECONDS = 300
-MASTER_URL = os.getenv("UPSTOX_MASTER_URL", "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
-MASTER_CACHE_PATH = Path(os.getenv("UPSTOX_MASTER_CACHE", "cache/nse_master.json.gz"))
+SUPPORTED_OPT_TYPES = ("CE", "PE")
+EXPIRY_TTL_SECONDS = int(os.getenv("OPTION_EXPIRY_TTL_SECONDS", "300"))
+CONTRACT_TTL_SECONDS = int(os.getenv("OPTION_CONTRACT_TTL_SECONDS", "300"))
 
 
 @dataclass(frozen=True)
@@ -35,46 +31,58 @@ class InstrumentMeta:
 
 
 class InstrumentCache:
-    """Persists option metadata for quick lookup of CE/PE contracts."""
+    """SQLite-backed option contract cache with expiry discovery and metadata."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    _runtime: ClassVar[Optional["InstrumentCache"]] = None
+    _runtime_lock: ClassVar[Lock] = Lock()
+
+    def __init__(self, db_path: Optional[str] = None, *, session_factory: Optional[Callable[[], UpstoxSession]] = None):
         path = Path(db_path or os.getenv("ENGINE_DB_PATH", "engine_state.sqlite"))
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._logger = logging.getLogger("InstrumentCache")
+        self._session_factory = session_factory or UpstoxSession
+        self._session: Optional[UpstoxSession] = None
         self._init_schema()
+        with self._runtime_lock:
+            InstrumentCache._runtime = self
 
+    # ------------------------------------------------------------------ runtime
+    @classmethod
+    def runtime_cache(cls) -> Optional["InstrumentCache"]:
+        return cls._runtime
+
+    # --------------------------------------------------------------------- schema
     def _init_schema(self) -> None:
         cur = self._conn.cursor()
         cur.executescript(
             """
-            CREATE TABLE IF NOT EXISTS instrument_cache (
+            CREATE TABLE IF NOT EXISTS option_contracts (
                 symbol TEXT NOT NULL,
-                expiry_date TEXT NOT NULL,
+                expiry TEXT NOT NULL,
                 strike REAL NOT NULL,
-                option_type TEXT NOT NULL CHECK(option_type IN ('CE','PE')),
+                opt_type TEXT NOT NULL CHECK(opt_type IN ('CE','PE')),
                 instrument_key TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(symbol, expiry_date, strike, option_type)
-            );
-            CREATE TABLE IF NOT EXISTS instrument_meta (
-                instrument_key TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                expiry_date TEXT NOT NULL,
-                option_type TEXT NOT NULL,
-                strike REAL NOT NULL,
-                lot_size REAL,
+                lot_size INT,
                 tick_size REAL,
-                freeze_qty REAL,
-                price_band_low REAL,
-                price_band_high REAL,
-                updated_at TEXT NOT NULL
+                band_low REAL,
+                band_high REAL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(symbol, expiry, strike, opt_type)
             );
-            CREATE TABLE IF NOT EXISTS cache_meta (
+            CREATE TABLE IF NOT EXISTS expiries (
+                symbol TEXT NOT NULL,
+                expiry TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('weekly','monthly')),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(symbol, expiry)
+            );
+            CREATE TABLE IF NOT EXISTS meta (
                 k TEXT PRIMARY KEY,
-                v TEXT NOT NULL,
+                v TEXT,
                 updated_at TEXT NOT NULL
             );
             """
@@ -84,8 +92,14 @@ class InstrumentCache:
     def close(self) -> None:
         self._conn.close()
 
+    # -------------------------------------------------------------------- helpers
     def _now_str(self) -> str:
         return dt.datetime.now(IST).isoformat()
+
+    def _ensure_session(self) -> UpstoxSession:
+        if self._session is None:
+            self._session = self._session_factory()
+        return self._session
 
     def resolve_index_key(self, symbol: str) -> str:
         try:
@@ -93,300 +107,115 @@ class InstrumentCache:
         except KeyError as exc:
             raise ValueError(f"Unsupported symbol {symbol}") from exc
 
-    # ----- Expiry helpers --------------------------------------------------
-    def _get_cached_expiries(self, symbol: str) -> Optional[Tuple[str, ...]]:
-        cur = self._conn.execute("SELECT v, updated_at FROM cache_meta WHERE k=?", (f"expiries:{symbol.upper()}",))
-        row = cur.fetchone()
-        if not row:
-            return None
-        updated_at = dt.datetime.fromisoformat(row["updated_at"]).astimezone(IST)
-        if (dt.datetime.now(IST) - updated_at).total_seconds() > CACHE_TTL_SECONDS:
-            return None
-        try:
-            payload = json.loads(row["v"])
-            return tuple(payload)
-        except json.JSONDecodeError:
-            return None
-
-    def _set_cached_expiries(self, symbol: str, expiries: Tuple[str, ...]) -> None:
-        key = f"expiries:{symbol.upper()}"
-        self._conn.execute(
-            "INSERT INTO cache_meta(k,v,updated_at) VALUES (?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
-            (key, json.dumps(list(expiries)), self._now_str()),
-        )
-        self._conn.commit()
-
-    def _fetch_expiries(self, symbol: str, session: UpstoxSession) -> Tuple[str, ...]:
-        cached = self._get_cached_expiries(symbol)
-        if cached:
-            return cached
-        try:
-            payload = session.get_option_contracts(
-                self.resolve_index_key(symbol),
-                expiry_date=dt.date.today().isoformat(),
-            )
-            expiries = self._extract_expiries(payload)
-        except Exception as exc:
-            logging.warning("Option contract lookup failed (%s); using instrument master", exc)
-            expiries = self._expiries_from_master(symbol)
-        if not expiries:
-            expiries = self._expiries_from_master(symbol)
-        if not expiries:
-            raise RuntimeError(f"Unable to determine expiries for {symbol}")
-        self._set_cached_expiries(symbol, expiries)
-        return expiries
-
-    def _extract_expiries(self, payload: dict) -> Tuple[str, ...]:
-        data = payload.get("data") if isinstance(payload, dict) else None
-        expiries = []
-        if isinstance(data, dict):
-            if isinstance(data.get("expiries"), list):
-                expiries = [str(e) for e in data.get("expiries") if e]
-            elif isinstance(data.get("contracts"), list):
-                expiries = [c.get("expiry") for c in data["contracts"] if c.get("expiry")]
-        expiries = sorted({e for e in expiries if e})
-        return tuple(expiries)
-
-    def _load_master_data(self) -> List[dict]:
-        if MASTER_CACHE_PATH.exists():
-            with gzip.open(MASTER_CACHE_PATH, "rt") as fh:
-                return json.load(fh)
-        try:
-            resp = requests.get(MASTER_URL, timeout=30)
-            resp.raise_for_status()
-            MASTER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            MASTER_CACHE_PATH.write_bytes(resp.content)
-            with gzip.open(io.BytesIO(resp.content), "rt") as fh:
-                return json.load(fh)
-        except Exception as exc:
-            logging.error("Failed to fetch instrument master: %s", exc)
-            return []
-
-    def _expiries_from_master(self, symbol: str) -> Tuple[str, ...]:
-        data = self._load_master_data()
-        if not data:
-            return tuple()
+    # -------------------------------------------------------------- expiry cache
+    def list_expiries(self, symbol: str, kind: Optional[str] = None) -> List[str]:
         symbol = symbol.upper()
-        expiries = set()
-        for row in data:
-            segment = str(row.get("segment") or row.get("Segment") or "").upper()
-            if segment != "NSE_FO":
-                continue
-            inst_type = str(row.get("instrument_type") or row.get("instrumentType") or "").upper()
-            if inst_type not in {"CE", "PE", "OPTIDX"}:
-                continue
-            name = str(row.get("name") or row.get("tradingsymbol") or row.get("trading_symbol") or "").upper()
-            if symbol not in name:
-                continue
-            expiry_val = row.get("expiry") or row.get("expiry_date") or row.get("expiryDate")
-            if not expiry_val:
-                continue
-            if isinstance(expiry_val, (int, float)):
-                exp_dt = dt.datetime.fromtimestamp(float(expiry_val) / 1000.0).date()
-            else:
-                try:
-                    exp_dt = dt.datetime.fromisoformat(str(expiry_val)).date()
-                except ValueError:
-                    continue
-            expiries.add(exp_dt.isoformat())
-        return tuple(sorted(expiries))
+        if not self._is_meta_fresh(self._expiry_meta(symbol), EXPIRY_TTL_SECONDS):
+            self._refresh_expiries(symbol)
+        query = "SELECT expiry FROM expiries WHERE symbol=?"
+        params: List[object] = [symbol]
+        if kind:
+            query += " AND kind=?"
+            params.append(kind.lower())
+        query += " ORDER BY expiry"
+        cur = self._conn.execute(query, tuple(params))
+        return [str(row["expiry"]) for row in cur.fetchall()]
 
-    def nearest_weekly_and_monthly_expiries(self, symbol: str, session: UpstoxSession) -> Tuple[str, Optional[str]]:
-        expiries = self._fetch_expiries(symbol, session)
-        weekly = expiries[0]
-        weekly_dt = dt.date.fromisoformat(weekly)
-        monthly = None
-        for exp in expiries[1:]:
-            exp_dt = dt.date.fromisoformat(exp)
-            if exp_dt.month != weekly_dt.month or exp_dt.day >= 25:
-                monthly = exp
-                break
-        if monthly is None and len(expiries) > 1:
-            monthly = expiries[1]
-        return weekly, monthly
+    def refresh_expiry(self, symbol: str, expiry: str, session: Optional[UpstoxSession] = None) -> int:
+        """Fetch and persist all contracts for a given expiry."""
 
-    # ----- Option chain refresh -------------------------------------------
-    def refresh_option_chain(self, symbol: str, expiry_date: str, session: UpstoxSession) -> int:
-        underlying_key = self.resolve_index_key(symbol)
-        payload = session.get_option_chain(underlying_key, expiry_date)
+        session = session or self._ensure_session()
+        payload = session.get_option_chain(self.resolve_index_key(symbol), expiry)
         contracts = self._parse_option_chain(payload)
         if not contracts:
-            contracts = self._contracts_from_master(symbol, expiry_date)
-        if not contracts:
-            logging.warning("Option chain empty for %s %s", symbol, expiry_date)
             return 0
         now = self._now_str()
         rows = []
-        meta_rows = []
+        expiry_rows = []
         for item in contracts:
             rows.append(
                 (
                     symbol.upper(),
-                    expiry_date,
+                    expiry,
                     float(item["strike"]),
                     item["type"],
                     item["instrument_key"],
-                    now,
-                )
-            )
-            meta_rows.append(
-                (
-                    item["instrument_key"],
-                    symbol.upper(),
-                    expiry_date,
-                    item["type"],
-                    float(item["strike"]),
                     item.get("lot_size"),
                     item.get("tick_size"),
-                    item.get("freeze_qty"),
                     item.get("price_band_low"),
                     item.get("price_band_high"),
                     now,
                 )
             )
+        expiry_rows.append((symbol.upper(), expiry, self._classify_expiry(expiry), now))
         with self._conn:
             self._conn.executemany(
                 """
-                INSERT INTO instrument_cache(symbol, expiry_date, strike, option_type, instrument_key, updated_at)
-                VALUES (?,?,?,?,?,?)
-                ON CONFLICT(symbol, expiry_date, strike, option_type)
-                DO UPDATE SET instrument_key=excluded.instrument_key, updated_at=excluded.updated_at
+                INSERT INTO option_contracts(symbol, expiry, strike, opt_type, instrument_key, lot_size, tick_size, band_low, band_high, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol, expiry, strike, opt_type)
+                DO UPDATE SET instrument_key=excluded.instrument_key,
+                              lot_size=excluded.lot_size,
+                              tick_size=excluded.tick_size,
+                              band_low=excluded.band_low,
+                              band_high=excluded.band_high,
+                              updated_at=excluded.updated_at
                 """,
                 rows,
             )
             self._conn.executemany(
                 """
-                INSERT INTO instrument_meta(instrument_key, symbol, expiry_date, option_type, strike, lot_size, tick_size, freeze_qty, price_band_low, price_band_high, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(instrument_key)
-                DO UPDATE SET symbol=excluded.symbol, expiry_date=excluded.expiry_date, option_type=excluded.option_type,
-                              strike=excluded.strike, lot_size=excluded.lot_size, tick_size=excluded.tick_size,
-                              freeze_qty=excluded.freeze_qty, price_band_low=excluded.price_band_low,
-                              price_band_high=excluded.price_band_high, updated_at=excluded.updated_at
+                INSERT INTO expiries(symbol, expiry, kind, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(symbol, expiry)
+                DO UPDATE SET kind=excluded.kind, updated_at=excluded.updated_at
                 """,
-                meta_rows,
+                expiry_rows,
             )
-        logging.info("Cached %s contracts for %s %s", len(rows), symbol, expiry_date)
+            self._upsert_meta(self._contracts_meta(symbol, expiry), now)
         return len(rows)
 
-    def _parse_option_chain(self, payload: dict) -> Tuple[Dict[str, str], ...]:
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict):
-            return tuple()
-        contracts: list[Dict[str, str]] = []
-
-        def _collect(entries, opt_type):
-            if not isinstance(entries, list):
-                return
-            for item in entries:
-                if not isinstance(item, dict):
-                    continue
-                key = item.get("instrument_key") or item.get("instrumentKey")
-                strike = item.get("strike") or item.get("strike_price") or item.get("strikePrice")
-                if key and strike:
-                    contracts.append({
-                        "instrument_key": key,
-                        "strike": float(strike),
-                        "type": opt_type,
-                        "lot_size": item.get("lot_size") or item.get("lotSize"),
-                        "tick_size": item.get("tick_size") or item.get("tickSize"),
-                        "freeze_qty": item.get("freeze_quantity") or item.get("freezeQuantity"),
-                        "price_band_low": item.get("price_band_lower") or item.get("priceBandLower"),
-                        "price_band_high": item.get("price_band_upper") or item.get("priceBandUpper"),
-                    })
-
-        calls = data.get("call") or data.get("CALL") or data.get("ce") or data.get("CE")
-        puts = data.get("put") or data.get("PUT") or data.get("pe") or data.get("PE")
-        if isinstance(calls, dict) and "data" in calls:
-            calls = calls["data"]
-        if isinstance(puts, dict) and "data" in puts:
-            puts = puts["data"]
-        _collect(calls, "CE")
-        _collect(puts, "PE")
-
-        if not contracts and isinstance(data.get("contracts"), list):
-            for item in data["contracts"]:
-                if not isinstance(item, dict):
-                    continue
-                opt_type = (item.get("option_type") or item.get("optionType") or "").upper()
-                if opt_type not in {"CE", "PE"}:
-                    continue
-                key = item.get("instrument_key") or item.get("instrumentKey")
-                strike = item.get("strike") or item.get("strike_price") or item.get("strikePrice")
-                if key and strike:
-                    contracts.append({
-                        "instrument_key": key,
-                        "strike": float(strike),
-                        "type": opt_type,
-                        "lot_size": item.get("lot_size") or item.get("lotSize"),
-                        "tick_size": item.get("tick_size") or item.get("tickSize"),
-                        "freeze_qty": item.get("freeze_quantity") or item.get("freezeQuantity"),
-                        "price_band_low": item.get("price_band_lower") or item.get("priceBandLower"),
-                        "price_band_high": item.get("price_band_upper") or item.get("priceBandUpper"),
-                    })
-
-        return tuple(contracts)
-
-    def _contracts_from_master(self, symbol: str, expiry_date: str) -> Tuple[Dict[str, str], ...]:
-        data = self._load_master_data()
-        if not data:
-            return tuple()
-        target = dt.date.fromisoformat(expiry_date)
-        symbol_upper = symbol.upper()
-        contracts: list[Dict[str, str]] = []
-        for row in data:
-            segment = str(row.get("segment") or row.get("Segment") or "").upper()
-            if segment != "NSE_FO":
-                continue
-            inst_type = str(row.get("instrument_type") or row.get("instrumentType") or "").upper()
-            if inst_type not in {"CE", "PE"}:
-                continue
-            name = str(row.get("name") or row.get("tradingsymbol") or row.get("trading_symbol") or "").upper()
-            if symbol_upper not in name:
-                continue
-            expiry_val = row.get("expiry") or row.get("expiry_date") or row.get("expiryDate")
-            if not expiry_val:
-                continue
-            if isinstance(expiry_val, (int, float)):
-                exp_dt = dt.datetime.fromtimestamp(float(expiry_val) / 1000.0).date()
-            else:
-                try:
-                    exp_dt = dt.datetime.fromisoformat(str(expiry_val)).date()
-                except ValueError:
-                    continue
-            if exp_dt != target:
-                continue
-            strike = row.get("strike_price") or row.get("strikePrice") or row.get("strike")
-            instrument_key = row.get("instrument_key") or row.get("instrumentKey")
-            if not strike or not instrument_key:
-                continue
-            contracts.append(
-                {
-                    "instrument_key": str(instrument_key),
-                    "strike": float(strike),
-                    "type": inst_type,
-                    "lot_size": row.get("lot_size") or row.get("lotSize"),
-                    "tick_size": row.get("tick_size") or row.get("tickSize"),
-                    "freeze_qty": row.get("freeze_quantity") or row.get("freezeQuantity"),
-                    "price_band_low": row.get("price_band_lower") or row.get("priceBandLower"),
-                    "price_band_high": row.get("price_band_upper") or row.get("priceBandUpper"),
-                }
-            )
-        return tuple(contracts)
-
-    # ----- Lookup helpers -------------------------------------------------
-    def lookup(self, symbol: str, expiry_date: str, strike: float, option_type: str) -> Optional[str]:
+    def get_contract(self, symbol: str, expiry: str, strike: float, opt_type: str) -> Optional[Dict[str, object]]:
+        symbol = symbol.upper()
+        opt_type = opt_type.upper()
+        if opt_type not in SUPPORTED_OPT_TYPES:
+            return None
+        self._ensure_contracts(symbol, expiry)
         cur = self._conn.execute(
-            "SELECT instrument_key FROM instrument_cache WHERE symbol=? AND expiry_date=? AND strike=? AND option_type=?",
-            (symbol.upper(), expiry_date, float(strike), option_type.upper()),
+            "SELECT * FROM option_contracts WHERE symbol=? AND expiry=? AND strike=? AND opt_type=?",
+            (symbol, expiry, float(strike), opt_type),
         )
         row = cur.fetchone()
-        return row[0] if row else None
+        if not row:
+            return None
+        return dict(row)
 
-    def get_meta(self, instrument_key: str) -> Optional[InstrumentMeta]:
+    def get_meta(self, key: str, expiry: Optional[str] = None):
+        """Return contract meta for an instrument key or an expiry (tick, lot, bands)."""
+
+        if expiry is None or "|" in key:
+            return self._get_instrument_meta(key)
+        return self._get_expiry_meta(key, expiry)
+
+    def _get_expiry_meta(self, symbol: str, expiry: str) -> Optional[Tuple[float, int, float, float]]:
+        symbol = symbol.upper()
+        self._ensure_contracts(symbol, expiry)
         cur = self._conn.execute(
-            "SELECT instrument_key, symbol, expiry_date, option_type, strike, lot_size, tick_size, freeze_qty, price_band_low, price_band_high "
-            "FROM instrument_meta WHERE instrument_key=?",
+            "SELECT tick_size, lot_size, band_low, band_high FROM option_contracts WHERE symbol=? AND expiry=? ORDER BY updated_at DESC LIMIT 1",
+            (symbol, expiry),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        tick = float(row["tick_size"] or 0.0)
+        lot = int(row["lot_size"] or 0)
+        band_low = float(row["band_low"] or 0.0)
+        band_high = float(row["band_high"] or 0.0)
+        return (tick, lot, band_low, band_high)
+
+    def _get_instrument_meta(self, instrument_key: str) -> Optional[InstrumentMeta]:
+        cur = self._conn.execute(
+            "SELECT * FROM option_contracts WHERE instrument_key=?",
             (instrument_key,),
         )
         row = cur.fetchone()
@@ -395,15 +224,37 @@ class InstrumentCache:
         return InstrumentMeta(
             instrument_key=row["instrument_key"],
             symbol=row["symbol"],
-            expiry_date=row["expiry_date"],
-            option_type=row["option_type"],
+            expiry_date=row["expiry"],
+            option_type=row["opt_type"],
             strike=row["strike"],
             lot_size=row["lot_size"],
             tick_size=row["tick_size"],
-            freeze_qty=row["freeze_qty"],
-            price_band_low=row["price_band_low"],
-            price_band_high=row["price_band_high"],
+            freeze_qty=None,
+            price_band_low=row["band_low"],
+            price_band_high=row["band_high"],
         )
+
+    # -------------------------------------------------------------- compat funcs
+    def refresh_option_chain(self, symbol: str, expiry_date: str, session: Optional[UpstoxSession] = None) -> int:
+        return self.refresh_expiry(symbol, expiry_date, session=session)
+
+    def lookup(self, symbol: str, expiry_date: str, strike: float, option_type: str) -> Optional[str]:
+        row = self.get_contract(symbol, expiry_date, strike, option_type)
+        if row:
+            return str(row.get("instrument_key"))
+        return None
+
+    def nearest_weekly_and_monthly_expiries(self, symbol: str, session: UpstoxSession) -> Tuple[str, Optional[str]]:
+        expiries = self.list_expiries(symbol)
+        if not expiries:
+            raise RuntimeError(f"No expiries cached for {symbol}")
+        weekly = expiries[0]
+        monthly = None
+        for exp in expiries:
+            if exp != weekly and self._classify_expiry(exp) == "monthly":
+                monthly = exp
+                break
+        return weekly, monthly
 
     def nearest_strikes(self, symbol: str, ltp: float, step: int = 50) -> Tuple[int, int]:
         atm = int(round(ltp / step) * step)
@@ -414,7 +265,129 @@ class InstrumentCache:
         ce = self.lookup(symbol, expiry_date, atm_ce, "CE")
         pe = self.lookup(symbol, expiry_date, atm_pe, "PE")
         if (not ce or not pe) and session is not None:
-            self.refresh_option_chain(symbol, expiry_date, session)
+            self.refresh_expiry(symbol, expiry_date, session=session)
             ce = ce or self.lookup(symbol, expiry_date, atm_ce, "CE")
             pe = pe or self.lookup(symbol, expiry_date, atm_pe, "PE")
         return {"CE": ce, "PE": pe}
+
+    # ------------------------------------------------------------------ internals
+    def _expiry_meta(self, symbol: str) -> str:
+        return f"expiries:{symbol}"
+
+    def _contracts_meta(self, symbol: str, expiry: str) -> str:
+        return f"contracts:{symbol}:{expiry}"
+
+    def _is_meta_fresh(self, key: str, ttl_seconds: int) -> bool:
+        cur = self._conn.execute("SELECT updated_at FROM meta WHERE k=?", (key,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        updated = dt.datetime.fromisoformat(row["updated_at"]).astimezone(IST)
+        return (dt.datetime.now(IST) - updated).total_seconds() < ttl_seconds
+
+    def _upsert_meta(self, key: str, now: Optional[str] = None) -> None:
+        ts = now or self._now_str()
+        self._conn.execute(
+            "INSERT INTO meta(k, v, updated_at) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
+            (key, "1", ts),
+        )
+
+    def _refresh_expiries(self, symbol: str) -> None:
+        session = self._ensure_session()
+        payload = session.get_option_contracts(self.resolve_index_key(symbol))
+        expiries = self._extract_expiries(payload)
+        rows = [(symbol.upper(), expiry, self._classify_expiry(expiry), self._now_str()) for expiry in expiries]
+        if not rows:
+            raise RuntimeError(f"Unable to discover expiries for {symbol}")
+        with self._conn:
+            self._conn.execute("DELETE FROM expiries WHERE symbol=?", (symbol.upper(),))
+            self._conn.executemany(
+                "INSERT INTO expiries(symbol, expiry, kind, updated_at) VALUES (?,?,?,?)",
+                rows,
+            )
+            self._upsert_meta(self._expiry_meta(symbol.upper()))
+
+    def _ensure_contracts(self, symbol: str, expiry: str) -> None:
+        if self._is_meta_fresh(self._contracts_meta(symbol, expiry), CONTRACT_TTL_SECONDS):
+            return
+        self.refresh_expiry(symbol, expiry)
+
+    def _extract_expiries(self, payload: Dict[str, object]) -> List[str]:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        expiries: List[str] = []
+        if isinstance(data, dict) and isinstance(data.get("expiries"), Sequence):
+            expiries = [str(item) for item in data.get("expiries", []) if item]
+        if not expiries and isinstance(data, dict) and isinstance(data.get("contracts"), Sequence):
+            for entry in data.get("contracts", []):
+                if isinstance(entry, dict) and entry.get("expiry"):
+                    expiries.append(str(entry["expiry"]))
+        uniq = sorted({exp for exp in expiries})
+        return uniq
+
+    def _parse_option_chain(self, payload: Dict[str, object]) -> Tuple[Dict[str, object], ...]:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return tuple()
+        contracts: List[Dict[str, object]] = []
+
+        def _collect(entries: Optional[Sequence[Dict[str, object]]], opt_type: str) -> None:
+            if not isinstance(entries, Sequence):
+                return
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("instrument_key") or item.get("instrumentKey")
+                strike = item.get("strike") or item.get("strike_price") or item.get("strikePrice")
+                if not key or strike is None:
+                    continue
+                contracts.append(
+                    {
+                        "instrument_key": str(key),
+                        "strike": float(strike),
+                        "type": opt_type,
+                        "lot_size": item.get("lot_size") or item.get("lotSize"),
+                        "tick_size": item.get("tick_size") or item.get("tickSize"),
+                        "price_band_low": item.get("price_band_lower") or item.get("priceBandLower"),
+                        "price_band_high": item.get("price_band_upper") or item.get("priceBandUpper"),
+                    }
+                )
+
+        calls = data.get("call") or data.get("CALL") or data.get("ce") or data.get("CE")
+        puts = data.get("put") or data.get("PUT") or data.get("pe") or data.get("PE")
+        if isinstance(calls, dict) and "data" in calls:
+            calls = calls["data"]
+        if isinstance(puts, dict) and "data" in puts:
+            puts = puts["data"]
+        _collect(calls, "CE")
+        _collect(puts, "PE")
+        if not contracts and isinstance(data.get("contracts"), Sequence):
+            for item in data["contracts"]:
+                if not isinstance(item, dict):
+                    continue
+                opt_type = (item.get("option_type") or item.get("optionType") or "").upper()
+                if opt_type not in SUPPORTED_OPT_TYPES:
+                    continue
+                key = item.get("instrument_key") or item.get("instrumentKey")
+                strike = item.get("strike") or item.get("strike_price") or item.get("strikePrice")
+                if not key or strike is None:
+                    continue
+                contracts.append(
+                    {
+                        "instrument_key": str(key),
+                        "strike": float(strike),
+                        "type": opt_type,
+                        "lot_size": item.get("lot_size") or item.get("lotSize"),
+                        "tick_size": item.get("tick_size") or item.get("tickSize"),
+                        "price_band_low": item.get("price_band_lower") or item.get("priceBandLower"),
+                        "price_band_high": item.get("price_band_upper") or item.get("priceBandUpper"),
+                    }
+                )
+        return tuple(contracts)
+
+    def _classify_expiry(self, expiry: str) -> str:
+        exp_date = dt.date.fromisoformat(expiry)
+        next_week = exp_date + dt.timedelta(days=7)
+        return "monthly" if next_week.month != exp_date.month else "weekly"
+
+
+__all__ = ["InstrumentCache", "InstrumentMeta"]

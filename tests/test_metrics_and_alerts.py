@@ -26,7 +26,7 @@ def test_metrics_increment_when_prometheus_available(monkeypatch: pytest.MonkeyP
 
     created: dict[str, StubMetric] = {}
 
-    def _factory(name: str, _desc: str) -> StubMetric:
+    def _factory(name: str, _desc: str, *args, **kwargs) -> StubMetric:
         metric = StubMetric(name)
         created[name] = metric
         return metric
@@ -37,12 +37,13 @@ def test_metrics_increment_when_prometheus_available(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(metrics, "Histogram", _factory)
     meter = metrics.EngineMetrics()
     meter.engine_up.set(1)
-    meter.fills_total.inc(2)
-    meter.submit_latency_ms.observe(0.5)
+    meter.orders_filled_total.inc(2)
+    meter.fills_total.inc(1)
+    meter.order_latency_ms_bucketed.labels(operation="submit").observe(0.5)
     meter.beat()
     assert ("set", 1) in created["engine_up"].calls
-    assert ("inc", 2) in created["fills_total"].calls
-    assert ("observe", 0.5) in created["submit_latency_ms"].calls
+    assert ("inc", 2) in created["orders_filled_total"].calls
+    assert ("observe", 0.5) in created["order_latency_ms_bucketed"].calls
     assert created["heartbeat_ts"].calls
 
 

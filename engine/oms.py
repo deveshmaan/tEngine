@@ -4,15 +4,17 @@ import asyncio
 import datetime as dt
 import hashlib
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Protocol
+from typing import Any, Dict, Iterable, List, Optional, Protocol
 
 from engine.config import IST, OMSConfig
+from engine.data import get_app_config
 from engine.events import EventBus
 from engine.logging_utils import get_logger
 from engine.metrics import EngineMetrics
 from engine.time_machine import now as engine_now, utc_now
+from market.instrument_cache import InstrumentCache
 from persistence import SQLiteStore
 
 
@@ -27,6 +29,19 @@ class OrderState(str, Enum):
 
 
 FINAL_STATES = {OrderState.FILLED, OrderState.REJECTED, OrderState.CANCELED}
+
+
+class OrderValidationError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def round_to_tick(value: float, tick_size: float) -> float:
+    if tick_size <= 0:
+        return value
+    multiple = round(value / tick_size)
+    return round(multiple * tick_size, ndigits=8)
 
 
 @dataclass
@@ -107,6 +122,9 @@ class OMS:
         self._orders: Dict[str, Order] = {}
         self._lock = asyncio.Lock()
         self._logger = get_logger("OMS")
+        self._default_meta = self._load_default_meta()
+        self._submit_style = self._load_submit_style()
+        self._market_depth: Dict[str, Dict[str, float]] = {}
 
     # --------------------------------------------------------------- id helpers
     @staticmethod
@@ -128,6 +146,15 @@ class OMS:
         for order in orders:
             self._orders[order.client_order_id] = order
         self._update_order_metrics()
+
+    def update_market_depth(self, symbol: str, *, bid: float, ask: float, bid_qty: int, ask_qty: int) -> None:
+        self._market_depth[symbol] = {
+            "bid": float(bid),
+            "ask": float(ask),
+            "bid_qty": int(bid_qty),
+            "ask_qty": int(ask_qty),
+            "ts": engine_now(IST),
+        }
 
     # ----------------------------------------------------------------- commands
     async def submit(
@@ -167,6 +194,11 @@ class OMS:
                 limit_price=limit_price,
                 idempotency_key=idem,
             )
+            try:
+                self._prepare_order(order)
+            except OrderValidationError as exc:
+                self._record_validation_failure(exc, order)
+                raise
             self._orders[client_id] = order
             self._update_order_metrics()
         start = time.perf_counter()
@@ -177,13 +209,19 @@ class OMS:
     async def replace(self, client_order_id: str, *, price: Optional[float] = None, qty: Optional[int] = None) -> Order:
         async with self._lock:
             order = self._orders[client_order_id]
+        new_price = price if price is not None else order.limit_price
+        new_qty = qty if qty is not None else order.qty
+        candidate = replace(order, limit_price=new_price, qty=new_qty)
+        try:
+            self._prepare_order(candidate, skip_style=True)
+        except OrderValidationError as exc:
+            self._record_validation_failure(exc, candidate)
+            raise
         start = time.perf_counter()
-        await self._broker.replace_order(order, price=price, qty=qty)
+        await self._broker.replace_order(order, price=candidate.limit_price, qty=candidate.qty)
         self._record_latency("replace", time.perf_counter() - start)
-        if price is not None:
-            order.limit_price = price
-        if qty is not None:
-            order.qty = qty
+        order.limit_price = candidate.limit_price
+        order.qty = candidate.qty
         await self._persist_transition(order, order.state, order.state, reason="replace")
         return order
 
@@ -239,12 +277,15 @@ class OMS:
                     "exec_id": order.client_order_id,
                 },
             )
+        if self._metrics:
+            self._metrics.orders_filled_total.inc()
         self._update_order_metrics()
 
     async def mark_reject(self, client_order_id: str, message: str) -> None:
         async with self._lock:
             order = self._orders[client_order_id]
         await self._persist_transition(order, order.state, OrderState.REJECTED, reason=message)
+        self._record_reject_metric("broker")
         self._update_order_metrics()
 
     # --------------------------------------------------------------- reconciler
@@ -280,6 +321,8 @@ class OMS:
         if order.broker_order_id:
             return order
         try:
+            if self._metrics:
+                self._metrics.orders_submitted_total.inc()
             ack = await self._broker.submit_order(order)
         except Exception:
             await self._persist_transition(order, OrderState.SUBMITTED, OrderState.NEW, reason="retry")
@@ -310,6 +353,139 @@ class OMS:
         if open_orders >= self._cfg.max_inflight_orders:
             raise RuntimeError("Inflight order limit reached")
 
+    def _prepare_order(self, order: Order, *, skip_style: bool = False) -> None:
+        if order.qty <= 0:
+            raise OrderValidationError("qty_positive", "Quantity must be positive")
+        try:
+            underlying, expiry, strike, opt_type = self._parse_contract_symbol(order.symbol)
+        except OrderValidationError:
+            # Fallback for legacy symbols that do not include expiry/strike information.
+            fallback_expiry = engine_now(IST).date().isoformat()
+            underlying, expiry, strike, opt_type = order.symbol.upper(), fallback_expiry, 0.0, "CE"
+        tick_size, lot_size, band_low, band_high, strict_meta = self._lookup_contract_meta(underlying, expiry, strike, opt_type)
+        if not skip_style:
+            self._apply_submit_style(order, tick_size)
+        lot = max(int(lot_size), 1)
+        if strict_meta and order.qty % lot != 0:
+            raise OrderValidationError("lot_multiple", f"Qty {order.qty} not aligned to lot size {lot}")
+        order_type = order.order_type.upper()
+        if order_type != "MARKET":
+            if order.limit_price is None:
+                raise OrderValidationError("price_missing", "Limit orders require a price")
+            rounded = round_to_tick(float(order.limit_price), tick_size or self._default_meta[0])
+            order.limit_price = rounded
+            if band_low and rounded < band_low:
+                raise OrderValidationError("price_band_low", f"Price {rounded} below band {band_low}")
+            if band_high and band_high > 0 and rounded > band_high:
+                raise OrderValidationError("price_band_high", f"Price {rounded} above band {band_high}")
+
+    def _parse_contract_symbol(self, symbol: str) -> tuple[str, str, float, str]:
+        parts = symbol.split("-")
+        if len(parts) < 3:
+            raise OrderValidationError("symbol_format", f"Unsupported symbol format {symbol}")
+        expiry = "-".join(parts[1:-1])
+        tail = parts[-1]
+        opt_type = tail[-2:].upper() if tail[-2:].upper() in {"CE", "PE"} else "CE"
+        strike_part = tail[:-2] if opt_type in {"CE", "PE"} else tail
+        try:
+            dt.date.fromisoformat(expiry)
+        except ValueError as exc:
+            raise OrderValidationError("expiry_format", f"Invalid expiry {expiry}") from exc
+        try:
+            strike = float(strike_part)
+        except ValueError as exc:
+            raise OrderValidationError("strike_parse", f"Invalid strike in {symbol}") from exc
+        return parts[0].upper(), expiry, strike, opt_type
+
+    def _lookup_contract_meta(self, symbol: str, expiry: str, strike: float, opt_type: str) -> tuple[float, int, float, float]:
+        tick, lot, band_low, band_high = self._default_meta
+        strict = False
+        cache = InstrumentCache.runtime_cache()
+        contract = None
+        if cache:
+            try:
+                contract = cache.get_contract(symbol, expiry, strike, opt_type)
+            except Exception:
+                contract = None
+            if not contract:
+                try:
+                    cache.refresh_expiry(symbol, expiry)
+                    contract = cache.get_contract(symbol, expiry, strike, opt_type)
+                except Exception:
+                    contract = None
+            try:
+                expiry_meta = cache.get_meta(symbol, expiry)
+            except Exception:
+                expiry_meta = None
+            if isinstance(expiry_meta, tuple):
+                tick = float(expiry_meta[0] or tick)
+                lot = int(expiry_meta[1] or lot)
+                band_low = float(expiry_meta[2] or band_low)
+                band_high = float(expiry_meta[3] or band_high)
+                strict = True
+        if contract:
+            tick = float(contract.get("tick_size") or tick)
+            lot = int(contract.get("lot_size") or lot)
+            band_low = float(contract.get("band_low") or band_low)
+            band_high = float(contract.get("band_high") or band_high)
+            strict = True
+        return (
+            tick or self._default_meta[0],
+            int(lot or self._default_meta[1]),
+            band_low or self._default_meta[2],
+            band_high or self._default_meta[3],
+            strict or bool(contract),
+        )
+
+    def _apply_submit_style(self, order: Order, tick_size: float) -> None:
+        mode = str(self._submit_style.get("mode", "market")).lower()
+        depth = self._market_depth.get(order.symbol)
+        tick = tick_size or self._default_meta[0]
+        if mode in {"ioc", "auto"} and depth:
+            spread = max(0.0, depth["ask"] - depth["bid"])
+            threshold = float(self._submit_style.get("max_spread_ticks", 1.0))
+            min_depth = int(self._submit_style.get("depth_threshold", 0))
+            side = order.side.upper()
+            available = depth["ask_qty"] if side == "BUY" else depth["bid_qty"]
+            if spread <= threshold and available >= order.qty and available >= max(1, min_depth):
+                price = depth["ask"] if side == "BUY" else depth["bid"]
+                order.limit_price = price
+                order.order_type = "IOC_LIMIT"
+                return
+        if mode in {"limit", "auto"} and order.order_type.upper() == "MARKET" and order.limit_price is not None:
+            order.order_type = "LIMIT"
+
+    def _load_default_meta(self) -> tuple[float, int, float, float]:
+        cfg = (get_app_config().get("data") or {})
+        tick = float(cfg.get("tick_size", 0.05))
+        lot = int(cfg.get("lot_size") or cfg.get("lot_step", 1))
+        band_low = float(cfg.get("price_band_low", 0.0))
+        band_high = float(cfg.get("price_band_high", 0.0))
+        return tick, lot, band_low, band_high
+
+    def _load_submit_style(self) -> Dict[str, float | str | int]:
+        submit_cfg = ((get_app_config().get("oms") or {}).get("submit", {}))
+        return {
+            "mode": str(submit_cfg.get("default", "market")).lower(),
+            "max_spread_ticks": float(submit_cfg.get("max_spread_ticks", 1.0)),
+            "depth_threshold": int(submit_cfg.get("depth_threshold", 0)),
+        }
+
+    def _record_validation_failure(self, error: OrderValidationError, order: Optional[Order] = None) -> None:
+        if self._metrics:
+            self._metrics.orders_rejected_total.labels(reason="validation").inc()
+        self._logger.log_event(
+            30,
+            "order_validation_failed",
+            code=error.code,
+            message=str(error),
+            symbol=getattr(order, "symbol", None),
+        )
+
+    def _record_reject_metric(self, reason: str) -> None:
+        if self._metrics:
+            self._metrics.orders_rejected_total.labels(reason=reason).inc()
+
     def _update_order_metrics(self) -> None:
         if not self._metrics:
             return
@@ -319,14 +495,7 @@ class OMS:
     def _record_latency(self, kind: str, duration: float) -> None:
         if not self._metrics:
             return
-        mapping = {
-            "submit": self._metrics.submit_latency_ms,
-            "replace": self._metrics.replace_latency_ms,
-            "cancel": self._metrics.cancel_latency_ms,
-        }
-        metric = mapping.get(kind)
-        if metric:
-            metric.observe(duration * 1000.0)
+        self._metrics.order_latency_ms_bucketed.labels(operation=kind).observe(duration * 1000.0)
 
 
 __all__ = [
@@ -335,5 +504,7 @@ __all__ = [
     "BrokerOrderView",
     "OMS",
     "Order",
+    "OrderValidationError",
     "OrderState",
+    "round_to_tick",
 ]

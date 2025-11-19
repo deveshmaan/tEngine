@@ -1,3 +1,17 @@
+data:
+  index_symbol: "NIFTY"
+  lot_step: 50
+  tick_size: 0.05
+  price_band_low: 10.0
+  price_band_high: 5000.0
+  holidays:
+    - "2024-08-15"
+    - "2024-10-02"
+    - "2024-12-25"
+  strike_steps:
+    NIFTY: 50
+    BANKNIFTY: 100
+
 risk:
   daily_pnl_stop: -15000
   per_symbol_loss_stop: -5000
@@ -5,6 +19,34 @@ risk:
   notional_premium_cap: 250000
   no_new_entries_after: "15:10:00"
   square_off_by: "15:22:00"
+
+broker:
+  rest_timeout: 3.0
+  ws_heartbeat_interval: 3.0
+  ws_backoff_seconds: [1, 2, 5, 10]
+  oauth_refresh_margin: 60
+  rate_limits:
+    place:
+      rate_per_sec: 15
+      burst: 30
+    modify:
+      rate_per_sec: 12
+      burst: 24
+    cancel:
+      rate_per_sec: 12
+      burst: 24
+    history:
+      rate_per_sec: 5
+      burst: 10
+
+oms:
+  resubmit_backoff: 0.5
+  reconciliation_interval: 2.0
+  max_inflight_orders: 8
+  submit:
+    default: "auto"
+    max_spread_ticks: 2
+    depth_threshold: 50
 
 alerts:
   throttle_seconds: 30
