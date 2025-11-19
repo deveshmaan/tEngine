@@ -5,7 +5,6 @@ This tree lists only the files involved in running the trading engine so it can 
 ```
 .
 ├── main.py
-├── engine_config.yaml
 ├── requirements.txt
 ├── run_stack.sh
 ├── Readme.md

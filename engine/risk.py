@@ -49,6 +49,55 @@ class RiskEvent:
     context: Dict[str, float | int | str] = field(default_factory=dict)
 
 
+class SessionGuard:
+    """Encapsulate time-of-day guardrails for session bootstrap."""
+
+    MARKET_START = (9, 15, 0)
+    MARKET_CLOSE = (15, 30, 0)
+
+    def __init__(self, config: RiskLimits):
+        self._cfg = config
+
+    @staticmethod
+    def _parse_tod(hhmmss: str) -> tuple[int, int, int]:
+        parts = [int(part) for part in hhmmss.split(":") if part]
+        while len(parts) < 3:
+            parts.append(0)
+        return parts[0], parts[1], parts[2]
+
+    @staticmethod
+    def _now_ist() -> dt.datetime:
+        return engine_now(IST)
+
+    @staticmethod
+    def _is_market_open(now_ist: dt.datetime) -> bool:
+        start = now_ist.replace(hour=SessionGuard.MARKET_START[0], minute=SessionGuard.MARKET_START[1], second=0, microsecond=0)
+        close = now_ist.replace(hour=SessionGuard.MARKET_CLOSE[0], minute=SessionGuard.MARKET_CLOSE[1], second=0, microsecond=0)
+        return start <= now_ist < close
+
+    def _combine(self, now_ist: dt.datetime, target: dt.time) -> dt.datetime:
+        h, m, s = self._parse_tod(target.strftime("%H:%M:%S"))
+        return now_ist.replace(hour=h, minute=m, second=s, microsecond=0)
+
+    def evaluate_boot_state(self, now_ist: dt.datetime, has_positions: bool) -> dict[str, str]:
+        cutoff = self._combine(now_ist, self._cfg.no_new_entries_after)
+        square_off = self._combine(now_ist, self._cfg.square_off_by)
+        if now_ist < cutoff:
+            market_reason = "PREOPEN" if now_ist < now_ist.replace(hour=self.MARKET_START[0], minute=self.MARKET_START[1], second=0, microsecond=0) else "LIVE"
+            return {"action": "continue", "reason": market_reason}
+        if now_ist < square_off:
+            return {"action": "halt", "reason": "AFTER_CUTOFF"}
+        if has_positions:
+            return {"action": "squareoff_then_halt", "reason": "POST_CLOSE"}
+        behavior = (self._cfg.post_close_behavior or "halt_if_flat").lower()
+        if behavior == "shutdown":
+            return {"action": "shutdown", "reason": "POST_CLOSE"}
+        return {"action": "halt", "reason": "POST_CLOSE"}
+
+    def now(self) -> dt.datetime:
+        return self._now_ist()
+
+
 class RiskManager:
     """Production-ready risk controller for the BUY-only strategy."""
 
@@ -61,6 +110,7 @@ class RiskManager:
         self._halt_reason: Optional[str] = None
         self._kill_switch = False
         self._logger = logger if logger else get_logger("RiskManager")
+        self._session_guard = SessionGuard(config)
 
     # ----------------------------------------------------------------- updates
     def on_fill(self, *, symbol: str, side: str, qty: int, price: float, lot_size: int) -> None:
@@ -176,6 +226,41 @@ class RiskManager:
         if budgets:
             self.store.record_incident("SQUARE_OFF", {"reason": reason, "count": len(budgets)}, ts=self._clock())
         return budgets
+
+    def open_position_count(self) -> int:
+        runtime = sum(1 for state in self._positions.values() if state.net_qty > 0)
+        if runtime:
+            return runtime
+        conn = getattr(self.store, "_conn", None)
+        lock = getattr(self.store, "_lock", None)
+        if conn is None or lock is None:
+            return 0
+        try:
+            with lock:
+                cur = conn.execute(
+                    "SELECT qty FROM positions WHERE run_id=? AND (closed_at IS NULL OR closed_at='') AND ABS(qty) > 0",
+                    (self.store.run_id,),
+                )
+                rows = cur.fetchall()
+        except Exception:
+            return 0
+        count = 0
+        for row in rows:
+            qty = row[0]
+            if qty:
+                count += 1
+        return count
+
+    def has_open_positions(self) -> bool:
+        return self.open_position_count() > 0
+
+    def evaluate_boot_state(self, now_ist: Optional[dt.datetime] = None, has_positions: Optional[bool] = None) -> dict[str, str]:
+        now = now_ist or self._session_guard.now()
+        snapshot_has_positions = has_positions if has_positions is not None else self.has_open_positions()
+        return self._session_guard.evaluate_boot_state(now, snapshot_has_positions)
+
+    def session_guard_now(self) -> dt.datetime:
+        return self._session_guard.now()
 
     # ------------------------------------------------------------------ helpers
     def _order_rate_ok(self, now: dt.datetime) -> bool:

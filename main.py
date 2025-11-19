@@ -19,8 +19,8 @@ from engine.events import EventBus
 from engine.fees import load_fee_config
 from engine.instruments import InstrumentResolver
 from engine.logging_utils import configure_logging, get_logger
-from engine.metrics import EngineMetrics, start_http_server_if_available
-from engine.oms import OMS
+from engine.metrics import EngineMetrics, bind_global_metrics, start_http_server_if_available
+from engine.oms import OMS, OrderValidationError
 from engine.pnl import Execution as PnLExecution, PnLCalculator
 from engine.recovery import RecoveryManager
 from engine.replay import ReplayConfig, configure_runtime as configure_replay_runtime, replay
@@ -69,28 +69,40 @@ class IntradayBuyStrategy:
         await self._maybe_trade(spot, ts, symbol_hint)
 
     async def _maybe_trade(self, spot: float, ts: dt.datetime, symbol_hint: Optional[str]) -> None:
-        expiry = resolve_weekly_expiry(self.cfg.data.index_symbol, ts, self.cfg.data.holidays)
+        expiry_date = resolve_weekly_expiry(
+            self.cfg.data.index_symbol,
+            ts,
+            self.cfg.data.holidays,
+            weekly_weekday=self.cfg.data.weekly_expiry_weekday,
+        )
+        expiry_str = expiry_date.isoformat()
         strike = pick_strike_from_spot(
             spot,
-            self.cfg.data.lot_step,
-            self.cfg.data.tick_size,
-            price_band=(self.cfg.data.price_band_low, self.cfg.data.price_band_high),
+            step=self.cfg.data.lot_step,
         )
         option_type = "CE"
-        symbol = symbol_hint or f"{self.cfg.data.index_symbol}-{expiry.isoformat()}-{int(strike)}{option_type}"
-        budget = OrderBudget(symbol=symbol, qty=self.cfg.data.lot_step, price=spot, lot_size=self.cfg.data.lot_step, side="BUY")
+        lot_size = self._resolve_lot_size(expiry_str)
+        symbol = symbol_hint or f"{self.cfg.data.index_symbol}-{expiry_str}-{int(strike)}{option_type}"
+        budget = OrderBudget(symbol=symbol, qty=lot_size, price=spot, lot_size=lot_size, side="BUY")
         self.risk.on_tick(symbol, spot)
         if not self.risk.budget_ok_for(budget):
             return
-        await self.oms.submit(
-            strategy=self.cfg.strategy_tag,
-            symbol=symbol,
-            side="BUY",
-            qty=budget.qty,
-            order_type="MARKET",
-            limit_price=budget.price,
-            ts=ts,
-        )
+        try:
+            await self.oms.submit(
+                strategy=self.cfg.strategy_tag,
+                symbol=symbol,
+                side="BUY",
+                qty=budget.qty,
+                order_type="MARKET",
+                limit_price=budget.price,
+                ts=ts,
+            )
+        except OrderValidationError as exc:
+            self.logger.log_event(30, "order_validation_failed", symbol=symbol, code=exc.code, message=str(exc))
+            return
+        except Exception as exc:
+            self.logger.log_event(40, "order_submit_failed", symbol=symbol, error=str(exc))
+            return
         self.logger.log_event(20, "submitted", symbol=symbol, price=budget.price)
 
     def _event_ts(self, value: Optional[str]) -> dt.datetime:
@@ -105,6 +117,20 @@ class IntradayBuyStrategy:
                     continue
         return None
 
+    def _resolve_lot_size(self, expiry: str) -> int:
+        lot = max(int(self.cfg.data.lot_step), 1)
+        cache = self.instrument_cache
+        try:
+            meta = cache.get_meta(self.cfg.data.index_symbol, expiry)
+        except Exception:
+            meta = None
+        if isinstance(meta, tuple) and len(meta) >= 2 and meta[1]:
+            try:
+                lot = max(int(meta[1]), 1)
+            except (TypeError, ValueError):
+                pass
+        return lot
+
 
 class EngineApp:
     def __init__(self, config: EngineConfig):
@@ -112,9 +138,17 @@ class EngineApp:
         self.logger = get_logger("EngineApp")
         self.bus = EventBus()
         self.store = SQLiteStore(config.persistence_path, run_id=config.run_id)
-        self.instrument_cache = InstrumentCache(str(config.persistence_path))
+        probe_expiries = os.getenv("UPSTOX_ENABLE_EXPIRY_PROBE", "true").lower() in {"1", "true", "yes"}
+        self.instrument_cache = InstrumentCache(
+            str(config.persistence_path),
+            weekly_expiry_weekday=config.data.weekly_expiry_weekday,
+            holidays=config.data.holidays,
+            enable_remote_expiry_probe=probe_expiries,
+            expiry_ttl_minutes=config.data.expiry_ttl_minutes,
+        )
         self.instrument_resolver = InstrumentResolver(self.instrument_cache)
         self.metrics = EngineMetrics()
+        bind_global_metrics(self.metrics)
         self.risk = RiskManager(config.risk, self.store)
         self.broker = UpstoxBroker(
             config=config.broker,
@@ -122,9 +156,21 @@ class EngineApp:
             instrument_resolver=self.instrument_resolver,
             metrics=self.metrics,
             auth_halt_callback=self.risk.halt_new_entries,
+            risk_manager=self.risk,
         )
-        self.oms = OMS(broker=self.broker, store=self.store, config=config.oms, bus=self.bus, metrics=self.metrics)
+        default_meta = (config.data.tick_size, config.data.lot_step, config.data.price_band_low, config.data.price_band_high)
+        self.oms = OMS(
+            broker=self.broker,
+            store=self.store,
+            config=config.oms,
+            bus=self.bus,
+            metrics=self.metrics,
+            default_meta=default_meta,
+            square_off_time=config.risk.square_off_by,
+        )
         self.broker.bind_reconcile_callback(self.oms.reconcile_from_broker)
+        self.broker.bind_square_off_callback(self._execute_square_off)
+        self.broker.bind_shutdown_callback(self.trigger_shutdown)
         self.strategy = IntradayBuyStrategy(config, self.risk, self.oms, self.bus)
         self.fee_config = load_fee_config()
         self.pnl = PnLCalculator(self.store, self.fee_config)
@@ -144,6 +190,13 @@ class EngineApp:
         self.logger.log_event(20, "metrics_bootstrap", port=metrics_port, started=metrics_started)
         self.metrics.engine_up.set(1)
         await self.broker.start()
+        decision = self.broker.session_guard_decision or {"action": "continue", "state": 1, "positions": 0}
+        halt_flag = 1 if decision.get("action") != "continue" else 0
+        self.logger.log_event(20, "session_guard", state=decision.get("state", 1), halt=halt_flag, positions=decision.get("positions", 0))
+        if decision.get("action") == "shutdown":
+            await self.trigger_shutdown("session_guard_shutdown")
+            await self._cleanup()
+            return
         await RecoveryManager(self.store, self.oms).reconcile()
         self._square_task = asyncio.create_task(self._square_off_watchdog(), name="square-off")
         strat_task = asyncio.create_task(self.strategy.run(self._stop), name="strategy-loop")
@@ -318,12 +371,15 @@ class EngineApp:
         while not self._stop.is_set():
             ts = engine_now(IST)
             spot = self._mock_spot()
-            expiry = resolve_weekly_expiry(self.cfg.data.index_symbol, ts, self.cfg.data.holidays)
+            expiry = resolve_weekly_expiry(
+                self.cfg.data.index_symbol,
+                ts,
+                self.cfg.data.holidays,
+                weekly_weekday=self.cfg.data.weekly_expiry_weekday,
+            )
             strike = pick_strike_from_spot(
                 spot,
-                self.cfg.data.lot_step,
-                self.cfg.data.tick_size,
-                price_band=(self.cfg.data.price_band_low, self.cfg.data.price_band_high),
+                step=self.cfg.data.lot_step,
             )
             symbol = f"{self.cfg.data.index_symbol}-{expiry.isoformat()}-{int(strike)}CE"
             payload = {"underlying": self.cfg.data.index_symbol, "ltp": spot, "symbol": symbol}
@@ -351,7 +407,7 @@ class EngineApp:
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Async trading engine")
-    parser.add_argument("--config", type=Path, help="Path to engine_config.yaml", default=None)
+    parser.add_argument("--config", type=Path, help="(deprecated) config/app.yml is canonical", default=None)
     parser.add_argument("--replay-from-run", dest="replay_from_run", help="Replay from persisted run id")
     parser.add_argument("--replay-from-file", dest="replay_from_file", type=Path, help="Replay from JSONL feed")
     parser.add_argument("--replay-speed", dest="replay_speed", type=float, default=1.0)

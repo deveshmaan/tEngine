@@ -58,9 +58,17 @@ def _risk_limits() -> RiskLimits:
 async def test_integration_partial_reject_and_reconnect(tmp_path):
     broker = FlakyBroker()
     store = SQLiteStore(tmp_path / "integration.sqlite", run_id="int")
-    oms = OMS(broker=broker, store=store, config=_oms_cfg())
+    limits = _risk_limits()
+    default_meta = (0.05, 50, 10.0, 500.0)
+    oms = OMS(
+        broker=broker,
+        store=store,
+        config=_oms_cfg(),
+        default_meta=default_meta,
+        square_off_time=limits.square_off_by,
+    )
     clock_now = dt.datetime(2024, 7, 1, 9, 45, tzinfo=IST)
-    risk = RiskManager(_risk_limits(), store, clock=lambda: clock_now)
+    risk = RiskManager(limits, store, clock=lambda: clock_now)
     ts = clock_now
     order_id = OMS.client_order_id("demo", ts, "NIFTY", "BUY", 50)
     budget = OrderBudget(symbol="NIFTY", qty=50, price=200.0, lot_size=50, side="BUY")

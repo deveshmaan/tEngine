@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - numpy optional
     numpy = None  # type: ignore
 
 
-@dataclass(slots=True)
+@dataclass
 class ReplayConfig:
     run_id: Optional[str]
     input_path: Optional[Path]

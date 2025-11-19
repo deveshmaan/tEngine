@@ -32,7 +32,23 @@ class StubMetrics(SimpleNamespace):
             ratelimit_tokens=MetricStub(),
             broker_queue_depth=MetricStub(),
             ws_reconnects_total=MetricStub(),
+            api_errors_total=MetricStub(),
         )
+
+    def set_ratelimit_tokens(self, endpoint: str, tokens: float) -> None:
+        self.ratelimit_tokens.set(tokens)
+
+    def set_broker_queue_depth(self, endpoint: str, depth: float) -> None:
+        self.broker_queue_depth.set(depth)
+
+    def set_risk_halt_state(self, value: float) -> None:
+        self.risk_halt_state.set(value)
+
+    def inc_api_error(self, code: str) -> None:
+        self.api_errors_total.labels(code=code).inc()
+
+    def inc_orders_rejected(self, reason: str) -> None:
+        return None
 
 
 class FakeOrderApi:
@@ -131,7 +147,7 @@ async def test_http_401_triggers_halt(monkeypatch):
     with pytest.raises(BrokerError):
         await broker.submit_order(order)
     assert metrics.http_401_total.value == pytest.approx(1)
-    assert halted == ["AUTH"]
+    assert halted == ["AUTH_401"]
     with pytest.raises(BrokerError):
         await broker.submit_order(order)
     sell_order = Order(client_order_id="2", strategy="s", symbol="TOKEN", side="SELL", qty=50, limit_price=10.0)
@@ -142,6 +158,7 @@ async def test_http_401_triggers_halt(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ws_watchdog_reconnects(monkeypatch):
+    monkeypatch.setattr("engine.broker.preopen_expiry_smoke", lambda symbols=("NIFTY", "BANKNIFTY"): None)
     stream = HeartbeatStream()
     metrics = StubMetrics()
     broker = UpstoxBroker(

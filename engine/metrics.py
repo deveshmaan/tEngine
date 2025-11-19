@@ -59,6 +59,12 @@ class EngineMetrics:
             self.ws_reconnects_total = _NoOpMetric()
             self.ratelimit_tokens = _NoOpMetric()
             self.broker_queue_depth = _NoOpMetric()
+            self.api_errors_total = _NoOpMetric()
+            self.session_state = _NoOpMetric()
+            self.expiry_discovery_attempt_total = _NoOpMetric()
+            self.expiry_discovery_success_total = _NoOpMetric()
+            self.expiry_override_used_total = _NoOpMetric()
+            self.expiry_source = _NoOpMetric()
             return
         registry_kwargs = {"registry": self._registry} if self._registry is not None else {}
         self.engine_up = Gauge("engine_up", "Engine up status", **registry_kwargs)
@@ -84,9 +90,90 @@ class EngineMetrics:
         self.ws_reconnects_total = Counter("ws_reconnects_total", "WS reconnect attempts", **registry_kwargs)
         self.ratelimit_tokens = Gauge("ratelimit_tokens", "Available tokens per endpoint", ["endpoint"], **registry_kwargs)
         self.broker_queue_depth = Gauge("broker_queue_depth", "Broker queue depth", ["endpoint"], **registry_kwargs)
+        self.api_errors_total = Counter("api_errors_total", "API errors", ["code"], **registry_kwargs)
+        self.session_state = Gauge("session_state", "Trading session state", **registry_kwargs)
+        self.expiry_discovery_attempt_total = Counter("expiry_discovery_attempt_total", "Expiry discovery attempts", ["source"], **registry_kwargs)
+        self.expiry_discovery_success_total = Counter("expiry_discovery_success_total", "Expiry discovery successes", ["source"], **registry_kwargs)
+        self.expiry_override_used_total = Counter("expiry_override_used_total", "Expiry override activations", **registry_kwargs)
+        self.expiry_source = Gauge("expiry_source", "Expiry discovery source (0=contracts,1=instruments,2=override)", ["symbol"], **registry_kwargs)
 
     def beat(self) -> None:
         self.heartbeat_ts.set(time.time())
+
+    def inc_api_error(self, code: str) -> None:
+        self.api_errors_total.labels(code=code).inc()
+
+    def inc_orders_rejected(self, reason: str) -> None:
+        self.orders_rejected_total.labels(reason=reason).inc()
+
+    def set_ratelimit_tokens(self, endpoint: str, tokens: float) -> None:
+        self.ratelimit_tokens.labels(endpoint=endpoint).set(tokens)
+
+    def set_broker_queue_depth(self, endpoint: str, depth: int) -> None:
+        self.broker_queue_depth.labels(endpoint=endpoint).set(depth)
+
+    def set_risk_halt_state(self, value: int | float) -> None:
+        self.risk_halt_state.set(value)
+
+
+_GLOBAL_METRICS: Optional[EngineMetrics] = None
+
+
+def bind_global_metrics(metrics: Optional[EngineMetrics]) -> None:
+    global _GLOBAL_METRICS
+    _GLOBAL_METRICS = metrics
+
+
+def _maybe_metrics() -> Optional[EngineMetrics]:
+    return _GLOBAL_METRICS
+
+
+def inc_api_error(code: str) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        meter.inc_api_error(code)
+
+
+def inc_orders_rejected(reason: str) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        meter.inc_orders_rejected(reason)
+
+
+def set_risk_halt_state(value: int | float) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        meter.set_risk_halt_state(value)
+
+
+def inc_expiry_attempt(source: str) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        meter.expiry_discovery_attempt_total.labels(source=source).inc()
+
+
+def inc_expiry_success(source: str) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        meter.expiry_discovery_success_total.labels(source=source).inc()
+
+
+def inc_expiry_override_used() -> None:
+    meter = _maybe_metrics()
+    if meter:
+        meter.expiry_override_used_total.inc()
+
+
+def set_expiry_source(symbol: str, value: int | float) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        meter.expiry_source.labels(symbol=symbol.upper()).set(value)
+
+
+def set_session_state(value: int | float) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        meter.session_state.set(value)
 
 
 def start_http_server_if_available(port: Optional[int] = None) -> bool:
@@ -98,4 +185,16 @@ def start_http_server_if_available(port: Optional[int] = None) -> bool:
     return True
 
 
-__all__ = ["EngineMetrics", "start_http_server_if_available"]
+__all__ = [
+    "EngineMetrics",
+    "bind_global_metrics",
+    "inc_expiry_attempt",
+    "inc_api_error",
+    "inc_expiry_override_used",
+    "inc_expiry_success",
+    "inc_orders_rejected",
+    "set_expiry_source",
+    "set_session_state",
+    "set_risk_halt_state",
+    "start_http_server_if_available",
+]

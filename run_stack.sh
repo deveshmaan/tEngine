@@ -10,15 +10,19 @@ if [ -f "$ROOT_DIR/.env" ]; then
   source "$ROOT_DIR/.env"
 fi
 
-if ! python - <<'PY' >/dev/null 2>&1; then
+PY_BOOTSTRAP_BIN="$(command -v python3 || command -v python || true)"
+if [ -z "$PY_BOOTSTRAP_BIN" ]; then
+  echo "[STACK] python interpreter not found; please install python3"
+  exit 1
+fi
+
+if ! "$PY_BOOTSTRAP_BIN" - <<'PY' >/dev/null 2>&1; then
 import importlib
 importlib.import_module("upstox_client")
 PY
-  pip install --upgrade upstox-python-sdk >/dev/null
-  python - <<'PY' >/dev/null 2>&1
-import importlib
-importlib.import_module("upstox_client")
-PY
+  echo "[STACK] Missing dependency 'upstox-python-sdk'. Install it via:"
+  echo "    $PY_BOOTSTRAP_BIN -m pip install --upgrade upstox-python-sdk"
+  exit 1
 fi
 
 PROM_BIN="${PROM_BIN:-$ROOT_DIR/prometheus/prometheus}"
@@ -28,17 +32,36 @@ PROM_PORT="${PROM_PORT:-9090}"
 METRICS_PORT="${METRICS_PORT:-9103}"
 STREAMLIT_PORT="${STREAMLIT_PORT:-8502}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.engine-env/bin/python}"
-if [ ! -x "$PYTHON_BIN" ]; then
-  PYTHON_BIN="$(command -v python)"
+if ! "$PYTHON_BIN" --version >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3 || command -v python || true)"
 fi
+if [ -z "$PYTHON_BIN" ]; then
+  echo "[STACK] python interpreter for engine not found; please install python3"
+  exit 1
+fi
+PYTHON_SSL=$("$PYTHON_BIN" - <<'PY'
+import ssl
+print(getattr(ssl, "OPENSSL_VERSION", "unknown"))
+PY
+)
+case "$PYTHON_SSL" in
+  *"LibreSSL"* )
+    echo "[STACK] WARNING: Using Apple/LibreSSL Python. Prefer a Homebrew/venv Python (OpenSSL >=1.1) for stable TLS."
+    ;;
+esac
 ENGINE_CMD=("$PYTHON_BIN" "$ROOT_DIR/main.py")
 STREAMLIT_BIN_DEFAULT="$ROOT_DIR/.engine-env/bin/streamlit"
-if [ -x "$STREAMLIT_BIN_DEFAULT" ]; then
-  STREAMLIT_BIN="$STREAMLIT_BIN_DEFAULT"
+STREAMLIT_CMD=()
+if [ -x "$STREAMLIT_BIN_DEFAULT" ] && "$STREAMLIT_BIN_DEFAULT" --version >/dev/null 2>&1; then
+  STREAMLIT_CMD=("$STREAMLIT_BIN_DEFAULT" run "$ROOT_DIR/streamlit_app.py" --server.port "$STREAMLIT_PORT")
 else
-  STREAMLIT_BIN=$(command -v streamlit 2>/dev/null || true)
+  STREAMLIT_PATH=$(command -v streamlit 2>/dev/null || true)
+  if [ -n "$STREAMLIT_PATH" ] && "$STREAMLIT_PATH" --version >/dev/null 2>&1; then
+    STREAMLIT_CMD=("$STREAMLIT_PATH" run "$ROOT_DIR/streamlit_app.py" --server.port "$STREAMLIT_PORT")
+  elif "$PYTHON_BIN" -m streamlit --version >/dev/null 2>&1; then
+    STREAMLIT_CMD=("$PYTHON_BIN" -m streamlit run "$ROOT_DIR/streamlit_app.py" --server.port "$STREAMLIT_PORT")
+  fi
 fi
-STREAMLIT_CMD=("$STREAMLIT_BIN" run "$ROOT_DIR/streamlit_app.py" --server.port "$STREAMLIT_PORT")
 if ! [[ "$METRICS_PORT" =~ ^[0-9]+$ ]]; then
   echo "[STACK] Invalid METRICS_PORT '$METRICS_PORT' - defaulting to 9103"
   METRICS_PORT=9103
@@ -85,11 +108,11 @@ else
 fi
 
 echo "[STACK] Starting Streamlit UI"
-if [ -n "$STREAMLIT_BIN" ]; then
+if [ "${#STREAMLIT_CMD[@]}" -gt 0 ]; then
   "${STREAMLIT_CMD[@]}" &
   STREAMLIT_PID=$!
 else
-  echo "[STACK] streamlit executable not found; please install streamlit"
+  echo "[STACK] streamlit executable not available; install it or set STREAMLIT_BIN"
   STREAMLIT_PID=""
 fi
 

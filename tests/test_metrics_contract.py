@@ -20,8 +20,10 @@ def test_metrics_surface_required_series():
     metrics.orders_submitted_total.inc(2)
     metrics.orders_filled_total.inc(1)
     metrics.orders_rejected_total.labels(reason="validation").inc()
+    metrics.api_errors_total.labels(code="UDAPI1088").inc()
     metrics.order_latency_ms_bucketed.labels(operation="submit").observe(12.5)
     metrics.http_401_total.inc()
+    metrics.ws_reconnects_total.inc()
     metrics.rest_retries_total.labels(endpoint="place").inc()
     metrics.ratelimit_tokens.labels(endpoint="place").set(0)
     metrics.broker_queue_depth.labels(endpoint="place").set(1)
@@ -34,8 +36,21 @@ def test_metrics_surface_required_series():
     time.sleep(0.1)
     resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=2)
     payload = resp.read().decode("utf-8")
-    assert "pnl_net_rupees" in payload
-    assert "orders_submitted_total" in payload
-    assert "orders_rejected_total" in payload
-    assert "order_latency_ms_bucketed" in payload
-    assert "risk_halt_state" in payload
+    required = [
+        "pnl_realized",
+        "pnl_unrealized",
+        "pnl_fees",
+        "pnl_net_rupees",
+        "risk_halt_state",
+        "broker_queue_depth",
+        "ratelimit_tokens",
+        "orders_submitted_total",
+        "orders_filled_total",
+        "orders_rejected_total",
+        "api_errors_total",
+        "ws_reconnects_total",
+        "http_401_total",
+        "order_latency_ms_bucketed",
+    ]
+    for metric_name in required:
+        assert metric_name in payload

@@ -43,6 +43,10 @@ def _cfg() -> OMSConfig:
     return OMSConfig(resubmit_backoff=0.1, reconciliation_interval=0.5, max_inflight_orders=100)
 
 
+DEFAULT_META = (0.05, 50, 10.0, 500.0)
+SQUARE_OFF = dt.time(15, 30)
+
+
 @pytest.mark.asyncio
 async def test_client_order_id_deterministic():
     ts = dt.datetime(2024, 7, 1, 9, 30, tzinfo=IST)
@@ -55,7 +59,7 @@ async def test_client_order_id_deterministic():
 async def test_oms_transitions_and_fills(tmp_path):
     broker = FakeBroker()
     store = SQLiteStore(tmp_path / "oms.sqlite", run_id="oms-test")
-    oms = OMS(broker=broker, store=store, config=_cfg())
+    oms = OMS(broker=broker, store=store, config=_cfg(), default_meta=DEFAULT_META, square_off_time=SQUARE_OFF)
     order = await oms.submit(strategy="demo", symbol="NIFTY", side="BUY", qty=10, ts=dt.datetime.now(IST))
     assert order.state == OrderState.ACKNOWLEDGED
     await oms.record_fill(order.client_order_id, qty=5, price=100.0)
@@ -68,7 +72,7 @@ async def test_oms_transitions_and_fills(tmp_path):
 async def test_reconnect_retries_with_same_id(tmp_path):
     broker = FakeBroker(fail_first=1)
     store = SQLiteStore(tmp_path / "oms.sqlite", run_id="oms-retry")
-    oms = OMS(broker=broker, store=store, config=_cfg())
+    oms = OMS(broker=broker, store=store, config=_cfg(), default_meta=DEFAULT_META, square_off_time=SQUARE_OFF)
     ts = dt.datetime(2024, 7, 1, 9, 30, tzinfo=IST)
     with pytest.raises(BrokerError):
         await oms.submit(strategy="demo", symbol="NIFTY", side="BUY", qty=10, ts=ts)
@@ -82,7 +86,7 @@ async def test_reconnect_retries_with_same_id(tmp_path):
 async def test_reconcile_reflects_broker_state(tmp_path):
     broker = FakeBroker()
     store = SQLiteStore(tmp_path / "oms.sqlite", run_id="oms-reconcile")
-    oms = OMS(broker=broker, store=store, config=_cfg())
+    oms = OMS(broker=broker, store=store, config=_cfg(), default_meta=DEFAULT_META, square_off_time=SQUARE_OFF)
     order = await oms.submit(strategy="demo", symbol="NIFTY", side="BUY", qty=10, ts=dt.datetime.now(IST))
     view = broker.views[order.client_order_id]
     broker.views[order.client_order_id] = BrokerOrderView(
@@ -100,7 +104,7 @@ async def test_reconcile_reflects_broker_state(tmp_path):
 async def test_burst_of_orders_has_unique_ids(tmp_path):
     broker = FakeBroker()
     store = SQLiteStore(tmp_path / "oms.sqlite", run_id="oms-burst")
-    oms = OMS(broker=broker, store=store, config=_cfg())
+    oms = OMS(broker=broker, store=store, config=_cfg(), default_meta=DEFAULT_META, square_off_time=SQUARE_OFF)
     base_ts = dt.datetime(2024, 7, 1, 9, 30, tzinfo=IST)
     ids = []
     for idx in range(50):

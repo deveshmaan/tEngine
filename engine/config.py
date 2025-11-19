@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Set
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import yaml
 
@@ -12,23 +13,73 @@ from engine.time_machine import now as engine_now
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 
+_WEEKDAY_ALIASES = {
+    "mon": 0,
+    "monday": 0,
+    "tue": 1,
+    "tuesday": 1,
+    "wed": 2,
+    "wednesday": 2,
+    "thu": 3,
+    "thursday": 3,
+    "fri": 4,
+    "friday": 4,
+}
+
+_DEPRECATION_WARNED = False
+_LOGGER = logging.getLogger("engine.config")
+
+
+def _canonical_config() -> Path:
+    return Path(os.getenv("APP_CONFIG_PATH", "config/app.yml"))
+
 
 def _parse_time_str(value: str) -> dt.time:
     value = value.strip()
-    try:
-        return dt.datetime.strptime(value, "%H:%M").time()
-    except ValueError as exc:  # pragma: no cover - config error
-        raise ValueError(f"Invalid HH:MM time string: {value}") from exc
-
-
-def _parse_holidays(raw: Iterable[str]) -> Set[dt.date]:
-    holidays: Set[dt.date] = set()
-    for entry in raw:
+    for fmt in ("%H:%M:%S", "%H:%M"):
         try:
-            holidays.add(dt.date.fromisoformat(entry))
+            return dt.datetime.strptime(value, fmt).time()
         except ValueError:
             continue
-    return holidays
+    raise ValueError(f"Invalid HH:MM[:SS] time string: {value}")
+
+
+def _parse_holidays(raw: Iterable[str]) -> tuple[dt.date, ...]:
+    holidays: list[dt.date] = []
+    for entry in raw:
+        try:
+            holidays.append(dt.date.fromisoformat(str(entry)))
+        except ValueError:
+            continue
+    return tuple(sorted(set(holidays)))
+
+
+def _parse_weekday(value: Any, default: int = 3) -> int:
+    if value is None:
+        return default
+    if isinstance(value, int):
+        day = value
+    else:
+        text = str(value).strip().lower()
+        if not text:
+            return default
+        if text.isdigit():
+            day = int(text)
+        else:
+            day = _WEEKDAY_ALIASES.get(text, default)
+    if day < 0 or day > 6:
+        return default
+    return day
+
+
+def _strike_steps(payload: Mapping[str, Any]) -> dict[str, int]:
+    steps: dict[str, int] = {}
+    for symbol, raw in (payload or {}).items():
+        try:
+            steps[str(symbol).upper()] = int(raw)
+        except (TypeError, ValueError):
+            continue
+    return steps
 
 
 @dataclass(frozen=True)
@@ -40,17 +91,22 @@ class RiskLimits:
     max_order_rate: int
     no_new_entries_after: dt.time
     square_off_by: dt.time
+    post_close_behavior: str = "halt_if_flat"
 
     @staticmethod
-    def from_dict(payload: Dict[str, Any]) -> "RiskLimits":
+    def from_dict(payload: Mapping[str, Any]) -> "RiskLimits":
+        behavior = str(payload.get("post_close_behavior", "halt_if_flat")).strip().lower() or "halt_if_flat"
+        if behavior not in {"halt_if_flat", "shutdown"}:
+            behavior = "halt_if_flat"
         return RiskLimits(
             daily_pnl_stop=float(payload["daily_pnl_stop"]),
             per_symbol_loss_stop=float(payload["per_symbol_loss_stop"]),
             max_open_lots=int(payload["max_open_lots"]),
             notional_premium_cap=float(payload["notional_premium_cap"]),
-            max_order_rate=int(payload["max_order_rate"]),
-            no_new_entries_after=_parse_time_str(payload["no_new_entries_after"]),
-            square_off_by=_parse_time_str(payload["square_off_by"]),
+            max_order_rate=int(payload.get("max_order_rate", 15)),
+            no_new_entries_after=_parse_time_str(str(payload["no_new_entries_after"])),
+            square_off_by=_parse_time_str(str(payload["square_off_by"])),
+            post_close_behavior=behavior,
         )
 
 
@@ -61,18 +117,64 @@ class DataConfig:
     tick_size: float
     price_band_low: float
     price_band_high: float
-    holidays: Set[dt.date]
+    strike_steps: dict[str, int]
+    holidays: tuple[dt.date, ...]
+    expiry_ttl_minutes: int
+    weekly_expiry_weekday: int
+    allow_expiry_override: bool = False
+    expiry_override_path: Optional[str] = None
+    expiry_override_max_age_minutes: int = 90
 
     @staticmethod
-    def from_dict(payload: Dict[str, Any]) -> "DataConfig":
+    def from_dict(payload: Mapping[str, Any]) -> "DataConfig":
+        raw_path = payload.get("expiry_override_path")
+        path_value = str(raw_path).strip() if raw_path else ""
         return DataConfig(
             index_symbol=str(payload.get("index_symbol", "NIFTY")).upper(),
-            lot_step=int(payload["lot_step"]),
-            tick_size=float(payload["tick_size"]),
+            lot_step=int(payload.get("lot_step", 50)),
+            tick_size=float(payload.get("tick_size", 0.05)),
             price_band_low=float(payload.get("price_band_low", 0.05)),
             price_band_high=float(payload.get("price_band_high", 5000.0)),
+            strike_steps=_strike_steps(payload.get("strike_steps", {})),
             holidays=_parse_holidays(payload.get("holidays", [])),
+            expiry_ttl_minutes=int(payload.get("expiry_ttl_minutes", 5)),
+            weekly_expiry_weekday=_parse_weekday(payload.get("weekly_expiry_weekday"), default=3),
+            allow_expiry_override=bool(payload.get("allow_expiry_override", False)),
+            expiry_override_path=path_value or None,
+            expiry_override_max_age_minutes=int(payload.get("expiry_override_max_age_minutes", 90)),
         )
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+@dataclass(frozen=True)
+class RateLimitConfig:
+    rate_per_sec: float
+    burst: int
+
+
+@dataclass(frozen=True)
+class BrokerRateLimits:
+    place: RateLimitConfig
+    modify: RateLimitConfig
+    cancel: RateLimitConfig
+    history: RateLimitConfig
+
+
+def _build_rate_limit(payload: Mapping[str, Any], fallback_rate: float, fallback_burst: int) -> RateLimitConfig:
+    rate = float(payload.get("rate_per_sec", fallback_rate))
+    burst = int(payload.get("burst", fallback_burst))
+    return RateLimitConfig(rate_per_sec=max(rate, 0.1), burst=max(burst, 1))
+
+
+def _rate_limits(payload: Mapping[str, Any], default_rate: float) -> BrokerRateLimits:
+    return BrokerRateLimits(
+        place=_build_rate_limit(payload.get("place", {}), default_rate, int(default_rate * 2)),
+        modify=_build_rate_limit(payload.get("modify", {}), default_rate, int(default_rate * 2)),
+        cancel=_build_rate_limit(payload.get("cancel", {}), default_rate, int(default_rate * 2)),
+        history=_build_rate_limit(payload.get("history", {}), max(default_rate / 2, 1.0), int(default_rate)),
+    )
 
 
 @dataclass(frozen=True)
@@ -81,17 +183,27 @@ class BrokerConfig:
     ws_heartbeat_interval: float
     ws_backoff_seconds: tuple[float, ...]
     oauth_refresh_margin: int
-    max_order_rate: int
+    rate_limits: BrokerRateLimits = field(default_factory=lambda: _rate_limits({}, 15.0))
+    max_order_rate: int = 15
 
     @staticmethod
-    def from_dict(payload: Dict[str, Any]) -> "BrokerConfig":
+    def from_dict(payload: Mapping[str, Any]) -> "BrokerConfig":
+        base_rate = float(payload.get("max_order_rate", 15))
         return BrokerConfig(
             rest_timeout=float(payload.get("rest_timeout", 3.0)),
             ws_heartbeat_interval=float(payload.get("ws_heartbeat_interval", 3.0)),
             ws_backoff_seconds=tuple(float(v) for v in payload.get("ws_backoff_seconds", (1, 2, 5, 10))),
             oauth_refresh_margin=int(payload.get("oauth_refresh_margin", 60)),
-            max_order_rate=int(payload.get("max_order_rate", 15)),
+            rate_limits=_rate_limits(payload.get("rate_limits", {}), max(base_rate, 1.0)),
+            max_order_rate=int(base_rate),
         )
+
+
+@dataclass(frozen=True)
+class OMSSubmitConfig:
+    default: str
+    max_spread_ticks: int
+    depth_threshold: int
 
 
 @dataclass(frozen=True)
@@ -99,13 +211,21 @@ class OMSConfig:
     resubmit_backoff: float
     reconciliation_interval: float
     max_inflight_orders: int
+    submit: OMSSubmitConfig = field(default_factory=lambda: OMSSubmitConfig(default="market", max_spread_ticks=1, depth_threshold=0))
 
     @staticmethod
-    def from_dict(payload: Dict[str, Any]) -> "OMSConfig":
+    def from_dict(payload: Mapping[str, Any]) -> "OMSConfig":
+        submit_raw = payload.get("submit", {})
+        submit = OMSSubmitConfig(
+            default=str(submit_raw.get("default", "market")).lower(),
+            max_spread_ticks=int(submit_raw.get("max_spread_ticks", 1)),
+            depth_threshold=int(submit_raw.get("depth_threshold", 0)),
+        )
         return OMSConfig(
             resubmit_backoff=float(payload.get("resubmit_backoff", 0.5)),
             reconciliation_interval=float(payload.get("reconciliation_interval", 2.0)),
             max_inflight_orders=int(payload.get("max_inflight_orders", 8)),
+            submit=submit,
         )
 
 
@@ -114,54 +234,118 @@ class AlertConfig:
     throttle_seconds: float = 30.0
 
     @staticmethod
-    def from_dict(payload: Dict[str, Any]) -> "AlertConfig":
+    def from_dict(payload: Mapping[str, Any]) -> "AlertConfig":
         return AlertConfig(throttle_seconds=float(payload.get("throttle_seconds", 30.0)))
+
+
+@dataclass(frozen=True)
+class TelemetryConfig:
+    metrics_port_env: str = "METRICS_PORT"
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "TelemetryConfig":
+        return TelemetryConfig(metrics_port_env=str(payload.get("metrics_port_env", "METRICS_PORT")))
+
+
+@dataclass(frozen=True)
+class ReplayConfig:
+    default_speed: float = 1.0
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "ReplayConfig":
+        return ReplayConfig(default_speed=float(payload.get("default_speed", 1.0)))
 
 
 @dataclass(frozen=True)
 class EngineConfig:
     run_id: str
     persistence_path: Path
+    strategy_tag: str
     risk: RiskLimits
     data: DataConfig
     broker: BrokerConfig
     oms: OMSConfig
-    strategy_tag: str
     alerts: AlertConfig
+    telemetry: TelemetryConfig
+    replay: ReplayConfig
 
     @staticmethod
     def load(path: Optional[str | Path] = None) -> "EngineConfig":
-        cfg_path = Path(path or os.getenv("ENGINE_CONFIG", "engine_config.yaml"))
-        if not cfg_path.exists():  # pragma: no cover - guard for deployments
-            raise FileNotFoundError(f"Engine configuration {cfg_path} not found")
+        cfg_path = _canonical_config()
+        if path and Path(path) != cfg_path:
+            _LOGGER.warning("Ignoring explicit config path %s; using canonical %s", path, cfg_path)
+        if not cfg_path.exists():  # pragma: no cover - deployment guard
+            raise FileNotFoundError(f"Canonical config {cfg_path} not found")
+        _warn_engine_config()
         with cfg_path.open("r", encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
         run_id = str(raw.get("run_id") or f"run-{engine_now(IST).strftime('%Y%m%d')}")
         persistence_path = Path(raw.get("persistence_path", "engine_state.sqlite"))
-        risk = RiskLimits.from_dict(raw["risk"])
-        data = DataConfig.from_dict(raw["data"])
+        strategy_tag = str(raw.get("strategy_tag", "intraday-buy"))
+        risk = RiskLimits.from_dict(raw.get("risk", {}))
+        data = DataConfig.from_dict(raw.get("data", {}))
         broker = BrokerConfig.from_dict(raw.get("broker", {}))
         oms = OMSConfig.from_dict(raw.get("oms", {}))
-        strategy_tag = str(raw.get("strategy_tag", "intraday-buy"))
         alerts = AlertConfig.from_dict(raw.get("alerts", {}))
+        telemetry = TelemetryConfig.from_dict(raw.get("telemetry", {}))
+        replay = ReplayConfig.from_dict(raw.get("replay", {}))
         return EngineConfig(
             run_id=run_id,
             persistence_path=persistence_path,
+            strategy_tag=strategy_tag,
             risk=risk,
             data=data,
             broker=broker,
             oms=oms,
-            strategy_tag=strategy_tag,
             alerts=alerts,
+            telemetry=telemetry,
+            replay=replay,
         )
+
+
+class _ConfigHandle:
+    def __init__(self) -> None:
+        self._config: Optional[EngineConfig] = None
+
+    def _ensure(self) -> EngineConfig:
+        if self._config is None:
+            self._config = EngineConfig.load()
+        return self._config
+
+    def reload(self) -> EngineConfig:
+        self._config = EngineConfig.load()
+        return self._config
+
+    def value(self) -> EngineConfig:
+        return self._ensure()
+
+    def __getattr__(self, item: str):  # pragma: no cover - simple proxy
+        return getattr(self._ensure(), item)
+
+
+CONFIG = _ConfigHandle()
+
+
+def _warn_engine_config() -> None:
+    global _DEPRECATION_WARNED
+    if _DEPRECATION_WARNED:
+        return
+    legacy = Path("engine_config.yaml")
+    if legacy.exists():
+        _LOGGER.warning("DEPRECATED config file 'engine_config.yaml' detected. Ignoring; using config/app.yml only.")
+    _DEPRECATION_WARNED = True
 
 
 __all__ = [
     "AlertConfig",
+    "BrokerConfig",
+    "CONFIG",
     "DataConfig",
     "EngineConfig",
     "IST",
     "OMSConfig",
+    "OMSSubmitConfig",
+    "ReplayConfig",
     "RiskLimits",
-    "BrokerConfig",
+    "TelemetryConfig",
 ]

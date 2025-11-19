@@ -41,6 +41,10 @@ def _cfg() -> OMSConfig:
     return OMSConfig(resubmit_backoff=0.1, reconciliation_interval=0.5, max_inflight_orders=10)
 
 
+DEFAULT_META = (0.05, 50, 10.0, 500.0)
+DEFAULT_SQUARE_OFF = dt.time(15, 30)
+
+
 def _risk_limits() -> RiskLimits:
     return RiskLimits(
         daily_pnl_stop=5000.0,
@@ -57,14 +61,14 @@ def _risk_limits() -> RiskLimits:
 async def test_idempotency_avoids_duplicate_submits(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "idem.sqlite", run_id="idem")
     broker = ReplayBroker()
-    oms = OMS(broker=broker, store=store, config=_cfg())
+    oms = OMS(broker=broker, store=store, config=_cfg(), default_meta=DEFAULT_META, square_off_time=DEFAULT_SQUARE_OFF)
     ts = dt.datetime(2024, 7, 1, 9, 30, tzinfo=IST)
     order = await oms.submit(strategy="demo", symbol="NIFTY-TEST", side="BUY", qty=10, ts=ts)
     assert broker.submits == 1
     # simulate restart by creating new OMS with same store
     broker2 = ReplayBroker()
     broker2.views = broker.views
-    oms2 = OMS(broker=broker2, store=store, config=_cfg())
+    oms2 = OMS(broker=broker2, store=store, config=_cfg(), default_meta=DEFAULT_META, square_off_time=DEFAULT_SQUARE_OFF)
     await oms2.submit(strategy="demo", symbol="NIFTY-TEST", side="BUY", qty=10, ts=ts)
     assert broker2.submits == 0
     assert order.client_order_id in broker2.views
@@ -74,12 +78,12 @@ async def test_idempotency_avoids_duplicate_submits(tmp_path: Path) -> None:
 async def test_recovery_rehydrates_orders(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "recovery.sqlite", run_id="recovery")
     broker = ReplayBroker()
-    oms = OMS(broker=broker, store=store, config=_cfg())
+    oms = OMS(broker=broker, store=store, config=_cfg(), default_meta=DEFAULT_META, square_off_time=DEFAULT_SQUARE_OFF)
     ts = dt.datetime(2024, 7, 1, 10, 0, tzinfo=IST)
     order = await oms.submit(strategy="demo", symbol="NIFTY-REC", side="BUY", qty=10, ts=ts)
     broker2 = ReplayBroker()
     broker2.views = broker.views
-    oms2 = OMS(broker=broker2, store=store, config=_cfg())
+    oms2 = OMS(broker=broker2, store=store, config=_cfg(), default_meta=DEFAULT_META, square_off_time=DEFAULT_SQUARE_OFF)
     manager = RecoveryManager(store, oms2)
     await manager.reconcile()
     assert oms2.get_order(order.client_order_id) is not None

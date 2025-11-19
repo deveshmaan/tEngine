@@ -81,6 +81,8 @@ Then point Grafana’s Prometheus datasource at the Prometheus server (default `
 | `OI_PERCENTILE_MIN` | Minimum rolling OI percentile to confirm writer capitulation (default `0.25`). |
 | `MAX_CONCURRENT_POS`, `CAPITAL_PER_TRADE`, `EXIT_TARGET_PCT_BUY`, `EXIT_STOP_PCT_BUY` | Sizing + exit heuristics as before. |
 
+If your broker/calendar now uses a non-Thursday weekly expiry (e.g., Upstox moved NIFTY to Tuesdays), set `weekly_expiry_weekday` under the `data` block in `config/app.yml` (0 = Monday … 6 = Sunday). The engine uses this hint for expiry discovery and when seeding the instrument cache before it has fetched live metadata.
+
 Set these along with the older knobs to align with your playbook from NSE circulars, Zerodha Varsity Options modules, or Gurjar’s breakout texts. When replaying historical CSVs that lack OI, dial `OI_PERCENTILE_MIN=0.0` to bypass the live-only filter.
 
 **Replay shortcut:** When you run `main.py --replay-only` (or pass the flag through `run_stack.sh`), the engine auto-relaxes IV/OI percentile filters (defaults to zero) so synthetic data can produce trades. Set `RELAX_REPLAY_FILTERS=false` to keep live thresholds, or override the relaxed values with `IV_PERCENTILE_MIN_REPLAY` / `OI_PERCENTILE_MIN_REPLAY` for custom stress tests.

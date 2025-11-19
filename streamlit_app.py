@@ -14,17 +14,51 @@ import streamlit as st
 from prometheus_client.parser import text_string_to_metric_families
 from yaml import safe_load
 
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 DEFAULT_DB = Path(os.getenv("ENGINE_DB_PATH", "engine_state.sqlite"))
 PROM_URL = os.getenv("PROM_URL", "http://127.0.0.1:9103/metrics")
-ENGINE_CONFIG = Path(os.getenv("ENGINE_CONFIG", "engine_config.yaml"))
+APP_CONFIG = Path(os.getenv("APP_CONFIG_PATH", "config/app.yml"))
+
+
+def _load_app_config() -> Dict[str, Any]:
+    if not APP_CONFIG.exists():
+        return {}
+    with APP_CONFIG.open("r", encoding="utf-8") as handle:
+        raw = safe_load(handle) or {}
+    return raw
+
+
+def _data_config() -> Dict[str, Any]:
+    return _load_app_config().get("data", {})
 
 
 def load_risk_limits() -> Dict[str, float]:
-    if not ENGINE_CONFIG.exists():
-        return {}
-    with ENGINE_CONFIG.open("r", encoding="utf-8") as handle:
-        raw = safe_load(handle) or {}
-    return raw.get("risk", {})
+    cfg = _load_app_config()
+    return (cfg.get("risk") or {})
+
+
+def load_index_symbol() -> str:
+    data_cfg = _data_config()
+    return str(data_cfg.get("index_symbol", "NIFTY")).upper()
+
+
+def load_weekly_weekday() -> int:
+    data_cfg = _data_config()
+    try:
+        return int(data_cfg.get("weekly_expiry_weekday", 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+def load_holidays() -> set[dt.date]:
+    data_cfg = _data_config()
+    holidays: set[dt.date] = set()
+    for raw in data_cfg.get("holidays", []):
+        try:
+            holidays.add(dt.date.fromisoformat(str(raw)))
+        except ValueError:
+            continue
+    return holidays
 
 
 def fetch_metrics() -> Dict[str, float]:
@@ -73,6 +107,63 @@ def fetch_pnl_history(conn: sqlite3.Connection, run_id: str, limit: int = 200) -
     return df.sort_values("ts")
 
 
+def _extract_symbol_expiry(symbol: Optional[str]) -> Optional[str]:
+    if not symbol:
+        return None
+    parts = symbol.split("-")
+    if len(parts) < 3:
+        return None
+    return "-".join(parts[1:-1])
+
+
+def fetch_latest_contract_ticks(
+    conn: sqlite3.Connection,
+    run_id: str,
+    limit: int = 500,
+    *,
+    expiry_filter: Optional[str] = None,
+    underlying_filter: Optional[str] = None,
+) -> pd.DataFrame:
+    rows = conn.execute(
+        "SELECT ts, payload FROM event_log WHERE run_id=? AND event_type='tick' ORDER BY ts DESC LIMIT ?",
+        (run_id, limit),
+    ).fetchall()
+    latest: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        payload = json.loads(row["payload"] or "{}")
+        symbol = payload.get("symbol")
+        if not symbol or symbol in latest:
+            continue
+        latest[symbol] = {"ts": row["ts"], "payload": payload}
+    records: list[Dict[str, Any]] = []
+    for symbol, entry in latest.items():
+        payload = entry["payload"]
+        expiry = _extract_symbol_expiry(symbol) or ""
+        if expiry_filter and expiry != expiry_filter:
+            continue
+        underlying = (payload.get("underlying") or payload.get("name") or symbol).upper()
+        if underlying_filter and underlying_filter.upper() not in {underlying, symbol.split("-")[0].upper()}:
+            continue
+        greeks = payload.get("optionGreeks") or payload.get("greeks") or {}
+        records.append(
+            {
+                "Symbol": symbol,
+                "Name": payload.get("name") or payload.get("display_name") or payload.get("underlying") or symbol,
+                "Expiry": expiry,
+                "LTP": payload.get("ltp") or payload.get("price"),
+                "IV": payload.get("iv") or greeks.get("iv"),
+                "Delta": payload.get("delta") or greeks.get("delta"),
+                "Gamma": payload.get("gamma") or greeks.get("gamma"),
+                "Theta": payload.get("theta") or greeks.get("theta"),
+                "Vega": payload.get("vega") or greeks.get("vega"),
+            }
+        )
+    if not records:
+        return pd.DataFrame(columns=["Symbol", "Name", "Expiry", "LTP", "IV", "Delta", "Gamma", "Theta", "Vega"])
+    df = pd.DataFrame(records)
+    return df.sort_values("Symbol")
+
+
 def insert_control_intent(conn: sqlite3.Connection, run_id: str, action: str, payload: Optional[Dict[str, Any]] = None) -> None:
     ts = dt.datetime.utcnow().isoformat()
     conn.execute(
@@ -80,6 +171,19 @@ def insert_control_intent(conn: sqlite3.Connection, run_id: str, action: str, pa
         (run_id, ts, action, json.dumps(payload) if payload else None),
     )
     conn.commit()
+
+
+def resolve_next_weekly_expiry(now: Optional[dt.datetime] = None) -> str:
+    now_ist = (now or dt.datetime.now(IST)).astimezone(IST)
+    weekday = load_weekly_weekday()
+    holidays = load_holidays()
+    delta = (weekday - now_ist.weekday()) % 7
+    if delta == 0 and now_ist.time() >= dt.time(15, 30):
+        delta = 7
+    expiry = now_ist.date() + dt.timedelta(days=delta)
+    while expiry.weekday() >= 5 or expiry in holidays:
+        expiry -= dt.timedelta(days=1)
+    return expiry.isoformat()
 
 
 st.set_page_config(page_title="Trading Engine Console", layout="wide")
@@ -97,6 +201,8 @@ limits = load_risk_limits()
 
 with sqlite3.connect(db_path) as conn:
     conn.row_factory = sqlite3.Row
+    index_symbol = load_index_symbol()
+    weekly_expiry = resolve_next_weekly_expiry()
     positions = fetch_df(conn, "SELECT symbol, qty, avg_price, opened_at, closed_at FROM positions WHERE run_id=?", (run_id,))
     orders = fetch_df(
         conn,
@@ -106,6 +212,12 @@ with sqlite3.connect(db_path) as conn:
     incidents = fetch_df(conn, "SELECT ts, code, payload FROM incidents WHERE run_id=? ORDER BY ts DESC LIMIT 50", (run_id,))
     snapshot = fetch_latest_snapshot(conn, run_id)
     pnl_history = fetch_pnl_history(conn, run_id)
+    contracts_df = fetch_latest_contract_ticks(
+        conn,
+        run_id,
+        expiry_filter=weekly_expiry,
+        underlying_filter=index_symbol,
+    )
 
 run_col1, run_col2, run_col3 = st.columns(3)
 heartbeat = metrics_data.get("heartbeat_ts", 0.0)
@@ -130,6 +242,16 @@ st.dataframe(positions, use_container_width=True)
 
 st.subheader("Orders")
 st.dataframe(orders, use_container_width=True)
+
+st.subheader("Subscribed Contracts (Next Weekly)")
+if not contracts_df.empty:
+    expiry_label = weekly_expiry or "n/a"
+    display_df = contracts_df[["Symbol", "Name", "Expiry", "LTP", "IV", "Delta", "Gamma", "Theta", "Vega"]]
+else:
+    expiry_label = weekly_expiry or "n/a"
+    display_df = contracts_df
+st.markdown(f"**Expiry:** {expiry_label}")
+st.dataframe(display_df, use_container_width=True)
 
 st.subheader("Incidents")
 st.dataframe(incidents, use_container_width=True)

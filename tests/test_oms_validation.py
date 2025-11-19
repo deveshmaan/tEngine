@@ -1,9 +1,10 @@
 import asyncio
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
 
-from engine.config import IST, OMSConfig
+from engine.config import IST, OMSConfig, OMSSubmitConfig
 from engine.oms import OMS, OrderValidationError
 from market.instrument_cache import InstrumentCache
 from persistence import SQLiteStore
@@ -116,8 +117,21 @@ def oms(tmp_path, app_config):
         orders_rejected_total=metric,
         order_latency_ms_bucketed=metric,
     )
-    cfg = OMSConfig(resubmit_backoff=0.1, reconciliation_interval=1.0, max_inflight_orders=10)
-    return OMS(broker=broker, store=store, config=cfg, metrics=metrics), broker
+    submit_cfg = OMSSubmitConfig(default="ioc", max_spread_ticks=2, depth_threshold=50)
+    cfg = OMSConfig(resubmit_backoff=0.1, reconciliation_interval=1.0, max_inflight_orders=10, submit=submit_cfg)
+    default_meta = (0.05, 50, 10.0, 500.0)
+    square_off_time = dt.time(15, 20)
+    return (
+        OMS(
+            broker=broker,
+            store=store,
+            config=cfg,
+            metrics=metrics,
+            default_meta=default_meta,
+            square_off_time=square_off_time,
+        ),
+        broker,
+    )
 
 
 @pytest.mark.asyncio
@@ -169,7 +183,7 @@ async def test_tick_rounding(oms):
 @pytest.mark.asyncio
 async def test_ioc_market_style(oms):
     engine, broker = oms
-    engine.update_market_depth("NIFTY-2024-07-11-22650CE", bid=100.0, ask=100.5, bid_qty=200, ask_qty=200)
+    engine.update_market_depth("NIFTY-2024-07-11-22650CE", bid=100.0, ask=100.1, bid_qty=200, ask_qty=200)
     order = await engine.submit(
         strategy="test",
         symbol="NIFTY-2024-07-11-22650CE",
@@ -179,5 +193,5 @@ async def test_ioc_market_style(oms):
         limit_price=0.0,
     )
     assert order.order_type == "IOC_LIMIT"
-    assert order.limit_price == pytest.approx(100.5)
+    assert order.limit_price == pytest.approx(100.1)
     assert broker.submissions[0].order_type == "IOC_LIMIT"

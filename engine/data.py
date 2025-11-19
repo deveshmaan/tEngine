@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
+import re
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Set
+from typing import Iterable, List, Literal, Optional, Sequence, Set, TYPE_CHECKING
 
 import yaml
 
 from engine.config import IST
 from engine.time_machine import now as engine_now
-from market.instrument_cache import InstrumentCache
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from market.instrument_cache import InstrumentCache
 
 _APP_CONFIG_CACHE: Optional[dict] = None
 _APP_CONFIG_PATH: Optional[Path] = None
+LOG = logging.getLogger("engine.data")
 
 
 def _load_app_config() -> dict:
@@ -54,19 +59,21 @@ def _holiday_calendar() -> Set[dt.date]:
     return holidays
 
 
-def _legacy_weekly(symbol: str, now: dt.datetime, holidays: Optional[Iterable[dt.date]] = None) -> dt.date:
+def _legacy_weekly(symbol: str, now: dt.datetime, holidays: Optional[Iterable[dt.date]] = None, target_weekday: int = 3) -> dt.date:
     weekday = now.weekday()  # Monday=0
-    if weekday <= 3:
-        expiry = now.date() + dt.timedelta(days=3 - weekday)
-    else:
-        expiry = now.date() + dt.timedelta(days=(7 - weekday) + 3)
+    delta = (target_weekday - weekday) % 7
+    if delta == 0 and now.time() >= dt.time(15, 30):
+        delta = 7
+    expiry = now.date() + dt.timedelta(days=delta)
     holiday_set: Set[dt.date] = set(holidays or [])
     while expiry.weekday() >= 5 or expiry in holiday_set:
         expiry -= dt.timedelta(days=1)
     return expiry
 
 
-def _active_cache() -> Optional[InstrumentCache]:
+def _active_cache() -> Optional["InstrumentCache"]:
+    from market.instrument_cache import InstrumentCache
+
     return InstrumentCache.runtime_cache()
 
 
@@ -88,7 +95,7 @@ def _back_adjust(expiry: dt.date, holidays: Set[dt.date]) -> dt.date:
     return expiry
 
 
-def _holiday_adjusted_choice(symbol: str, candidates: Sequence[str], holidays: Set[dt.date], cache: InstrumentCache) -> str:
+def _holiday_adjusted_choice(symbol: str, candidates: Sequence[str], holidays: Set[dt.date], cache: "InstrumentCache") -> str:
     if not holidays:
         return candidates[0]
     for raw in candidates:
@@ -116,14 +123,14 @@ def _holiday_adjusted_choice(symbol: str, candidates: Sequence[str], holidays: S
     return chosen
 
 
-def resolve_next_expiry(symbol: str, now_ist: dt.datetime, kind: str = "weekly") -> str:
+def resolve_next_expiry(symbol: str, now_ist: dt.datetime, kind: str = "weekly", weekly_weekday: int = 3) -> str:
     """Discover next expiry via the instrument cache, applying holiday back-adjustment."""
 
     now = now_ist.astimezone(IST)
     cache = _active_cache()
     kind_lower = kind.lower()
     if cache is None:
-        fallback = _legacy_weekly(symbol, now, holidays=_holiday_calendar())
+        fallback = _legacy_weekly(symbol, now, holidays=_holiday_calendar(), target_weekday=weekly_weekday)
         return fallback.isoformat()
     today = now.date()
     try:
@@ -138,25 +145,119 @@ def resolve_next_expiry(symbol: str, now_ist: dt.datetime, kind: str = "weekly")
     else:
         candidates = weekly or monthly
     if not candidates:
-        fallback = _legacy_weekly(symbol, now, holidays=_holiday_calendar())
+        fallback = _legacy_weekly(symbol, now, holidays=_holiday_calendar(), target_weekday=weekly_weekday)
         return fallback.isoformat()
     holidays = _holiday_calendar()
     return _holiday_adjusted_choice(symbol, tuple(candidates), holidays, cache)
 
 
-def resolve_weekly_expiry(index_symbol: str, now_ist: Optional[dt.datetime] = None, holidays: Optional[Iterable[dt.date]] = None) -> dt.date:
+def resolve_weekly_expiry(
+    index_symbol: str,
+    now_ist: Optional[dt.datetime] = None,
+    holidays: Optional[Iterable[dt.date]] = None,
+    weekly_weekday: int = 3,
+) -> dt.date:
     """Return the weekly expiry leveraging cached discovery when available."""
 
     now = (now_ist or engine_now(IST)).astimezone(IST)
     try:
-        expiry_str = resolve_next_expiry(index_symbol, now, kind="weekly")
+        expiry_str = resolve_next_expiry(index_symbol, now, kind="weekly", weekly_weekday=weekly_weekday)
         expiry = dt.date.fromisoformat(expiry_str)
     except Exception:
-        expiry = _legacy_weekly(index_symbol, now, holidays)
+        expiry = _legacy_weekly(index_symbol, now, holidays, target_weekday=weekly_weekday)
     else:
         if holidays:
             expiry = _back_adjust(expiry, set(holidays))
     return expiry
+
+
+def normalize_date(value: object) -> str:
+    """Return strict YYYY-MM-DD string for the provided value."""
+
+    if isinstance(value, dt.datetime):
+        return value.date().strftime("%Y-%m-%d")
+    if isinstance(value, dt.date):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    if not text:
+        raise ValueError("Date must be in YYYY-MM-DD format")
+    if re.search(r"[T\s/:+]", text):
+        raise ValueError(f"Date must be in YYYY-MM-DD format: {text}")
+    try:
+        parsed = dt.datetime.strptime(text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"Invalid date format: {text}") from exc
+    return parsed.strftime("%Y-%m-%d")
+
+
+def list_expiries(symbol: Literal["NIFTY", "BANKNIFTY"]) -> List[str]:
+    cache = _active_cache()
+    if cache is None:
+        raise RuntimeError("Instrument cache not initialised")
+    expiries = cache.list_expiries(symbol)
+    normalized = []
+    for exp in expiries:
+        try:
+            normalized.append(normalize_date(exp))
+        except ValueError:
+            continue
+    return sorted(set(normalized))
+
+
+def resolve_expiries_with_fallback(symbol: str) -> List[str]:
+    cache = _active_cache()
+    if cache is None:
+        return []
+    try:
+        expiries = cache.list_expiries(symbol)
+    except Exception:
+        return []
+    return list(expiries or [])
+
+
+def assert_valid_expiry(symbol: str, expiry: str) -> str:
+    expiry_norm = normalize_date(expiry)
+    expiries = list_expiries(symbol)
+    if expiry_norm in expiries:
+        return expiry_norm
+    today = engine_now(IST).date()
+    future: list[dt.date] = []
+    for exp in expiries:
+        try:
+            parsed = dt.date.fromisoformat(exp)
+        except ValueError:
+            continue
+        if parsed >= today:
+            future.append(parsed)
+    if future:
+        fallback = min(future).strftime("%Y-%m-%d")
+    elif expiries:
+        fallback = expiries[0]
+    else:
+        raise ValueError(f"No expiries available for {symbol}")
+    LOG.warning("Expiry %s not valid for %s; falling back to %s", expiry_norm, symbol, fallback)
+    return fallback
+
+
+class PreopenExpiryCheckFailed(RuntimeError):
+    """Raised when the pre-open expiry probe fails."""
+
+
+def preopen_expiry_smoke(symbols: Iterable[str] = ("NIFTY", "BANKNIFTY")) -> None:
+    cache = _active_cache()
+    if cache is None:
+        raise PreopenExpiryCheckFailed("Instrument cache unavailable for pre-open check")
+    session = cache.upstox_session()
+    for symbol in symbols:
+        expiries = resolve_expiries_with_fallback(symbol)
+        LOG.info("preopen_expiry_smoke: %s expiries=%d", symbol, len(expiries))
+        if not expiries:
+            raise PreopenExpiryCheckFailed(f"no expiries for {symbol}")
+        target = expiries[0]
+        try:
+            session.get_option_contracts(cache.resolve_index_key(symbol), target)
+        except Exception as exc:  # pragma: no cover - network dependent
+            raise PreopenExpiryCheckFailed(f"{symbol} expiry {target} probe failed: {exc}") from exc
 
 
 def pick_strike_from_spot(
@@ -204,9 +305,15 @@ def enforce_price_band(price: float, lower: Optional[float], upper: Optional[flo
 
 __all__ = [
     "align_to_tick",
+    "assert_valid_expiry",
     "enforce_price_band",
     "get_app_config",
+    "list_expiries",
+    "normalize_date",
+    "preopen_expiry_smoke",
     "pick_strike_from_spot",
+    "resolve_expiries_with_fallback",
     "resolve_next_expiry",
     "resolve_weekly_expiry",
+    "PreopenExpiryCheckFailed",
 ]

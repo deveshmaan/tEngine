@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Protocol
 
+from engine.alerts import notify_incident
 from engine.config import IST, OMSConfig
 from engine.data import get_app_config
 from engine.events import EventBus
@@ -42,6 +43,36 @@ def round_to_tick(value: float, tick_size: float) -> float:
         return value
     multiple = round(value / tick_size)
     return round(multiple * tick_size, ndigits=8)
+
+
+def validate_order(
+    symbol: str,
+    expiry: str,
+    strike: float,
+    opt_type: str,
+    side: str,
+    qty: int,
+    price_or_trigger: Optional[float],
+    *,
+    lot_size: int,
+    tick: float,
+    band_low: float,
+    band_high: float,
+) -> tuple[int, Optional[float]]:
+    """Validate and normalize quantity/price for an order prior to submission."""
+
+    lot = max(int(lot_size or 1), 1)
+    qty = int(qty)
+    if qty % lot != 0:
+        raise OrderValidationError("lot_multiple", f"Qty {qty} not aligned to lot size {lot}")
+    rounded_price: Optional[float] = None
+    if price_or_trigger is not None:
+        rounded_price = round_to_tick(float(price_or_trigger), tick or 0.0)
+        if band_low and rounded_price < band_low:
+            raise OrderValidationError("price_band_low", f"Price {rounded_price} below band {band_low}")
+        if band_high and band_high > 0 and rounded_price > band_high:
+            raise OrderValidationError("price_band_high", f"Price {rounded_price} above band {band_high}")
+    return qty, rounded_price
 
 
 @dataclass
@@ -113,7 +144,17 @@ class BrokerClient(Protocol):
 class OMS:
     """Stateful order management with deterministic identifiers and persistence."""
 
-    def __init__(self, *, broker: BrokerClient, store: SQLiteStore, config: OMSConfig, bus: Optional[EventBus] = None, metrics: Optional[EngineMetrics] = None):
+    def __init__(
+        self,
+        *,
+        broker: BrokerClient,
+        store: SQLiteStore,
+        config: OMSConfig,
+        bus: Optional[EventBus] = None,
+        metrics: Optional[EngineMetrics] = None,
+        default_meta: Optional[tuple[float, int, float, float]] = None,
+        square_off_time: Optional[dt.time] = None,
+    ):
         self._broker = broker
         self._store = store
         self._cfg = config
@@ -122,9 +163,11 @@ class OMS:
         self._orders: Dict[str, Order] = {}
         self._lock = asyncio.Lock()
         self._logger = get_logger("OMS")
-        self._default_meta = self._load_default_meta()
-        self._submit_style = self._load_submit_style()
+        self._default_meta = default_meta or self._load_default_meta()
+        self._submit_cfg = config.submit
         self._market_depth: Dict[str, Dict[str, float]] = {}
+        self._square_off_time = square_off_time
+        self._square_off_buffer = dt.timedelta(minutes=5)
 
     # --------------------------------------------------------------- id helpers
     @staticmethod
@@ -362,22 +405,28 @@ class OMS:
             # Fallback for legacy symbols that do not include expiry/strike information.
             fallback_expiry = engine_now(IST).date().isoformat()
             underlying, expiry, strike, opt_type = order.symbol.upper(), fallback_expiry, 0.0, "CE"
-        tick_size, lot_size, band_low, band_high, strict_meta = self._lookup_contract_meta(underlying, expiry, strike, opt_type)
+        tick_size, lot_size, band_low, band_high = self._lookup_contract_meta(underlying, expiry, strike, opt_type)
         if not skip_style:
             self._apply_submit_style(order, tick_size)
-        lot = max(int(lot_size), 1)
-        if strict_meta and order.qty % lot != 0:
-            raise OrderValidationError("lot_multiple", f"Qty {order.qty} not aligned to lot size {lot}")
         order_type = order.order_type.upper()
-        if order_type != "MARKET":
-            if order.limit_price is None:
-                raise OrderValidationError("price_missing", "Limit orders require a price")
-            rounded = round_to_tick(float(order.limit_price), tick_size or self._default_meta[0])
-            order.limit_price = rounded
-            if band_low and rounded < band_low:
-                raise OrderValidationError("price_band_low", f"Price {rounded} below band {band_low}")
-            if band_high and band_high > 0 and rounded > band_high:
-                raise OrderValidationError("price_band_high", f"Price {rounded} above band {band_high}")
+        if order_type != "MARKET" and order.limit_price is None:
+            raise OrderValidationError("price_missing", "Limit orders require a price")
+        qty, rounded_price = validate_order(
+            underlying,
+            expiry,
+            strike,
+            opt_type,
+            order.side,
+            order.qty,
+            order.limit_price if order_type != "MARKET" else None,
+            lot_size=lot_size or self._default_meta[1],
+            tick=tick_size or self._default_meta[0],
+            band_low=band_low or self._default_meta[2],
+            band_high=band_high or self._default_meta[3],
+        )
+        order.qty = qty
+        if rounded_price is not None:
+            order.limit_price = rounded_price
 
     def _parse_contract_symbol(self, symbol: str) -> tuple[str, str, float, str]:
         parts = symbol.split("-")
@@ -399,7 +448,6 @@ class OMS:
 
     def _lookup_contract_meta(self, symbol: str, expiry: str, strike: float, opt_type: str) -> tuple[float, int, float, float]:
         tick, lot, band_low, band_high = self._default_meta
-        strict = False
         cache = InstrumentCache.runtime_cache()
         contract = None
         if cache:
@@ -422,37 +470,47 @@ class OMS:
                 lot = int(expiry_meta[1] or lot)
                 band_low = float(expiry_meta[2] or band_low)
                 band_high = float(expiry_meta[3] or band_high)
-                strict = True
         if contract:
             tick = float(contract.get("tick_size") or tick)
             lot = int(contract.get("lot_size") or lot)
             band_low = float(contract.get("band_low") or band_low)
             band_high = float(contract.get("band_high") or band_high)
-            strict = True
         return (
             tick or self._default_meta[0],
             int(lot or self._default_meta[1]),
             band_low or self._default_meta[2],
             band_high or self._default_meta[3],
-            strict or bool(contract),
         )
 
     def _apply_submit_style(self, order: Order, tick_size: float) -> None:
-        mode = str(self._submit_style.get("mode", "market")).lower()
+        if self._close_to_square_off():
+            order.order_type = "MARKET"
+            order.limit_price = None
+            return
         depth = self._market_depth.get(order.symbol)
+        if not depth:
+            return
         tick = tick_size or self._default_meta[0]
-        if mode in {"ioc", "auto"} and depth:
-            spread = max(0.0, depth["ask"] - depth["bid"])
-            threshold = float(self._submit_style.get("max_spread_ticks", 1.0))
-            min_depth = int(self._submit_style.get("depth_threshold", 0))
-            side = order.side.upper()
-            available = depth["ask_qty"] if side == "BUY" else depth["bid_qty"]
-            if spread <= threshold and available >= order.qty and available >= max(1, min_depth):
-                price = depth["ask"] if side == "BUY" else depth["bid"]
-                order.limit_price = price
-                order.order_type = "IOC_LIMIT"
-                return
-        if mode in {"limit", "auto"} and order.order_type.upper() == "MARKET" and order.limit_price is not None:
+        spread = max(0.0, depth["ask"] - depth["bid"])
+        spread_ticks = spread / tick if tick > 0 else spread
+        cfg = self._submit_cfg
+        mode = cfg.default
+        min_depth = max(cfg.depth_threshold, 0)
+        side = order.side.upper()
+        available = depth["ask_qty"] if side == "BUY" else depth["bid_qty"]
+        if mode in {"auto", "ioc"} and tick > 0 and spread_ticks <= cfg.max_spread_ticks and available >= max(order.qty, min_depth):
+            price = depth["ask"] if side == "BUY" else depth["bid"]
+            order.limit_price = price
+            order.order_type = "IOC_LIMIT"
+            return
+        if mode in {"auto", "limit"}:
+            price = depth["ask"] if side == "BUY" else depth["bid"]
+            peg_ticks = max(1, min(cfg.max_spread_ticks or 1, 2))
+            adjustment = peg_ticks * tick if tick > 0 else 0.0
+            if side == "SELL":
+                adjustment *= -1
+            pegged = max(0.0, price + adjustment)
+            order.limit_price = pegged
             order.order_type = "LIMIT"
 
     def _load_default_meta(self) -> tuple[float, int, float, float]:
@@ -463,13 +521,19 @@ class OMS:
         band_high = float(cfg.get("price_band_high", 0.0))
         return tick, lot, band_low, band_high
 
-    def _load_submit_style(self) -> Dict[str, float | str | int]:
-        submit_cfg = ((get_app_config().get("oms") or {}).get("submit", {}))
-        return {
-            "mode": str(submit_cfg.get("default", "market")).lower(),
-            "max_spread_ticks": float(submit_cfg.get("max_spread_ticks", 1.0)),
-            "depth_threshold": int(submit_cfg.get("depth_threshold", 0)),
-        }
+    def _close_to_square_off(self) -> bool:
+        if not self._square_off_time:
+            return False
+        now = engine_now(IST)
+        square = now.astimezone(IST).replace(
+            hour=self._square_off_time.hour,
+            minute=self._square_off_time.minute,
+            second=self._square_off_time.second,
+            microsecond=0,
+        )
+        if square <= now:
+            return False
+        return (square - now) <= self._square_off_buffer
 
     def _record_validation_failure(self, error: OrderValidationError, order: Optional[Order] = None) -> None:
         if self._metrics:
@@ -481,6 +545,7 @@ class OMS:
             message=str(error),
             symbol=getattr(order, "symbol", None),
         )
+        notify_incident("WARN", "Local validation reject", f"code={error.code} symbol={getattr(order, 'symbol', '')}")
 
     def _record_reject_metric(self, reason: str) -> None:
         if self._metrics:
@@ -507,4 +572,5 @@ __all__ = [
     "OrderValidationError",
     "OrderState",
     "round_to_tick",
+    "validate_order",
 ]
