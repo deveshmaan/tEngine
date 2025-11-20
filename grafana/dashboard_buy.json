@@ -1,0 +1,136 @@
+{
+  "title": "Intraday BUY Engine — v2",
+  "uid": "buy-engine-v2",
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "2s",
+  "panels": [
+    { "type": "stat", "title": "Engine Up", "gridPos": {"x":0,"y":0,"w":4,"h":3},
+      "datasource": {"type":"prometheus","uid":"prometheus"},
+      "targets": [{"expr":"engine_up","refId":"A"}],
+      "options":{"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background"}
+    },
+    { "type": "stat", "title": "Heartbeat Lag (s)", "gridPos": {"x":4,"y":0,"w":4,"h":3},
+      "datasource": {"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"s","thresholds":{"mode":"absolute","steps":[{"color":"green"},{"color":"yellow","value":1.5},{"color":"red","value":3}]}}},
+      "targets": [{"expr":"time() - heartbeat_ts","refId":"A"}]
+    },
+    { "type": "stat", "title": "Session", "gridPos": {"x":8,"y":0,"w":4,"h":3},
+      "datasource": {"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"PREOPEN"},"1":{"text":"LIVE"},"2":{"text":"HALT"},"3":{"text":"POST_CLOSE"}}}]}},
+      "targets": [{"expr":"session_state","refId":"A"}]
+    },
+    { "type": "stat", "title": "PnL (₹)", "gridPos": {"x":12,"y":0,"w":4,"h":3},
+      "datasource": {"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"currencyINR"}},
+      "targets": [{"expr":"pnl_net_rupees","refId":"A"}]
+    },
+    { "type": "stat", "title": "PnL vs Stop (₹)", "gridPos": {"x":16,"y":0,"w":8,"h":3},
+      "datasource": {"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"currencyINR"}},
+      "targets": [{"expr":"pnl_net_rupees - risk_daily_stop_rupees","refId":"A"}]
+    },
+
+    { "type":"stat", "title":"Subscribed (count)", "gridPos":{"x":0,"y":3,"w":4,"h":3},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"sum(md_subscription_info)","refId":"A"}]
+    },
+    { "type":"timeseries","title":"WS lag & Reconnects","gridPos":{"x":4,"y":3,"w":10,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"ms"}},
+      "targets":[
+        {"expr":"ws_lag_ms","legendFormat":"ws_lag_ms","refId":"A"},
+        {"expr":"increase(ws_reconnects_total[15m])","legendFormat":"reconnects(15m)","refId":"B"}
+      ]
+    },
+    { "type":"bargauge","title":"API errors (15m)","gridPos":{"x":14,"y":3,"w":10,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"sum by (code) (increase(api_errors_total[15m]))","refId":"A"}]
+    },
+
+    { "type":"table","title":"Tick Freshness & Spread","gridPos":{"x":0,"y":9,"w":24,"h":8},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "options":{"showHeader":true},
+      "targets":[
+        {"expr":"time() - option_last_ts_seconds","legendFormat":"{{instrument_key}} age","instant":true,"refId":"AGE","format":"table"},
+        {"expr":"(option_ask - option_bid) / clamp_min(option_ltp, 0.01) * 100","legendFormat":"{{instrument_key}} spread%","instant":true,"refId":"SP","format":"table"}
+      ]
+    },
+
+    { "type":"timeseries","title":"Spread (ticks)","gridPos":{"x":0,"y":17,"w":12,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"option_spread_ticks","legendFormat":"{{instrument_key}}","refId":"A"}]
+    },
+    { "type":"timeseries","title":"OB Imbalance (Top10)","gridPos":{"x":12,"y":17,"w":12,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"orderbook_imbalance_10","legendFormat":"{{instrument_key}}","refId":"A"}]
+    },
+
+    { "type":"timeseries","title":"Orders vs Fills","gridPos":{"x":0,"y":23,"w":12,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[
+        {"expr":"sum(rate(orders_submitted_total[5m]))","legendFormat":"submitted","refId":"A"},
+        {"expr":"sum(rate(orders_filled_total[5m]))","legendFormat":"filled","refId":"B"}
+      ]
+    },
+    { "type":"timeseries","title":"Rejected Orders (by reason)","gridPos":{"x":12,"y":23,"w":12,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"sum(rate(orders_rejected_total[5m])) by (reason)","legendFormat":"{{reason}}","refId":"A"}]
+    },
+
+    { "type":"timeseries","title":"Order Latency p50/p95/p99 (ms)","gridPos":{"x":0,"y":29,"w":12,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"ms"}},
+      "targets":[
+        {"expr":"histogram_quantile(0.50, sum(rate(order_latency_ms_bucketed_bucket[5m])) by (le))","refId":"P50","legendFormat":"p50"},
+        {"expr":"histogram_quantile(0.95, sum(rate(order_latency_ms_bucketed_bucket[5m])) by (le))","refId":"P95","legendFormat":"p95"},
+        {"expr":"histogram_quantile(0.99, sum(rate(order_latency_ms_bucketed_bucket[5m])) by (le))","refId":"P99","legendFormat":"p99"}
+      ]
+    },
+    { "type":"timeseries","title":"Queues","gridPos":{"x":12,"y":29,"w":12,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[
+        {"expr":"event_queue_depth","legendFormat":"event","refId":"A"},
+        {"expr":"order_queue_depth","legendFormat":"order","refId":"B"},
+        {"expr":"broker_queue_depth","legendFormat":"broker","refId":"C"}
+      ]
+    },
+
+    { "type":"table","title":"IV / OI (snapshot)","gridPos":{"x":0,"y":35,"w":12,"h":8},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[
+        {"expr":"option_iv","legendFormat":"{{instrument_key}} IV","instant":true,"refId":"IV","format":"table"},
+        {"expr":"option_oi","legendFormat":"{{instrument_key}} OI","instant":true,"refId":"OI","format":"table"}
+      ]
+    },
+    { "type":"table","title":"Expiry Discovery & Guardrails","gridPos":{"x":12,"y":35,"w":12,"h":8},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[
+        {"expr":"expiry_source","legendFormat":"source","instant":true,"refId":"SRC","format":"table"},
+        {"expr":"increase(expiry_discovery_attempt_total[1h])","legendFormat":"attempts(1h)","instant":true,"refId":"E1","format":"table"},
+        {"expr":"increase(expiry_discovery_success_total[1h])","legendFormat":"success(1h)","instant":true,"refId":"E2","format":"table"},
+        {"expr":"sum(increase(api_errors_total{code=\"UDAPI1088\"}[1h]))","legendFormat":"UDAPI1088(1h)","instant":true,"refId":"E3","format":"table"}
+      ]
+    },
+
+    { "type":"stat","title":"Open Lots","gridPos":{"x":0,"y":43,"w":4,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"risk_open_lots","refId":"A"}]
+    },
+    { "type":"stat","title":"Notional Premium (₹)","gridPos":{"x":4,"y":43,"w":8,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"currencyINR"}},
+      "targets":[{"expr":"risk_notional_premium_rupees","refId":"A"}]
+    },
+    { "type":"stat","title":"Minutes to Square-off","gridPos":{"x":12,"y":43,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"minutes_to_square_off","refId":"A"}]
+    },
+    { "type":"bargauge","title":"Rate-limit tokens (min by endpoint)","gridPos":{"x":18,"y":43,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"min by (endpoint) (ratelimit_tokens)","refId":"A"}]
+    }
+  ]
+}

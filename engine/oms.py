@@ -14,6 +14,33 @@ from engine.data import get_app_config
 from engine.events import EventBus
 from engine.logging_utils import get_logger
 from engine.metrics import EngineMetrics
+
+try:
+    from engine.metrics import (
+        observe_ack_to_fill_ms,
+        observe_tick_to_submit_ms,
+        record_state_transition,
+        set_oms_inflight,
+        effective_entry_spread_pct,
+    )
+except Exception:  # pragma: no cover
+
+    def observe_ack_to_fill_ms(ms: float): ...
+
+    def observe_tick_to_submit_ms(ms: float): ...
+
+    def record_state_transition(old: str, new: str): ...
+
+    def set_oms_inflight(n: int): ...
+
+    class _E:
+        def labels(self, *a, **k):
+            return self
+
+        def set(self, *a, **k):
+            return None
+
+    effective_entry_spread_pct = _E()
 from engine.time_machine import now as engine_now, utc_now
 from market.instrument_cache import InstrumentCache
 from persistence import SQLiteStore
@@ -91,6 +118,9 @@ class Order:
     created_at: dt.datetime = field(default_factory=utc_now)
     updated_at: dt.datetime = field(default_factory=utc_now)
     idempotency_key: Optional[str] = None
+    last_md_tick_ts: float = 0.0
+    submit_ts: float = 0.0
+    ack_ts: float = 0.0
 
     def mark_state(self, new_state: OrderState, *, ts: Optional[dt.datetime] = None) -> None:
         self.state = new_state
@@ -242,11 +272,31 @@ class OMS:
             except OrderValidationError as exc:
                 self._record_validation_failure(exc, order)
                 raise
+            order.submit_ts = time.time()
+            if not order.last_md_tick_ts:
+                order.last_md_tick_ts = order.submit_ts
             self._orders[client_id] = order
             self._update_order_metrics()
         start = time.perf_counter()
         result = await self._ensure_submitted(order)
         self._record_latency("submit", time.perf_counter() - start)
+        try:
+            if order.last_md_tick_ts > 0:
+                delta_ms = max(0.0, (order.submit_ts or time.time()) - order.last_md_tick_ts) * 1000.0
+                observe_tick_to_submit_ms(delta_ms)
+        except Exception:
+            pass
+        try:
+            if order.side.upper() == "BUY":
+                depth = self._market_depth.get(order.symbol, {})
+                bid = depth.get("bid")
+                ask = depth.get("ask")
+                ltp = depth.get("ltp") or depth.get("price") or depth.get("close")
+                if bid and ask and ltp and ltp > 0:
+                    eff = (float(ask) - float(bid)) / float(ltp) * 100.0
+                    effective_entry_spread_pct.labels(order.client_order_id, order.symbol).set(eff)
+        except Exception:
+            pass
         return result
 
     async def replace(self, client_order_id: str, *, price: Optional[float] = None, qty: Optional[int] = None) -> Order:
@@ -297,6 +347,12 @@ class OMS:
             order.broker_order_id = broker_order_id
         new_state = OrderState.FILLED if order.filled_qty >= order.qty else OrderState.PARTIALLY_FILLED
         await self._persist_transition(order, order.state, new_state, reason="fill")
+        try:
+            now_ms = time.time() * 1000.0
+            if order.ack_ts:
+                observe_ack_to_fill_ms(max(0.0, now_ms - (order.ack_ts * 1000.0)))
+        except Exception:
+            pass
         self._store.record_execution(
             order.client_order_id,
             symbol=order.symbol,
@@ -375,11 +431,15 @@ class OMS:
         return order
 
     async def _persist_transition(self, order: Order, prev: OrderState, new: OrderState, *, reason: Optional[str] = None) -> None:
+        prev_ts = order.updated_at
         if prev == new and reason == "replace":
             order.updated_at = utc_now()
             self._store.record_order_snapshot(order)
             return
         order.mark_state(new)
+        now_ts = time.time()
+        if new == OrderState.ACKNOWLEDGED:
+            order.ack_ts = now_ts
         self._store.record_transition(order.client_order_id, prev, new, reason=reason, ts=order.updated_at)
         self._store.record_order_snapshot(order)
         self._logger.log_event(
@@ -390,6 +450,15 @@ class OMS:
             new_state=new.value,
             reason=reason,
         )
+        try:
+            record_state_transition(prev.value, new.value)
+        except Exception:
+            pass
+        if prev_ts and prev in {OrderState.ACKNOWLEDGED, OrderState.PARTIALLY_FILLED} and new in {
+            OrderState.PARTIALLY_FILLED,
+            OrderState.FILLED,
+        }:
+            pass
 
     def _ensure_capacity(self) -> None:
         open_orders = sum(1 for order in self._orders.values() if order.state not in FINAL_STATES)
@@ -556,6 +625,7 @@ class OMS:
             return
         pending = sum(1 for order in self._orders.values() if order.state not in FINAL_STATES)
         self._metrics.order_queue_depth.set(pending)
+        set_oms_inflight(pending)
 
     def _record_latency(self, kind: str, duration: float) -> None:
         if not self._metrics:

@@ -8,6 +8,10 @@ from typing import Callable, Deque, Dict, Optional
 
 from engine.config import IST, RiskLimits
 from engine.logging_utils import get_logger
+try:
+    from engine.metrics import set_risk_dials
+except Exception:  # pragma: no cover
+    def set_risk_dials(**kwargs): ...
 from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 
@@ -111,6 +115,7 @@ class RiskManager:
         self._kill_switch = False
         self._logger = logger if logger else get_logger("RiskManager")
         self._session_guard = SessionGuard(config)
+        self._update_risk_metrics()
 
     # ----------------------------------------------------------------- updates
     def on_fill(self, *, symbol: str, side: str, qty: int, price: float, lot_size: int) -> None:
@@ -143,6 +148,7 @@ class RiskManager:
 
         self._positions[symbol] = state
         self._evaluate_limits(symbol)
+        self._update_risk_metrics()
 
     def on_tick(self, symbol: str, ltp: float) -> None:
         state = self._positions.get(symbol)
@@ -151,6 +157,7 @@ class RiskManager:
         state.last_price = ltp
         self._positions[symbol] = state
         self._evaluate_limits(symbol)
+        self._update_risk_metrics()
 
     # ----------------------------------------------------------------- checks
     def budget_ok_for(self, order: OrderBudget) -> bool:
@@ -186,6 +193,35 @@ class RiskManager:
             return False
 
         return True
+
+    def _update_risk_metrics(self) -> None:
+        """Update exposure gauges for open lots, premium, and square-off timer."""
+
+        try:
+            open_lots = 0.0
+            notional = 0.0
+            for state in self._positions.values():
+                lot = max(state.lot_size, 1)
+                open_lots += abs(state.net_qty) / lot
+                ref_price = state.last_price if state.last_price is not None else state.avg_price or 0.0
+                notional += abs(state.net_qty) * ref_price
+            now = self._now()
+            now_ist = now.astimezone(IST) if now.tzinfo else now
+            square_off_dt = now_ist.replace(
+                hour=self.cfg.square_off_by.hour,
+                minute=self.cfg.square_off_by.minute,
+                second=self.cfg.square_off_by.second,
+                microsecond=0,
+            )
+            minutes_to_sqoff = max(0, int((square_off_dt - now_ist).total_seconds() // 60)) if square_off_dt > now_ist else 0
+            set_risk_dials(
+                daily_stop_rupees=self.cfg.daily_pnl_stop,
+                open_lots=open_lots,
+                notional_rupees=notional,
+                minutes_to_sqoff=minutes_to_sqoff,
+            )
+        except Exception:
+            return
 
     def should_halt(self) -> bool:
         if self._now().time().replace(tzinfo=None) >= self.cfg.square_off_by:

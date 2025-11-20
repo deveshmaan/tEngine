@@ -28,6 +28,27 @@ except Exception:  # pragma: no cover
     except Exception:  # pragma: no cover
         pb = None  # type: ignore
 
+# Best-effort metrics helpers (never crash the stream)
+try:
+    from engine.metrics import (
+        record_md_frame,
+        record_md_decode_error,
+        publish_spread,
+        publish_depth10,
+        set_underlying_last_ts,
+    )
+except Exception:  # pragma: no cover
+
+    def record_md_frame(nbytes: int): ...
+
+    def record_md_decode_error(msg: str): ...
+
+    def publish_spread(instrument_key: str, bid: float, ask: float, ltp: float): ...
+
+    def publish_depth10(instrument_key: str, bid_qty10: float, ask_qty10: float): ...
+
+    def set_underlying_last_ts(instrument: str, ts_seconds: float): ...
+
 from brokerage.upstox_client import InvalidDateError, UpstoxConfig, UpstoxSession
 from engine.config import BrokerConfig, CONFIG
 from engine.data import normalize_date, pick_subscription_expiry, preopen_expiry_smoke, resolve_expiries_with_fallback
@@ -38,11 +59,14 @@ from engine.metrics import (
     EngineMetrics,
     clear_subscription_info,
     incr_ws_reconnects,
+    publish_depth10,
     publish_option_depth,
     publish_option_quote,
+    publish_spread,
     publish_subscription_info,
     publish_underlying,
     record_md_decode_error,
+    record_md_frame,
     set_last_tick_ts,
     set_md_subscription,
     set_md_subscription_gauge,
@@ -172,14 +196,24 @@ class FullD30Streamer:
 
     def _on_data(self, payload: bytes):
         """Decode protobuf MarketDataFeed and publish metrics."""
+        try:
+            record_md_frame(len(payload or b""))
+        except Exception:
+            pass
         if pb is None:
-            record_md_decode_error("pb_missing")
+            try:
+                record_md_decode_error("pb_missing")
+            except Exception:
+                pass
             return
         try:
             feed = pb.Feed()  # recommended message name in v3 proto
             feed.ParseFromString(payload)
         except Exception as e:
-            record_md_decode_error(str(e))
+            try:
+                record_md_decode_error(str(e))
+            except Exception:
+                pass
             return
 
         ts = time.time()
@@ -189,20 +223,64 @@ class FullD30Streamer:
             try:
                 q = getattr(item, "marketFF", None) or getattr(item, "marketFFQuote", None) or item
                 ltp = float(getattr(q, "ltp", 0.0))
-                book = getattr(q, "marketDepth", None)
-                bid1 = float(book.bids[0].price) if book and len(book.bids) else float("nan")
-                ask1 = float(book.asks[0].price) if book and len(book.asks) else float("nan")
+                book = getattr(q, "marketDepth", None) or getattr(q, "marketLevel", None)
+                bids_seq = getattr(book, "bids", None) or getattr(book, "bidAskQuote", None) or []
+                asks_seq = getattr(book, "asks", None) or []
+                bid1 = float(getattr(bids_seq[0], "price", getattr(bids_seq[0], "bidP", 0.0))) if bids_seq else float("nan")
+                ask1 = float(getattr(asks_seq[0], "price", getattr(asks_seq[0], "askP", 0.0))) if asks_seq else float("nan")
                 iv = float(getattr(q, "iv", float("nan"))) if hasattr(q, "iv") else None
                 oi = int(getattr(q, "oi", 0)) if hasattr(q, "oi") else None
             except Exception as e:  # pragma: no cover - defensive parse
                 record_md_decode_error(f"field_parse:{e}")
                 continue
+            bid_q10 = 0.0
+            ask_q10 = 0.0
+            try:
+                if book:
+                    for i in range(min(10, len(bids_seq))):
+                        try:
+                            bid_q10 += float(getattr(bids_seq[i], "quantity", getattr(bids_seq[i], "bidQ", 0.0)))
+                        except Exception:
+                            continue
+                    for i in range(min(10, len(asks_seq))):
+                        try:
+                            ask_q10 += float(getattr(asks_seq[i], "quantity", getattr(asks_seq[i], "askQ", 0.0)))
+                        except Exception:
+                            continue
+            except Exception:
+                bid_q10 = bid_q10
+                ask_q10 = ask_q10
 
             sym, expiry, strike, opt = labels_for_key(key)  # returns (symbol, 'YYYY-MM-DD' or '', int, 'CE'/'PE'/None)
             if opt is None:
                 publish_underlying(sym or key, ltp, ts)
+                try:
+                    if sym:
+                        set_underlying_last_ts(sym, ts)
+                except Exception:
+                    pass
             else:
                 publish_option_quote(key, sym, expiry, opt, strike, ltp, bid1, ask1, iv, oi, ts)
+                publish_spread(key, bid1, ask1, ltp)
+                publish_depth10(key, bid_q10, ask_q10)
+                publish_spread(key, bid1, ask1, ltp)
+                # Sum top-10 quantities if present for imbalance gauges
+                bid_qtys = []
+                ask_qtys = []
+                for entry in list(bids_seq)[:10]:
+                    qty = getattr(entry, "qty", None) or getattr(entry, "quantity", None) or getattr(entry, "bidQ", None)
+                    try:
+                        bid_qtys.append(float(qty))
+                    except Exception:
+                        continue
+                for entry in list(asks_seq)[:10]:
+                    qty = getattr(entry, "qty", None) or getattr(entry, "quantity", None) or getattr(entry, "askQ", None)
+                    try:
+                        ask_qtys.append(float(qty))
+                    except Exception:
+                        continue
+                if bid_qtys or ask_qtys:
+                    publish_depth10(key, sum(bid_qtys), sum(ask_qtys))
 
     async def _reconnect(self):
         incr_ws_reconnects()
@@ -886,6 +964,10 @@ class UpstoxBroker:
             if not frame:
                 continue
             try:
+                record_md_frame(len(str(frame)))
+            except Exception:
+                pass
+            try:
                 self._handle_feed_response(frame)
             except Exception as exc:
                 self._logger.exception("Failed to decode market data frame: %s", exc)
@@ -993,6 +1075,12 @@ class UpstoxBroker:
             oi = self._coerce_float(market_ff.get("oi") or payload.get("oi"))
             iv = self._coerce_float(market_ff.get("iv") or payload.get("iv"))
             set_last_tick_ts(instrument_key, ts_seconds)
+            publish_spread(instrument_key, best_bid or 0.0, best_ask or 0.0, ltp or 0.0)
+            if bids or asks:
+                bid_qty10 = sum(self._coerce_float(entry.get("qty")) or 0.0 for entry in bids[:10] if isinstance(entry, Mapping))
+                ask_qty10 = sum(self._coerce_float(entry.get("qty")) or 0.0 for entry in asks[:10] if isinstance(entry, Mapping))
+                if bid_qty10 or ask_qty10:
+                    publish_depth10(instrument_key, bid_qty10, ask_qty10)
             self._tick_coalescer.update_option(
                 instrument_key,
                 {
@@ -1022,6 +1110,10 @@ class UpstoxBroker:
         sym = self._underlying_symbol_for(instrument_key, payload)
         self._last_spot[sym.upper()] = ltp
         self._tick_coalescer.update_underlying(sym, ltp, ts_seconds)
+        try:
+            set_underlying_last_ts(sym, ts_seconds)
+        except Exception:
+            pass
 
     def _resolve_underlying_key(self, symbol: str) -> Optional[str]:
         cache = self.instrument_cache or InstrumentCache.runtime_cache()

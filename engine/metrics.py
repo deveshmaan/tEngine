@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 try:  # pragma: no cover - optional dependency
     from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, start_http_server
@@ -106,12 +106,24 @@ class EngineMetrics:
         self.rest_retries_total = Counter("rest_retries_total", "REST retries", ["endpoint"], **registry_kwargs)
         self.ws_reconnects_total = Counter("ws_reconnects_total", "WS reconnect attempts", **registry_kwargs)
         self.md_subscription_count = Gauge("md_subscription_count", "Active market-data subscriptions", **registry_kwargs)
-        self.md_decode_errors_total = Counter(
-            "md_decode_errors_total",
-            "Market-data decode errors",
-            ["error"],
-            **registry_kwargs,
-        )
+        try:
+            self.md_decode_errors_total = Counter(
+                "md_decode_errors_total",
+                "Market-data decode errors",
+                ["error"],
+                **registry_kwargs,
+            )
+        except ValueError:
+            try:
+                from prometheus_client import REGISTRY as _REG  # type: ignore
+
+                existing = getattr(_REG, "_names_to_collectors", {}).get("md_decode_errors_total")  # type: ignore[attr-defined]
+                if existing is not None:
+                    self.md_decode_errors_total = existing
+                else:
+                    raise
+            except Exception:
+                raise
         self.ratelimit_tokens = Gauge("ratelimit_tokens", "Available tokens per endpoint", ["endpoint"], **registry_kwargs)
         self.broker_queue_depth = Gauge("broker_queue_depth", "Broker queue depth", ["endpoint"], **registry_kwargs)
         self.api_errors_total = Counter("api_errors_total", "API errors", ["code"], **registry_kwargs)
@@ -522,4 +534,222 @@ __all__ = [
     "set_subscription_expiry",
     "set_risk_halt_state",
     "start_http_server_if_available",
+]
+
+# ---------------------------------------------------------------------------#
+# Extended metrics (market-data, microstructure, OMS, risk)
+# ---------------------------------------------------------------------------#
+try:  # pragma: no cover - optional
+    from prometheus_client import REGISTRY as _PROM_REGISTRY  # type: ignore
+except Exception:  # pragma: no cover
+    _PROM_REGISTRY = None  # type: ignore
+
+
+def _get_collector(name: str, ctor, *args, **kwargs):
+    """Return existing collector if registered; otherwise create or fall back to no-op."""
+
+    if not PROM_AVAILABLE or ctor is None:
+        return _NoOpMetric()
+    if _PROM_REGISTRY is not None:
+        try:
+            existing = _PROM_REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+            if existing is not None:
+                return existing
+        except Exception:
+            pass
+    try:
+        return ctor(name, *args, **kwargs)
+    except Exception:
+        try:
+            if _PROM_REGISTRY is not None:
+                existing = _PROM_REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+                if existing is not None:
+                    return existing
+        except Exception:
+            pass
+        return _NoOpMetric()
+
+
+def _counter(name: str, desc: str, *, labelnames: Iterable[str] | tuple[str, ...] = ()) -> Any:
+    labels = tuple(labelnames) if labelnames else ()
+    return _get_collector(name, Counter, desc, labelnames=labels)
+
+
+def _gauge(name: str, desc: str, *, labelnames: Iterable[str] | tuple[str, ...] = ()) -> Any:
+    labels = tuple(labelnames) if labelnames else ()
+    return _get_collector(name, Gauge, desc, labelnames=labels)
+
+
+def _histogram(
+    name: str,
+    desc: str,
+    *,
+    buckets: Iterable[float] | tuple[float, ...],
+    labelnames: Iterable[str] | tuple[str, ...] = (),
+) -> Any:
+    labels = tuple(labelnames) if labelnames else ()
+    return _get_collector(name, Histogram, desc, buckets=tuple(buckets), labelnames=labels)
+
+
+# --- Market–data health ---
+md_decode_errors_total = _counter(
+    "md_decode_errors_total",
+    "Market-data decode/parse errors (protobuf, schema).",
+    labelnames=("error",),
+)
+md_messages_total = _counter(
+    "md_messages_total", "WebSocket market-data messages processed (frames)."
+)
+md_message_bytes_total = _counter(
+    "md_message_bytes_total", "Total bytes of market-data messages processed."
+)
+
+# --- Option microstructure ---
+option_spread = _gauge(
+    "option_spread", "Best-ask minus best-bid (₹) for an option.", labelnames=("instrument_key",)
+)
+option_spread_bp = _gauge(
+    "option_spread_bp", "Spread in basis points of price.", labelnames=("instrument_key",)
+)
+effective_entry_spread_pct = _gauge(
+    "effective_entry_spread_pct",
+    "Effective entry spread as % of premium recorded at order submit.",
+    labelnames=("client_order_id", "instrument_key"),
+)
+orderbook_bid_total_10 = _gauge("orderbook_bid_total_10", "Sum qty across top-10 bids.", labelnames=("instrument_key",))
+orderbook_ask_total_10 = _gauge("orderbook_ask_total_10", "Sum qty across top-10 asks.", labelnames=("instrument_key",))
+orderbook_imbalance_10 = _gauge(
+    "orderbook_imbalance_10", "Depth imbalance (bid10-ask10)/(bid10+ask10).", labelnames=("instrument_key",)
+)
+option_spread_ticks = _gauge("option_spread_ticks", "Spread measured in ticks", labelnames=("instrument_key",))
+
+# --- OMS / execution ---
+oms_inflight_orders = _gauge("oms_inflight_orders", "Orders currently in-flight.")
+order_state_transitions_total = _counter(
+    "order_state_transitions_total", "OMS state transitions.", labelnames=("from", "to")
+)
+tick_to_submit_ms_bucket = _histogram(
+    "tick_to_submit_ms_bucket",
+    "Tick-to-submit latency in ms.",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000),
+)
+ack_to_fill_ms_bucket = _histogram(
+    "ack_to_fill_ms_bucket",
+    "Order ack-to-fill latency in ms.",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000),
+)
+
+# --- Risk / exposure ---
+risk_daily_stop_rupees = _gauge("risk_daily_stop_rupees", "Daily stop from config (₹).")
+risk_open_lots = _gauge("risk_open_lots", "Total open lots.")
+risk_notional_premium_rupees = _gauge("risk_notional_premium_rupees", "Gross notional premium exposure (₹).")
+minutes_to_square_off = _gauge("minutes_to_square_off", "Minutes remaining to mandated square-off.")
+
+
+# --- Convenience publishers (safe no-ops if unused) ---
+def record_md_frame(nbytes: int) -> None:
+    md_messages_total.inc()
+    md_message_bytes_total.inc(max(0, int(nbytes)))
+
+
+def record_md_decode_error(msg: str) -> None:  # type: ignore[override]
+    meter = _maybe_metrics()
+    if meter:
+        try:
+            meter.md_decode_errors_total.labels(error=str(msg)[:120]).inc()
+        except Exception:
+            try:
+                meter.md_decode_errors_total.inc()
+            except Exception:
+                pass
+    try:
+        md_decode_errors_total.labels(error=str(msg)[:120]).inc()
+    except Exception:
+        md_decode_errors_total.inc()
+
+
+def publish_spread(instrument_key: str, bid: float, ask: float, ltp: float) -> None:
+    spread = None
+    try:
+        if bid is not None and ask is not None:
+            spread = float(ask) - float(bid)
+    except Exception:
+        spread = None
+    if spread is None or spread <= 0:
+        return
+    option_spread.labels(instrument_key).set(spread)
+    if ltp and ltp > 0:
+        option_spread_bp.labels(instrument_key).set(spread / float(ltp) * 10000.0)
+    option_spread_ticks.labels(instrument_key).set(spread)
+
+
+def publish_depth10(instrument_key: str, bid_qty10: float, ask_qty10: float) -> None:
+    bid_q = max(0.0, float(bid_qty10 or 0.0))
+    ask_q = max(0.0, float(ask_qty10 or 0.0))
+    orderbook_bid_total_10.labels(instrument_key).set(bid_q)
+    orderbook_ask_total_10.labels(instrument_key).set(ask_q)
+    denom = bid_q + ask_q
+    if denom > 0:
+        orderbook_imbalance_10.labels(instrument_key).set((bid_q - ask_q) / denom)
+
+
+def set_oms_inflight(n: int) -> None:
+    oms_inflight_orders.set(max(0, int(n)))
+
+
+def record_state_transition(old: str, new: str) -> None:
+    order_state_transitions_total.labels(str(old), str(new)).inc()
+
+
+def observe_tick_to_submit_ms(ms: float) -> None:
+    tick_to_submit_ms_bucket.observe(max(0.0, float(ms)))
+
+
+def observe_ack_to_fill_ms(ms: float) -> None:
+    ack_to_fill_ms_bucket.observe(max(0.0, float(ms)))
+
+
+def set_risk_dials(
+    daily_stop_rupees: Optional[float] = None,
+    open_lots: Optional[int] = None,
+    notional_rupees: Optional[float] = None,
+    minutes_to_sqoff: Optional[int] = None,
+) -> None:
+    if daily_stop_rupees is not None:
+        risk_daily_stop_rupees.set(float(daily_stop_rupees))
+    if open_lots is not None:
+        risk_open_lots.set(int(open_lots))
+    if notional_rupees is not None:
+        risk_notional_premium_rupees.set(float(notional_rupees))
+    if minutes_to_sqoff is not None:
+        minutes_to_square_off.set(int(minutes_to_sqoff))
+
+
+__all__ += [
+    "md_decode_errors_total",
+    "md_messages_total",
+    "md_message_bytes_total",
+    "option_spread",
+    "option_spread_bp",
+    "effective_entry_spread_pct",
+    "orderbook_bid_total_10",
+    "orderbook_ask_total_10",
+    "orderbook_imbalance_10",
+    "option_spread_ticks",
+    "oms_inflight_orders",
+    "order_state_transitions_total",
+    "tick_to_submit_ms_bucket",
+    "ack_to_fill_ms_bucket",
+    "risk_daily_stop_rupees",
+    "risk_open_lots",
+    "risk_notional_premium_rupees",
+    "minutes_to_square_off",
+    "record_md_frame",
+    "publish_spread",
+    "publish_depth10",
+    "set_oms_inflight",
+    "record_state_transition",
+    "observe_tick_to_submit_ms",
+    "observe_ack_to_fill_ms",
+    "set_risk_dials",
 ]

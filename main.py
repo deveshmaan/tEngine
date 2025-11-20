@@ -20,6 +20,10 @@ from engine.fees import load_fee_config
 from engine.instruments import InstrumentResolver
 from engine.logging_utils import configure_logging, get_logger
 from engine.metrics import EngineMetrics, bind_global_metrics, set_subscription_expiry, start_http_server_if_available
+try:
+    from engine.metrics import set_risk_dials
+except Exception:  # pragma: no cover
+    def set_risk_dials(**kwargs): ...
 from engine.oms import OMS, OrderValidationError
 from engine.pnl import Execution as PnLExecution, PnLCalculator
 from engine.recovery import RecoveryManager
@@ -395,6 +399,11 @@ class EngineApp:
                 await self.oms.cancel_all(reason="square_off")
                 await self.trigger_shutdown("square_off")
                 return
+            try:
+                minutes_left = max(0, int((deadline - now).total_seconds() // 60))
+                set_risk_dials(minutes_to_sqoff=minutes_left)
+            except Exception:
+                pass
             await asyncio.sleep((deadline - now).total_seconds())
 
     async def _consume_fills(self) -> None:
