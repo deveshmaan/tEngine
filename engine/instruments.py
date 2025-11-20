@@ -34,6 +34,12 @@ class InstrumentResolver:
             return None
         return self._cache.get_meta(token)
 
+    def metadata_for_key(self, instrument_key: str) -> Optional[InstrumentMeta]:
+        try:
+            return self._cache.get_meta(instrument_key)
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------ internals
     def _resolve_symbol_sync(self, symbol: str) -> str:
         if "|" in symbol:

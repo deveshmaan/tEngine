@@ -7,19 +7,19 @@ import os
 import random
 import signal
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from dataclasses import replace
 
 from engine.alerts import configure_alerts, notify_incident
-from engine.broker import UpstoxBroker
+from engine.broker import FULL_D30_LIMIT_PER_USER, FullD30Streamer, UpstoxBroker
 from engine.config import EngineConfig, IST
-from engine.data import pick_strike_from_spot, resolve_weekly_expiry
+from engine.data import pick_strike_from_spot, pick_subscription_expiry, resolve_weekly_expiry
 from engine.events import EventBus
 from engine.fees import load_fee_config
 from engine.instruments import InstrumentResolver
 from engine.logging_utils import configure_logging, get_logger
-from engine.metrics import EngineMetrics, bind_global_metrics, start_http_server_if_available
+from engine.metrics import EngineMetrics, bind_global_metrics, set_subscription_expiry, start_http_server_if_available
 from engine.oms import OMS, OrderValidationError
 from engine.pnl import Execution as PnLExecution, PnLCalculator
 from engine.recovery import RecoveryManager
@@ -40,12 +40,20 @@ except Exception:  # pragma: no cover
 class IntradayBuyStrategy:
     """Toy BUY-side strategy that demonstrates the risk→data→oms pipeline."""
 
-    def __init__(self, config: EngineConfig, risk: RiskManager, oms: OMS, bus: EventBus):
+    def __init__(
+        self,
+        config: EngineConfig,
+        risk: RiskManager,
+        oms: OMS,
+        bus: EventBus,
+        subscription_expiry_provider: Optional[Callable[[str], str]] = None,
+    ):
         self.cfg = config
         self.risk = risk
         self.oms = oms
         self.bus = bus
         self.logger = get_logger("IntradayStrategy")
+        self._subscription_expiry_provider = subscription_expiry_provider
 
     async def run(self, stop_event: asyncio.Event) -> None:
         queue = await self.bus.subscribe("market/events", maxsize=1000)
@@ -69,13 +77,25 @@ class IntradayBuyStrategy:
         await self._maybe_trade(spot, ts, symbol_hint)
 
     async def _maybe_trade(self, spot: float, ts: dt.datetime, symbol_hint: Optional[str]) -> None:
-        expiry_date = resolve_weekly_expiry(
-            self.cfg.data.index_symbol,
-            ts,
-            self.cfg.data.holidays,
-            weekly_weekday=self.cfg.data.weekly_expiry_weekday,
-        )
-        expiry_str = expiry_date.isoformat()
+        symbol_root = self.cfg.data.index_symbol
+        preference = getattr(self.cfg.data, "subscription_expiry_preference", "current")
+        expiry_str: Optional[str] = None
+        if self._subscription_expiry_provider:
+            try:
+                expiry_str = self._subscription_expiry_provider(symbol_root)
+            except Exception:
+                expiry_str = None
+        if not expiry_str:
+            try:
+                expiry_str = pick_subscription_expiry(symbol_root, preference)
+            except Exception:
+                fallback_expiry = resolve_weekly_expiry(
+                    symbol_root,
+                    ts,
+                    self.cfg.data.holidays,
+                    weekly_weekday=self.cfg.data.weekly_expiry_weekday,
+                )
+                expiry_str = fallback_expiry.isoformat()
         strike = pick_strike_from_spot(
             spot,
             step=self.cfg.data.lot_step,
@@ -131,6 +151,84 @@ class IntradayBuyStrategy:
                 pass
         return lot
 
+    def _choose_subscription_expiry(self, symbol: str) -> str:
+        preference = getattr(self.cfg.data, "subscription_expiry_preference", "current")
+        pref = preference if preference in {"current", "next", "monthly"} else "current"
+        try:
+            expiry = pick_subscription_expiry(symbol, pref)
+        except Exception as exc:
+            self.logger.log_event(30, "subscription_expiry_fallback", symbol=symbol, preference=pref, error=str(exc))
+            fallback = resolve_weekly_expiry(
+                symbol,
+                engine_now(IST),
+                self.cfg.data.holidays,
+                weekly_weekday=self.cfg.data.weekly_expiry_weekday,
+            )
+            expiry = fallback.isoformat()
+            pref = "current"
+        try:
+            if self.broker:
+                self.broker.record_subscription_expiry(symbol, expiry, pref)
+            else:
+                set_subscription_expiry(symbol, expiry, pref)
+        except Exception:
+            set_subscription_expiry(symbol, expiry, pref)
+        return expiry
+
+    def _subscription_expiry_for(self, symbol: str) -> str:
+        sym = symbol.upper()
+        expiry = self.subscription_expiries.get(sym)
+        if expiry:
+            return expiry
+        expiry = self._choose_subscription_expiry(sym)
+        self.subscription_expiries[sym] = expiry
+        return expiry
+
+    async def _maybe_start_full_d30_streamer(self) -> None:
+        """Optional FULL_D30 metrics streamer using the new protobuf feed."""
+
+        if str(self.cfg.market_data.stream_mode).lower() != "full_d30":
+            return
+        token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+        if not token:
+            self.logger.warning("FullD30Streamer skipped: UPSTOX_ACCESS_TOKEN not set")
+            return
+        cache = self.instrument_cache
+        if cache is None:
+            self.logger.warning("FullD30Streamer skipped: instrument cache unavailable")
+            return
+        try:
+            underlying_key = cache.resolve_index_key(self.cfg.data.index_symbol)
+        except Exception as exc:
+            self.logger.warning("FullD30Streamer skipped: unable to resolve underlying key: %s", exc)
+            underlying_key = None
+        expiry = self._subscription_expiry_for(self.cfg.data.index_symbol)
+        spot = None
+        try:
+            spot = await self.broker.get_spot(self.cfg.data.index_symbol)
+        except Exception as exc:
+            self.logger.warning("FullD30Streamer spot lookup failed: %s", exc)
+        window = max(int(self.cfg.market_data.window_steps or 0), 0)
+        opt_mode = str(self.cfg.market_data.option_type or "CE").upper()
+        opt_types = ["CE", "PE"] if opt_mode == "BOTH" else [opt_mode if opt_mode in {"CE", "PE"} else "CE"]
+        instrument_keys: List[str] = []
+        if underlying_key:
+            instrument_keys.append(underlying_key)
+        if expiry and spot is not None:
+            for opt in opt_types:
+                rows = cache.nearest_strikes(self.cfg.data.index_symbol, expiry, spot, window=window, opt_type=opt)
+                for row in rows:
+                    key = row.get("instrument_key")
+                    if key:
+                        instrument_keys.append(str(key))
+        if not instrument_keys:
+            self.logger.warning("FullD30Streamer skipped: no instrument keys resolved")
+            return
+        unique_keys = list(dict.fromkeys(instrument_keys))[:FULL_D30_LIMIT_PER_USER]
+        streamer = FullD30Streamer(token, unique_keys)
+        self._full_d30_streamer = streamer
+        await streamer.start()
+
 
 class EngineApp:
     def __init__(self, config: EngineConfig):
@@ -150,10 +248,12 @@ class EngineApp:
         self.metrics = EngineMetrics()
         bind_global_metrics(self.metrics)
         self.risk = RiskManager(config.risk, self.store)
+        self.subscription_expiries: dict[str, str] = {}
         self.broker = UpstoxBroker(
             config=config.broker,
             ws_failure_callback=self._on_ws_failure,
             instrument_resolver=self.instrument_resolver,
+            instrument_cache=self.instrument_cache,
             metrics=self.metrics,
             auth_halt_callback=self.risk.halt_new_entries,
             risk_manager=self.risk,
@@ -171,7 +271,9 @@ class EngineApp:
         self.broker.bind_reconcile_callback(self.oms.reconcile_from_broker)
         self.broker.bind_square_off_callback(self._execute_square_off)
         self.broker.bind_shutdown_callback(self.trigger_shutdown)
-        self.strategy = IntradayBuyStrategy(config, self.risk, self.oms, self.bus)
+        self.strategy = IntradayBuyStrategy(
+            config, self.risk, self.oms, self.bus, subscription_expiry_provider=self._subscription_expiry_for
+        )
         self.fee_config = load_fee_config()
         self.pnl = PnLCalculator(self.store, self.fee_config)
         configure_alerts(config.alerts.throttle_seconds)
@@ -179,6 +281,40 @@ class EngineApp:
         self._market_task: Optional[asyncio.Task] = None
         self._square_task: Optional[asyncio.Task] = None
         self._tasks: List[asyncio.Task] = []
+        self._full_d30_streamer: Optional[FullD30Streamer] = None
+
+    def _choose_subscription_expiry(self, symbol: str) -> str:
+        preference = getattr(self.cfg.data, "subscription_expiry_preference", "current")
+        pref = preference if preference in {"current", "next", "monthly"} else "current"
+        try:
+            expiry = pick_subscription_expiry(symbol, pref)
+        except Exception as exc:
+            self.logger.log_event(30, "subscription_expiry_fallback", symbol=symbol, preference=pref, error=str(exc))
+            fallback = resolve_weekly_expiry(
+                symbol,
+                engine_now(IST),
+                self.cfg.data.holidays,
+                weekly_weekday=self.cfg.data.weekly_expiry_weekday,
+            )
+            expiry = fallback.isoformat()
+            pref = "current"
+        try:
+            if self.broker:
+                self.broker.record_subscription_expiry(symbol, expiry, pref)
+            else:
+                set_subscription_expiry(symbol, expiry, pref)
+        except Exception:
+            set_subscription_expiry(symbol, expiry, pref)
+        return expiry
+
+    def _subscription_expiry_for(self, symbol: str) -> str:
+        sym = symbol.upper()
+        expiry = self.subscription_expiries.get(sym)
+        if expiry:
+            return expiry
+        expiry = self._choose_subscription_expiry(sym)
+        self.subscription_expiries[sym] = expiry
+        return expiry
 
     async def run(self, replay_cfg: Optional[ReplayConfig] = None) -> None:
         configure_logging("INFO")
@@ -189,6 +325,7 @@ class EngineApp:
         metrics_started = start_http_server_if_available(metrics_port)
         self.logger.log_event(20, "metrics_bootstrap", port=metrics_port, started=metrics_started)
         self.metrics.engine_up.set(1)
+        self._subscription_expiry_for(self.cfg.data.index_symbol)
         await self.broker.start()
         decision = self.broker.session_guard_decision or {"action": "continue", "state": 1, "positions": 0}
         halt_flag = 1 if decision.get("action") != "continue" else 0
@@ -197,6 +334,12 @@ class EngineApp:
             await self.trigger_shutdown("session_guard_shutdown")
             await self._cleanup()
             return
+        try:
+            maybe_streamer = getattr(self, "_maybe_start_full_d30_streamer", None)
+            if callable(maybe_streamer):
+                await maybe_streamer()
+        except Exception as exc:
+            self.logger.warning("FullD30Streamer failed to start: %s", exc)
         await RecoveryManager(self.store, self.oms).reconcile()
         self._square_task = asyncio.create_task(self._square_off_watchdog(), name="square-off")
         strat_task = asyncio.create_task(self.strategy.run(self._stop), name="strategy-loop")
@@ -226,6 +369,11 @@ class EngineApp:
 
     async def _cleanup(self) -> None:
         await self.oms.cancel_all(reason="shutdown")
+        if self._full_d30_streamer:
+            try:
+                await self._full_d30_streamer.stop()
+            except Exception:
+                pass
         await self.broker.stop()
         self.metrics.engine_up.set(0)
         self.logger.log_event(20, "engine_stopped")
@@ -343,6 +491,26 @@ class EngineApp:
         expiry = "-".join(parts[1:-1])
         return expiry or None, strike, opt_type
 
+    def _instrument_key_for_symbol(self, symbol: str) -> Optional[str]:
+        parts = symbol.split("-")
+        if len(parts) < 3:
+            return None
+        tail = parts[-1]
+        opt_type = "CE"
+        if tail.endswith(("CE", "PE")):
+            opt_type = tail[-2:]
+            tail = tail[:-2]
+        expiry = "-".join(parts[1:-1])
+        try:
+            strike = float(tail)
+        except ValueError:
+            return None
+        underlying = parts[0].upper()
+        try:
+            return self.instrument_cache.lookup(underlying, expiry, strike, opt_type)
+        except Exception:
+            return None
+
     async def _on_ws_failure(self, failures: int) -> None:
         self.risk.halt_new_entries("WS_FAILURE")
         self.metrics.risk_halts_total.inc()
@@ -371,18 +539,36 @@ class EngineApp:
         while not self._stop.is_set():
             ts = engine_now(IST)
             spot = self._mock_spot()
-            expiry = resolve_weekly_expiry(
-                self.cfg.data.index_symbol,
-                ts,
-                self.cfg.data.holidays,
-                weekly_weekday=self.cfg.data.weekly_expiry_weekday,
-            )
+            expiry_str = self._subscription_expiry_for(self.cfg.data.index_symbol)
+            try:
+                expiry_dt = dt.date.fromisoformat(expiry_str)
+            except ValueError:
+                expiry_dt = resolve_weekly_expiry(
+                    self.cfg.data.index_symbol,
+                    ts,
+                    self.cfg.data.holidays,
+                    weekly_weekday=self.cfg.data.weekly_expiry_weekday,
+                )
+                expiry_str = expiry_dt.isoformat()
+                self.subscription_expiries[self.cfg.data.index_symbol.upper()] = expiry_str
+                try:
+                    if self.broker:
+                        self.broker.record_subscription_expiry(self.cfg.data.index_symbol, expiry_str, "current")
+                    else:
+                        set_subscription_expiry(self.cfg.data.index_symbol, expiry_str, "current")
+                except Exception:
+                    set_subscription_expiry(self.cfg.data.index_symbol, expiry_str, "current")
             strike = pick_strike_from_spot(
                 spot,
                 step=self.cfg.data.lot_step,
             )
-            symbol = f"{self.cfg.data.index_symbol}-{expiry.isoformat()}-{int(strike)}CE"
+            symbol = f"{self.cfg.data.index_symbol}-{expiry_str}-{int(strike)}CE"
             payload = {"underlying": self.cfg.data.index_symbol, "ltp": spot, "symbol": symbol}
+            tick_payload = dict(payload)
+            tick_payload.setdefault("ts", ts.isoformat())
+            instrument_key = self._instrument_key_for_symbol(symbol)
+            if self.broker:
+                self.broker.record_market_tick(instrument_key or symbol, tick_payload)
             event = {"ts": ts.isoformat(), "type": "tick", "payload": payload}
             self.store.record_market_event("tick", payload, ts=ts)
             await self.bus.publish("market/events", event)

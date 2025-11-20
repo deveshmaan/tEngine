@@ -204,6 +204,35 @@ def list_expiries(symbol: Literal["NIFTY", "BANKNIFTY"]) -> List[str]:
     return sorted(set(normalized))
 
 
+def pick_subscription_expiry(symbol: str, preference: str) -> str:
+    """
+    Returns a single expiry 'YYYY-MM-DD' based on preference.
+    preference ∈ {'current','next','monthly'}
+    - 'current': earliest weekly from list_expiries(symbol)
+    - 'next': the next weekly after the earliest (if present), else earliest
+    - 'monthly': pick the nearest monthly for symbol (first expiry with day>=24, else farthest)
+    """
+
+    pref = str(preference or "current").strip().lower()
+    if pref not in {"current", "next", "monthly"}:
+        pref = "current"
+    expiries = list_expiries(symbol)  # already normalized and sorted ascending
+    if not expiries:
+        raise RuntimeError(f"No expiries for {symbol}")
+    if pref == "monthly":
+        for e in expiries:
+            try:
+                parsed = dt.datetime.strptime(e, "%Y-%m-%d")
+            except ValueError:
+                continue
+            if parsed.day >= 24:
+                return e
+        return expiries[-1]
+    if pref == "next":
+        return expiries[1] if len(expiries) >= 2 else expiries[0]
+    return expiries[0]
+
+
 def resolve_expiries_with_fallback(symbol: str) -> List[str]:
     cache = _active_cache()
     if cache is None:
@@ -250,7 +279,7 @@ def preopen_expiry_smoke(symbols: Iterable[str] = ("NIFTY", "BANKNIFTY")) -> Non
     session = cache.upstox_session()
     for symbol in symbols:
         expiries = resolve_expiries_with_fallback(symbol)
-        LOG.info("preopen_expiry_smoke: %s expiries=%d", symbol, len(expiries))
+        LOG.info("preopen_expiry_smoke: %s expiries=%d sample=%s", symbol, len(expiries), expiries[:5])
         if not expiries:
             raise PreopenExpiryCheckFailed(f"no expiries for {symbol}")
         target = expiries[0]
@@ -310,6 +339,7 @@ __all__ = [
     "get_app_config",
     "list_expiries",
     "normalize_date",
+    "pick_subscription_expiry",
     "preopen_expiry_smoke",
     "pick_strike_from_spot",
     "resolve_expiries_with_fallback",

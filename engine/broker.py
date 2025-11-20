@@ -1,22 +1,58 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import logging
 import random
+import threading
 import time
-from typing import Any, Awaitable, Callable, Iterable, List, Optional, Protocol, Sequence, Union
+from typing import Any, Awaitable, Callable, Iterable, List, Mapping, Optional, Protocol, Sequence, Union
 
 import upstox_client
 from upstox_client.rest import ApiException
+try:
+    # SDKs ship MarketDataStreamerV3 under slightly different module layouts.
+    from upstox_client.feeder.market_data_streamer_v3 import MarketDataStreamerV3
+except Exception:  # pragma: no cover
+    try:
+        from upstox_client.feeder import MarketDataStreamerV3  # type: ignore
+    except Exception:  # pragma: no cover
+        MarketDataStreamerV3 = None  # type: ignore
+
+try:
+    # Protobuf generated from Upstox MarketDataFeed v3 .proto
+    from engine._proto import MarketDataFeed_pb2 as pb  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        import MarketDataFeed_pb2 as pb  # type: ignore
+    except Exception:  # pragma: no cover
+        pb = None  # type: ignore
 
 from brokerage.upstox_client import InvalidDateError, UpstoxConfig, UpstoxSession
-from engine.config import BrokerConfig
-from engine.data import normalize_date, preopen_expiry_smoke
+from engine.config import BrokerConfig, CONFIG
+from engine.data import normalize_date, pick_subscription_expiry, preopen_expiry_smoke, resolve_expiries_with_fallback
 from engine.logging_utils import get_logger
 from engine.oms import BrokerOrderAck, BrokerOrderView, Order
 from engine.instruments import InstrumentResolver
-from engine.metrics import EngineMetrics, set_session_state
+from engine.metrics import (
+    EngineMetrics,
+    clear_subscription_info,
+    incr_ws_reconnects,
+    publish_option_depth,
+    publish_option_quote,
+    publish_subscription_info,
+    publish_underlying,
+    record_md_decode_error,
+    set_last_tick_ts,
+    set_md_subscription,
+    set_md_subscription_gauge,
+    set_subscription_expiry,
+    set_session_state,
+    update_option_quote,
+)
 from engine.alerts import notify_incident
 from engine.risk import RiskManager
+from market.instrument_cache import InstrumentCache, labels_for_key
 
 
 class BrokerError(Exception):
@@ -32,7 +68,7 @@ class MarketStreamClient(Protocol):
 
     async def close(self) -> None: ...
 
-    async def subscribe(self, instruments: Sequence[str]) -> None: ...
+    async def subscribe(self, instruments: Sequence[str], mode: Optional[str] = None) -> None: ...
 
     async def heartbeat(self) -> None: ...
 
@@ -60,6 +96,296 @@ class TokenBucket:
             await asyncio.sleep(max(wait_for, 0.0))
 
 
+LOG = logging.getLogger("engine.market.full_d30")
+
+FULL_D30_LIMIT_PER_USER = 50  # Upstox Plus documented limit
+
+
+class FullD30Streamer:
+    """Upstox V3 WS streamer in FULL_D30 mode with protobuf decode + metrics emission."""
+
+    def __init__(self, access_token: str, instrument_keys: List[str], loop: Optional[asyncio.AbstractEventLoop] = None):
+        self._access_token = access_token
+        self._instrument_keys = list(dict.fromkeys(instrument_keys))  # de-dupe, stable order
+        self._loop = loop or asyncio.get_event_loop()
+        self._stream: Optional[MarketDataStreamerV3] = None
+        self._connected = asyncio.Event()
+        self._stop = asyncio.Event()
+
+    async def start(self) -> None:
+        if MarketDataStreamerV3 is None:
+            raise RuntimeError("MarketDataStreamerV3 unavailable in installed upstox_client package")
+        if pb is None:
+            raise RuntimeError("MarketDataFeed_pb2 missing; generate protobuf bindings for the v3 feed")
+        if not self._instrument_keys:
+            LOG.warning("No instruments provided to FULL_D30 streamer; nothing to subscribe.")
+            return
+
+        if len(self._instrument_keys) > FULL_D30_LIMIT_PER_USER:
+            LOG.warning(
+                "Truncating FULL_D30 subscription set from %d to %d (Upstox per-user cap).",
+                len(self._instrument_keys),
+                FULL_D30_LIMIT_PER_USER,
+            )
+            self._instrument_keys = self._instrument_keys[:FULL_D30_LIMIT_PER_USER]
+
+        cfg = upstox_client.Configuration()
+        cfg.access_token = self._access_token
+
+        self._stream = MarketDataStreamerV3(configuration=cfg)
+        self._connected.clear()
+
+        self._stream.on_open(self._on_open)
+        self._stream.on_data(self._on_data)  # raw protobuf bytes
+        self._stream.on_error(self._on_error)
+        self._stream.on_close(self._on_close)
+
+        await self._loop.run_in_executor(None, self._stream.connect)
+        await asyncio.wait_for(self._connected.wait(), timeout=10.0)
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._stream:
+            try:
+                await self._loop.run_in_executor(None, self._stream.disconnect)
+            except Exception:
+                pass
+
+    # ---- Callbacks ----
+    def _on_open(self, *args, **kwargs):
+        LOG.info("V3 WebSocket connected; subscribing %d instruments in full_d30", len(self._instrument_keys))
+        try:
+            self._stream.subscribe(mode="full_d30", instrument_keys=self._instrument_keys)  # type: ignore[attr-defined]
+        except Exception as e:
+            LOG.exception("Subscribe failed: %s", e)
+            raise
+        set_md_subscription_gauge(len(self._instrument_keys))
+        self._connected.set()
+
+    def _on_close(self, *args, **kwargs):
+        LOG.warning("V3 WebSocket closed.")
+        if not self._stop.is_set():
+            asyncio.run_coroutine_threadsafe(self._reconnect(), self._loop)
+
+    def _on_error(self, err, *args, **kwargs):
+        LOG.error("V3 WebSocket error: %s", err)
+
+    def _on_data(self, payload: bytes):
+        """Decode protobuf MarketDataFeed and publish metrics."""
+        if pb is None:
+            record_md_decode_error("pb_missing")
+            return
+        try:
+            feed = pb.Feed()  # recommended message name in v3 proto
+            feed.ParseFromString(payload)
+        except Exception as e:
+            record_md_decode_error(str(e))
+            return
+
+        ts = time.time()
+
+        for item in getattr(feed, "feeds", []):
+            key = getattr(item, "instrumentKey", "")  # e.g., "NSE_FO|12345" or "NSE_INDEX|Nifty 50"
+            try:
+                q = getattr(item, "marketFF", None) or getattr(item, "marketFFQuote", None) or item
+                ltp = float(getattr(q, "ltp", 0.0))
+                book = getattr(q, "marketDepth", None)
+                bid1 = float(book.bids[0].price) if book and len(book.bids) else float("nan")
+                ask1 = float(book.asks[0].price) if book and len(book.asks) else float("nan")
+                iv = float(getattr(q, "iv", float("nan"))) if hasattr(q, "iv") else None
+                oi = int(getattr(q, "oi", 0)) if hasattr(q, "oi") else None
+            except Exception as e:  # pragma: no cover - defensive parse
+                record_md_decode_error(f"field_parse:{e}")
+                continue
+
+            sym, expiry, strike, opt = labels_for_key(key)  # returns (symbol, 'YYYY-MM-DD' or '', int, 'CE'/'PE'/None)
+            if opt is None:
+                publish_underlying(sym or key, ltp, ts)
+            else:
+                publish_option_quote(key, sym, expiry, opt, strike, ltp, bid1, ask1, iv, oi, ts)
+
+    async def _reconnect(self):
+        incr_ws_reconnects()
+        backoff = [1, 2, 5, 10]
+        for d in backoff:
+            if self._stop.is_set():
+                return
+            try:
+                LOG.info("Reconnecting V3 WS…")
+                await self.start()
+                return
+            except Exception as e:
+                LOG.warning("Reconnect failed (%s); retrying in %ss", e, d)
+                await asyncio.sleep(d)
+        LOG.error("Exhausted reconnect attempts for V3 WS")
+
+
+class _AsyncMarketDataStream(MarketStreamClient):
+    """Async wrapper around Upstox MarketDataStreamerV3 with an internal queue."""
+
+    def __init__(self, access_token: str, mode: str = "full_d30") -> None:
+        cfg = upstox_client.Configuration(sandbox=False)
+        cfg.access_token = access_token
+        self.ws = upstox_client.MarketDataStreamerV3(upstox_client.ApiClient(cfg), mode=mode)
+        self._mode = mode or "full_d30"
+        self._loop = asyncio.get_event_loop()
+        self._open_event: asyncio.Event = asyncio.Event()
+        self._messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=2048)
+        self._last_event = time.monotonic()
+        self._thread: Optional[threading.Thread] = None
+        self._closed = False
+        self.ws.on("open", self._on_open)
+        self.ws.on("message", self._on_message)
+        self.ws.on("error", self._on_error)
+        self.ws.on("close", self._on_close)
+        self.ws.auto_reconnect(True, 1, 10)
+
+    # ------------------------------------------------------------------ callbacks
+    def _on_open(self, *_: Any) -> None:
+        self._last_event = time.monotonic()
+        self._loop.call_soon_threadsafe(self._open_event.set)
+
+    def _on_message(self, message: dict[str, Any]) -> None:
+        self._last_event = time.monotonic()
+        self._loop.call_soon_threadsafe(self._enqueue, message)
+
+    def _on_error(self, *_: Any) -> None:
+        self._last_event = time.monotonic()
+
+    def _on_close(self, *_: Any) -> None:
+        self._last_event = time.monotonic()
+
+    def _enqueue(self, message: dict[str, Any]) -> None:
+        try:
+            self._messages.put_nowait(message)
+        except asyncio.QueueFull:
+            try:
+                self._messages.get_nowait()
+            except Exception:
+                pass
+            try:
+                self._messages.put_nowait(message)
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------------- api
+    async def connect(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._open_event.clear()
+        self._closed = False
+        self._thread = threading.Thread(target=self.ws.connect, daemon=True)
+        self._thread.start()
+        try:
+            await asyncio.wait_for(self._open_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("Market data websocket open timed out") from exc
+
+    async def close(self) -> None:
+        self._closed = True
+        try:
+            await asyncio.to_thread(self.ws.disconnect)
+        except Exception:
+            return
+
+    async def subscribe(self, instruments: Sequence[str], mode: Optional[str] = None) -> None:
+        tokens = [str(tok) for tok in instruments if tok]
+        if not tokens:
+            return
+        await asyncio.to_thread(self.ws.subscribe, tokens, mode or self._mode)
+
+    async def heartbeat(self) -> float:
+        if self._closed:
+            raise RuntimeError("stream closed")
+        return self._last_event
+
+    async def recv(self, timeout: float = 1.0) -> Optional[Mapping[str, Any]]:
+        try:
+            return await asyncio.wait_for(self._messages.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+
+class _TickCoalescer:
+    """Rate-limits Prometheus updates by coalescing recent ticks."""
+
+    def __init__(self, *, depth_levels: int = 5) -> None:
+        self._depth_levels = max(int(depth_levels or 1), 1)
+        self._underlyings: dict[str, tuple[float, float]] = {}
+        self._options: dict[str, dict[str, Any]] = {}
+        self._task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
+
+    def start(self) -> None:
+        if self._task:
+            return
+        self._stop_event.clear()
+        self._task = asyncio.create_task(self._run(), name="tick-coalescer")
+
+    async def stop(self) -> None:
+        if not self._task:
+            return
+        self._stop_event.set()
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+
+    def update_underlying(self, symbol: str, ltp: float, ts: float) -> None:
+        self._underlyings[str(symbol or "").upper()] = (float(ltp), float(ts))
+
+    def update_option(self, instrument_key: str, payload: Mapping[str, Any]) -> None:
+        self._options[str(instrument_key or "")] = dict(payload)
+
+    async def _run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                await asyncio.sleep(0.15)
+                self._flush()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._underlyings:
+            for sym, (ltp, ts) in list(self._underlyings.items()):
+                publish_underlying(sym, ltp, ts)
+            self._underlyings.clear()
+        if self._options:
+            for key, data in list(self._options.items()):
+                publish_option_quote(
+                    key,
+                    data.get("symbol", ""),
+                    data.get("expiry", ""),
+                    data.get("opt", ""),
+                    data.get("strike", ""),
+                    ltp=data.get("ltp"),
+                    bid=data.get("bid"),
+                    ask=data.get("ask"),
+                    iv=data.get("iv"),
+                    oi=data.get("oi"),
+                    ts=data.get("ts"),
+                )
+                depth = data.get("depth") or {}
+                bids = depth.get("bids")
+                asks = depth.get("asks")
+                if bids or asks:
+                    publish_option_depth(
+                        key,
+                        data.get("symbol", ""),
+                        data.get("expiry", ""),
+                        data.get("opt", ""),
+                        data.get("strike", ""),
+                        bids=bids,
+                        asks=asks,
+                        levels=self._depth_levels,
+                    )
+            self._options.clear()
+
+
 class UpstoxBroker:
     """REST + streaming broker wrapper with watchdogs and rate-limits."""
 
@@ -79,6 +405,7 @@ class UpstoxBroker:
         token_refresh_cb: Optional[Callable[[], Union[str, Awaitable[str]]]] = None,
         ws_failure_callback: Optional[Callable[[int], Union[None, Awaitable[None]]]] = None,
         instrument_resolver: Optional[InstrumentResolver] = None,
+        instrument_cache: Optional[InstrumentCache] = None,
         metrics: Optional[EngineMetrics] = None,
         auth_halt_callback: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None,
         reconcile_callback: Optional[Callable[[], Awaitable[None]]] = None,
@@ -88,13 +415,20 @@ class UpstoxBroker:
         self._session_factory = session_factory or self._default_session_factory
         self._session = self._session_factory(None)
         self._stream = stream_client
+        self.ws: Optional[Any] = None
+        try:
+            self._stream_mode = str(CONFIG.market_data.get("stream_mode", "full_d30")).strip().lower() or "full_d30"
+        except Exception:
+            self._stream_mode = "full_d30"
         self._token_refresh_cb = token_refresh_cb
         self._subscriptions: set[str] = set()
+        self._subscription_meta: dict[str, dict[str, str]] = {}
         self._watchdog: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._logger = get_logger("UpstoxBroker")
         self._ws_failure_cb = ws_failure_callback
         self._resolver = instrument_resolver
+        self.instrument_cache = instrument_cache or InstrumentCache.runtime_cache()
         self._metrics = metrics
         self._auth_halt_cb = auth_halt_callback
         self._reconcile_cb = reconcile_callback
@@ -109,20 +443,165 @@ class UpstoxBroker:
         self._queue_lock = asyncio.Lock()
         self._last_ws_heartbeat = time.monotonic()
         self._preopen_checked = False
+        self._last_spot: dict[str, float] = {}
+        self._underlying_tokens: set[str] = set()
+        self._starting = False
+        self._stream_reader: Optional[asyncio.Task] = None
+        try:
+            depth_levels = int(CONFIG.market_data.get("depth_levels", 5))
+        except Exception:
+            depth_levels = 5
+        self._tick_coalescer = _TickCoalescer(depth_levels=depth_levels)
         if self._metrics:
             self._metrics.set_risk_halt_state(0)
 
-    async def start(self) -> None:
-        await self._run_preopen_probe()
-        if not await self._apply_session_guard():
+    async def get_spot(self, symbol: str) -> float:
+        cache = self.instrument_cache or InstrumentCache.runtime_cache()
+        symbol_up = symbol.upper()
+        if cache is None:
+            if symbol_up in self._last_spot:
+                return self._last_spot[symbol_up]
+            raise RuntimeError("Instrument cache unavailable for spot lookup")
+        if self.instrument_cache is None:
+            self.instrument_cache = cache
+        try:
+            index_key = cache.resolve_index_key(symbol_up)
+        except Exception as exc:
+            if symbol_up in self._last_spot:
+                return self._last_spot[symbol_up]
+            raise RuntimeError(f"Unable to resolve index key for {symbol_up}") from exc
+        try:
+            resp = await asyncio.to_thread(self._session.get_ltp, index_key)
+        except Exception as exc:
+            fallback = self._last_spot.get(symbol_up)
+            if fallback is not None:
+                return fallback
+            raise RuntimeError(f"Failed to fetch spot for {symbol_up}: {exc}") from exc
+        data: Any = resp
+        if isinstance(resp, Mapping):
+            data = resp.get("data") or resp.get("ltp") or resp
+        entries: list[Any]
+        if isinstance(data, Mapping):
+            entries = list(data.values())
+        elif isinstance(data, list):
+            entries = data
+        else:
+            entries = [data] if data not in (None, "") else []
+        price: Optional[float] = None
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            raw = entry.get("ltp") or entry.get("last_price") or entry.get("close") or entry.get("price")
+            try:
+                price = float(raw)
+            except (TypeError, ValueError):
+                continue
+            else:
+                break
+        if price is None:
+            fallback = self._last_spot.get(symbol_up)
+            if fallback is not None:
+                return fallback
+            raise RuntimeError(f"Unable to extract spot price for {symbol_up}")
+        self._last_spot[symbol_up] = price
+        return price
+
+    async def _subscribe_current_weekly(self, symbol: str) -> None:
+        """
+        Subscribes +/- window_steps strikes around ATM for the earliest weekly expiry,
+        and emits md_subscription rows. Respects option_type (CE|PE|BOTH).
+        """
+
+        cache = self.instrument_cache or InstrumentCache.runtime_cache()
+        idx_symbol = symbol.upper()
+        if cache is None:
+            self._logger.warning("Instrument cache unavailable; skipping auto-subscribe for %s", idx_symbol)
             return
-        if self._stream and not self._watchdog:
-            await self._stream.connect()
-            self._last_ws_heartbeat = time.monotonic()
-            self._watchdog = asyncio.create_task(self._stream_watchdog(), name="upstox-stream-watchdog")
+        if self.instrument_cache is None:
+            self.instrument_cache = cache
+        expiries = resolve_expiries_with_fallback(idx_symbol)
+        if not expiries:
+            self._logger.warning("No expiries available for %s", idx_symbol)
+            return
+        pref = CONFIG.data.get("subscription_expiry_preference", "current")
+        try:
+            expiry = pick_subscription_expiry(idx_symbol, pref)
+        except Exception:
+            expiry = expiries[1] if pref == "next" and len(expiries) > 1 else expiries[0]
+        self.record_subscription_expiry(idx_symbol, expiry, pref)
+        try:
+            step_map = getattr(CONFIG.data, "strike_steps", {}) or {}
+            step = int(step_map.get(idx_symbol, 50))
+        except Exception:
+            step = 50
+        step = max(step, 1)
+        try:
+            spot = await self.get_spot(idx_symbol)
+        except Exception as exc:
+            self._logger.warning("Unable to fetch spot for %s: %s", idx_symbol, exc)
+            cached = self._last_spot.get(idx_symbol)
+            if cached is None:
+                return
+            spot = cached
+        atm = round(float(spot) / step) * step
+        window = max(int(CONFIG.market_data.get("window_steps", 2)), 0)
+        strikes = [atm + i * step for i in range(-window, window + 1)]
+        opt_mode = str(CONFIG.market_data.get("option_type", "CE")).upper()
+        opt_list = ["CE", "PE"] if opt_mode == "BOTH" else [opt_mode]
+        tokens: list[Any] = list(self._subscriptions)
+        for opt in opt_list:
+            for ikey, st in cache.contract_keys_for(idx_symbol, expiry, opt, strikes):
+                tokens.append(
+                    {
+                        "instrument_key": ikey,
+                        "symbol": idx_symbol,
+                        "expiry": expiry,
+                        "opt_type": opt,
+                        "strike": st,
+                    }
+                )
+        if len(tokens) == len(self._subscriptions):
+            self._logger.warning("No option contracts resolved for %s %s (%s)", idx_symbol, expiry, opt_mode)
+            return
+        await self.subscribe_marketdata(tokens)
+
+    async def start(self) -> None:
+        if self._starting:
+            return
+        self._starting = True
+        await self._run_preopen_probe()
+        try:
+            if not await self._apply_session_guard():
+                return
+            self._ensure_stream_client()
+            self._tick_coalescer.start()
+            if self._stream and not self._watchdog:
+                await self._stream.connect()
+                self._last_ws_heartbeat = time.monotonic()
+                await self._subscribe_underlying(CONFIG.data.get("index_symbol", "NIFTY"))
+                await self._subscribe_current_weekly(CONFIG.data.get("index_symbol", "NIFTY"))
+                self._ensure_stream_reader()
+                self._watchdog = asyncio.create_task(self._stream_watchdog(), name="upstox-stream-watchdog")
+            else:
+                await self._subscribe_underlying(CONFIG.data.get("index_symbol", "NIFTY"))
+                await self._subscribe_current_weekly(CONFIG.data.get("index_symbol", "NIFTY"))
+        finally:
+            self._starting = False
 
     async def stop(self) -> None:
         self._stop.set()
+        if self._stream_reader:
+            self._stream_reader.cancel()
+            try:
+                await self._stream_reader
+            except asyncio.CancelledError:
+                pass
+            self._stream_reader = None
+        await self._tick_coalescer.stop()
+        if self._subscriptions:
+            self._emit_subscription_metrics(list(self._subscriptions), active=False)
+            self._subscriptions.clear()
+        self._underlying_tokens.clear()
         if self._watchdog:
             self._watchdog.cancel()
             try:
@@ -217,12 +696,25 @@ class UpstoxBroker:
             )
         return views
 
-    async def subscribe_marketdata(self, instruments: Iterable[str]) -> None:
+    async def subscribe_marketdata(self, instruments: Iterable[Any]) -> None:
+        normalized, overrides = self._normalize_subscription_inputs(instruments)
+        ordered_tokens: list[str] = []
+        new_set: set[str] = set()
+        for token in normalized:
+            clean = str(token or "").strip()
+            if not clean or clean in new_set:
+                continue
+            ordered_tokens.append(clean)
+            new_set.add(clean)
+        removed = self._subscriptions - new_set
+        self._subscriptions = new_set
+        self._apply_subscription_metadata(new_set, overrides)
+        self._emit_subscription_metrics(removed, active=False)
+        self._emit_subscription_metrics(new_set, active=True)
         if not self._stream:
             return
-        self._subscriptions = set(instruments)
-        await self._stream.subscribe(list(self._subscriptions))
-        if not self._watchdog:
+        await self._subscribe_batches(ordered_tokens, mode=self._stream_mode)
+        if not self._watchdog and not self._starting:
             await self.start()
         self._last_ws_heartbeat = time.monotonic()
 
@@ -235,6 +727,480 @@ class UpstoxBroker:
             "cancel": TokenBucket(limits.cancel.rate_per_sec, limits.cancel.burst),
             "history": TokenBucket(limits.history.rate_per_sec, limits.history.burst),
         }
+
+    def _normalize_subscription_inputs(self, instruments: Iterable[Any]) -> tuple[list[str], dict[str, dict[str, str]]]:
+        normalized: list[str] = []
+        overrides: dict[str, dict[str, str]] = {}
+        for entry in instruments:
+            token, meta = self._coerce_subscription_entry(entry)
+            if not token:
+                continue
+            normalized.append(token)
+            if meta:
+                overrides[token] = meta
+        return normalized, overrides
+
+    async def _subscribe_batches(self, tokens: Sequence[str], *, mode: Optional[str] = None) -> None:
+        if not self._stream or not tokens:
+            return
+        batch_size = 50
+        stream_mode = mode or self._stream_mode
+        for idx in range(0, len(tokens), batch_size):
+            batch = list(tokens[idx : idx + batch_size])
+            await self._stream.subscribe(batch, stream_mode)
+
+    def _coerce_subscription_entry(self, entry: Any) -> tuple[str, dict[str, str]]:
+        token = ""
+        meta: dict[str, str] = {}
+        if isinstance(entry, str):
+            token = entry
+        elif isinstance(entry, Mapping):
+            raw_token = entry.get("instrument_key") or entry.get("instrument") or entry.get("symbol") or entry.get("key") or entry.get("token")
+            token = str(raw_token or "")
+            meta = {
+                "symbol": str(entry.get("symbol") or entry.get("name") or ""),
+                "expiry": str(entry.get("expiry") or ""),
+                "opt_type": str(entry.get("opt_type") or entry.get("option_type") or ""),
+                "strike": str(entry.get("strike") or ""),
+            }
+        else:
+            raw_token = getattr(entry, "instrument_key", None) or getattr(entry, "instrument", None) or getattr(entry, "symbol", None)
+            token = str(raw_token or "")
+            meta = {
+                "symbol": str(getattr(entry, "symbol", "") or getattr(entry, "name", "")),
+                "expiry": str(getattr(entry, "expiry", "")),
+                "opt_type": str(getattr(entry, "opt_type", "") or getattr(entry, "option_type", "")),
+                "strike": str(getattr(entry, "strike", "")),
+            }
+        sanitized = {k: v for k, v in meta.items() if v not in ("", None)}
+        return token, sanitized
+
+    def _apply_subscription_metadata(self, tokens: set[str], overrides: dict[str, dict[str, str]]) -> None:
+        for token in tokens:
+            hints = overrides.get(token)
+            if token not in self._subscription_meta:
+                self._subscription_meta[token] = self._subscription_metadata_for(token, hints)
+            elif hints:
+                current = self._subscription_meta[token]
+                for key, value in hints.items():
+                    if value:
+                        current[key] = value
+
+    def _subscription_metadata_for(self, instrument_key: str, hints: Optional[dict[str, str]] = None) -> dict[str, str]:
+        details = {"symbol": "", "expiry": "", "opt_type": "", "strike": ""}
+        if hints:
+            for key in details:
+                if hints.get(key):
+                    details[key] = str(hints[key])
+        cache = self.instrument_cache or InstrumentCache.runtime_cache()
+        if cache:
+            cache_symbol, cache_expiry, cache_strike, cache_opt = cache.labels_for_instrument(instrument_key)
+            details["symbol"] = details["symbol"] or cache_symbol
+            details["expiry"] = details["expiry"] or cache_expiry
+            details["opt_type"] = details["opt_type"] or cache_opt
+            if cache_strike:
+                details["strike"] = details["strike"] or str(cache_strike)
+        if self._resolver:
+            cache_meta = self._resolver.metadata_for_key(instrument_key)
+            if cache_meta:
+                details["symbol"] = details["symbol"] or (cache_meta.symbol or "")
+                details["expiry"] = details["expiry"] or (cache_meta.expiry_date or "")
+                if cache_meta.option_type:
+                    details["opt_type"] = details["opt_type"] or cache_meta.option_type
+                if cache_meta.strike is not None:
+                    strike_val: Any = cache_meta.strike
+                    try:
+                        strike_float = float(strike_val)
+                        if strike_float.is_integer():
+                            strike_val = int(strike_float)
+                        else:
+                            strike_val = strike_float
+                    except (TypeError, ValueError):
+                        strike_val = cache_meta.strike
+                    details["strike"] = details["strike"] or str(strike_val)
+        return {k: str(v or "") for k, v in details.items()}
+
+    def _emit_subscription_metrics(self, tokens: Iterable[str], *, active: bool) -> None:
+        if not self._metrics:
+            return
+        for token in tokens:
+            clean = str(token or "").strip()
+            if not clean:
+                continue
+            details = self._subscription_meta.get(clean)
+            if not details and active:
+                details = self._subscription_metadata_for(clean)
+                self._subscription_meta[clean] = details
+            elif not details:
+                details = self._subscription_metadata_for(clean)
+            symbol = details.get("symbol", "") or ""
+            expiry = details.get("expiry", "") or ""
+            opt = details.get("opt_type", "") or ""
+            strike_text = str(details.get("strike", "") or "")
+            set_md_subscription(clean, symbol, expiry, opt, strike_text, active)
+            if active:
+                publish_subscription_info(clean, symbol=symbol, expiry=expiry, strike=strike_text, opt=opt, tag="live")
+            else:
+                clear_subscription_info(clean, symbol, expiry, strike_text, opt, tag="live")
+                self._subscription_meta.pop(clean, None)
+
+    def record_subscription_expiry(self, symbol: str, expiry: str, mode: str) -> None:
+        """Expose subscription expiry selection to metrics."""
+
+        if not self._metrics:
+            return
+        try:
+            set_subscription_expiry(symbol, expiry, mode)
+        except Exception:
+            pass
+
+    def _ensure_stream_client(self) -> None:
+        if self._stream is not None:
+            return
+        token = getattr(getattr(self._session, "config", None), "access_token", None)
+        if not token:
+            raise RuntimeError("Access token unavailable for market data stream")
+        client = _AsyncMarketDataStream(str(token), mode=self._stream_mode)
+        self._stream = client
+        self.ws = client.ws
+
+    def _ensure_stream_reader(self) -> None:
+        if self._stream_reader or not self._stream:
+            return
+        self._stream_reader = asyncio.create_task(self._drain_market_stream(), name="upstox-market-stream")
+
+    async def _drain_market_stream(self) -> None:
+        while not self._stop.is_set():
+            if not self._stream:
+                await asyncio.sleep(0.5)
+                continue
+            recv_fn = getattr(self._stream, "recv", None)
+            if not callable(recv_fn):
+                await asyncio.sleep(1.0)
+                continue
+            try:
+                frame = await recv_fn(timeout=1.0)
+            except Exception:
+                await asyncio.sleep(0.25)
+                continue
+            if not frame:
+                continue
+            try:
+                self._handle_feed_response(frame)
+            except Exception as exc:
+                self._logger.exception("Failed to decode market data frame: %s", exc)
+
+    def _handle_feed_response(self, frame: Mapping[str, Any]) -> None:
+        feeds = frame.get("feeds") if isinstance(frame, Mapping) else None
+        if not isinstance(feeds, Mapping):
+            return
+        frame_ts = self._extract_ts_seconds(frame.get("currentTs")) or None
+        for key, payload in feeds.items():
+            self._handle_feed_entry(str(key), payload or {}, frame_ts)
+
+    def _option_labels_for(self, instrument_key: str, payload: Mapping[str, Any]) -> tuple[bool, str, str, int, str]:
+        cache_symbol = cache_expiry = cache_opt = ""
+        cache_strike = 0
+        cache = self.instrument_cache or InstrumentCache.runtime_cache()
+        is_option = False
+        if cache and self.instrument_cache is None:
+            self.instrument_cache = cache
+        if cache:
+            try:
+                is_option = cache.is_option_key(instrument_key)
+                if is_option:
+                    labels = cache.labels_for_key(instrument_key) or cache.labels_for_instrument(instrument_key)
+                    if labels:
+                        cache_symbol, cache_expiry, cache_strike, cache_opt = labels
+            except Exception:
+                is_option = False
+        meta_hint = {
+            "symbol": str(payload.get("symbol") or payload.get("name") or ""),
+            "expiry": str(payload.get("expiry") or ""),
+            "opt_type": str(payload.get("opt_type") or payload.get("option_type") or ""),
+            "strike": payload.get("strike") or cache_strike,
+        }
+        cached = self._subscription_meta.get(instrument_key)
+        hints = {k: str(v) for k, v in meta_hint.items() if v not in ("", None, 0)}
+        if not cached:
+            cached = self._subscription_metadata_for(instrument_key, hints)
+            self._subscription_meta[instrument_key] = cached
+        else:
+            for name, value in hints.items():
+                if value and not cached.get(name):
+                    cached[name] = value
+        symbol = meta_hint.get("symbol") or cached.get("symbol") or cache_symbol
+        expiry = meta_hint.get("expiry") or cached.get("expiry") or cache_expiry
+        opt_type = (meta_hint.get("opt_type") or cached.get("opt_type") or cache_opt).upper()
+        strike_val = meta_hint.get("strike") or cached.get("strike") or cache_strike
+        try:
+            strike_int = int(float(strike_val))
+        except (TypeError, ValueError):
+            strike_int = cache_strike
+        if opt_type:
+            is_option = True
+        return is_option, symbol, expiry, strike_int, opt_type
+
+    def _handle_feed_entry(self, instrument_key: str, payload: Mapping[str, Any], frame_ts: Optional[float]) -> None:
+        ltpc = payload.get("ltpc") if isinstance(payload, Mapping) else None
+        if not isinstance(ltpc, Mapping):
+            ltpc = {}
+        full_feed = payload.get("fullFeed") if isinstance(payload, Mapping) else None
+        full_feed = full_feed or {}
+        if not isinstance(full_feed, Mapping):
+            full_feed = {}
+        market_ff = full_feed.get("marketFF") or full_feed.get("marketFf") or full_feed.get("market_ff") or {}
+        index_ff = full_feed.get("indexFF") or full_feed.get("indexFf") or full_feed.get("index_ff") or {}
+        is_option, symbol, expiry, strike, opt_type = self._option_labels_for(instrument_key, payload)
+        if not is_option and market_ff:
+            is_option = True
+        if is_option:
+            ts_seconds = (
+                self._extract_ts_seconds((market_ff.get("ltpc") or {}).get("ltt"))
+                or self._extract_ts_seconds(ltpc.get("ltt"))
+                or frame_ts
+                or time.time()
+            )
+            ltp = self._coerce_float((market_ff.get("ltpc") or {}).get("ltp") or ltpc.get("ltp"))
+            depth_entries = (market_ff.get("marketLevel") or {}).get("bidAskQuote") or []
+            bids: list[dict[str, Any]] = []
+            asks: list[dict[str, Any]] = []
+            if isinstance(depth_entries, list):
+                for entry in depth_entries:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    bid_p = self._coerce_float(entry.get("bidP"))
+                    bid_q = self._coerce_float(entry.get("bidQ"))
+                    ask_p = self._coerce_float(entry.get("askP"))
+                    ask_q = self._coerce_float(entry.get("askQ"))
+                    if bid_p is not None or bid_q is not None:
+                        bids.append({"price": bid_p, "qty": bid_q})
+                    if ask_p is not None or ask_q is not None:
+                        asks.append({"price": ask_p, "qty": ask_q})
+            if not bids and not asks:
+                first_depth = (full_feed.get("firstLevelWithGreeks") or {}).get("firstDepth") or {}
+                if isinstance(first_depth, Mapping):
+                    bid_p = self._coerce_float(first_depth.get("bidP"))
+                    bid_q = self._coerce_float(first_depth.get("bidQ"))
+                    ask_p = self._coerce_float(first_depth.get("askP"))
+                    ask_q = self._coerce_float(first_depth.get("askQ"))
+                    if bid_p is not None or bid_q is not None:
+                        bids.append({"price": bid_p, "qty": bid_q})
+                    if ask_p is not None or ask_q is not None:
+                        asks.append({"price": ask_p, "qty": ask_q})
+            best_bid = bids[0]["price"] if bids else None
+            best_ask = asks[0]["price"] if asks else None
+            oi = self._coerce_float(market_ff.get("oi") or payload.get("oi"))
+            iv = self._coerce_float(market_ff.get("iv") or payload.get("iv"))
+            set_last_tick_ts(instrument_key, ts_seconds)
+            self._tick_coalescer.update_option(
+                instrument_key,
+                {
+                    "symbol": symbol or self._subscription_meta.get(instrument_key, {}).get("symbol", ""),
+                    "expiry": expiry,
+                    "opt": opt_type,
+                    "strike": strike,
+                    "ltp": ltp,
+                    "bid": best_bid,
+                    "ask": best_ask,
+                    "iv": iv,
+                    "oi": oi,
+                    "ts": ts_seconds or time.time(),
+                    "depth": {"bids": bids, "asks": asks},
+                },
+            )
+            return
+        ts_seconds = (
+            self._extract_ts_seconds((index_ff.get("ltpc") or {}).get("ltt"))
+            or self._extract_ts_seconds(ltpc.get("ltt"))
+            or frame_ts
+            or time.time()
+        )
+        ltp = self._coerce_float((index_ff.get("ltpc") or {}).get("ltp") or (market_ff.get("ltpc") or {}).get("ltp") or ltpc.get("ltp"))
+        if ltp is None:
+            return
+        sym = self._underlying_symbol_for(instrument_key, payload)
+        self._last_spot[sym.upper()] = ltp
+        self._tick_coalescer.update_underlying(sym, ltp, ts_seconds)
+
+    def _resolve_underlying_key(self, symbol: str) -> Optional[str]:
+        cache = self.instrument_cache or InstrumentCache.runtime_cache()
+        if cache is None:
+            return None
+        try:
+            return cache.resolve_index_key(symbol)
+        except Exception:
+            return None
+
+    async def _subscribe_underlying(self, symbol: str) -> None:
+        key = self._resolve_underlying_key(symbol)
+        if not key:
+            return
+        if not self._stream:
+            self._ensure_stream_client()
+        if not self._stream:
+            return
+        await self._subscribe_batches([key], mode=self._stream_mode)
+        self._underlying_tokens.add(key)
+
+    def _underlying_symbol_for(self, instrument_key: str, payload: Mapping[str, Any]) -> str:
+        sym = str(payload.get("symbol") or payload.get("underlying") or payload.get("name") or "").upper()
+        if sym in {"NIFTY", "BANKNIFTY"}:
+            return sym
+        cache = self.instrument_cache or InstrumentCache.runtime_cache()
+        if cache:
+            try:
+                for candidate in ("NIFTY", "BANKNIFTY"):
+                    try_key = cache.resolve_index_key(candidate)
+                    if try_key == instrument_key:
+                        return candidate
+            except Exception:
+                pass
+        if "Nifty Bank" in instrument_key:
+            return "BANKNIFTY"
+        if "Nifty" in instrument_key:
+            return "NIFTY"
+        return sym or instrument_key
+
+    def record_market_tick(self, instrument_key: str, payload: dict[str, Any]) -> None:
+        key = str(instrument_key or "").strip()
+        if not key:
+            return
+
+        def _pluck(*names: str) -> Any:
+            if isinstance(payload, Mapping):
+                for name in names:
+                    if name in payload:
+                        return payload.get(name)
+            for name in names:
+                value = getattr(payload, name, None)
+                if value is not None:
+                    return value
+            return None
+        cache_symbol = cache_expiry = cache_opt = ""
+        cache_strike = 0
+        cache = self.instrument_cache or InstrumentCache.runtime_cache()
+        if cache and self.instrument_cache is None:
+            self.instrument_cache = cache
+        is_option = False
+        if cache:
+            try:
+                is_option = cache.is_option_key(key)
+                if is_option:
+                    labels = cache.labels_for_key(key) or cache.labels_for_instrument(key)
+                    if labels:
+                        cache_symbol, cache_expiry, cache_strike, cache_opt = labels
+            except Exception:
+                is_option = False
+
+        if is_option:
+            meta_hint = {
+                "symbol": _pluck("symbol", "name") or cache_symbol,
+                "expiry": _pluck("expiry") or cache_expiry,
+                "opt_type": (_pluck("opt_type", "option_type") or cache_opt or "").upper(),
+                "strike": _pluck("strike") or cache_strike,
+            }
+            cached = self._subscription_meta.get(key)
+            if not cached:
+                hints = {k: str(v) for k, v in meta_hint.items() if v not in (None, "", 0)}
+                cached = self._subscription_metadata_for(key, hints)
+                self._subscription_meta[key] = cached
+            else:
+                for name, value in meta_hint.items():
+                    if value not in (None, "", 0) and not cached.get(name):
+                        cached[name] = str(value)
+            symbol = meta_hint.get("symbol") or cached.get("symbol") or key
+            expiry = meta_hint.get("expiry") or cached.get("expiry") or ""
+            opt_type = (meta_hint.get("opt_type") or cached.get("opt_type") or "").upper()
+            strike_val: Any = meta_hint.get("strike") or cached.get("strike") or cache_strike or ""
+            try:
+                strike_val = int(float(strike_val))
+            except (TypeError, ValueError):
+                strike_val = strike_val or ""
+            ltp = self._coerce_float(_pluck("last_price", "ltp", "price"))
+            bid = None
+            for field in ("best_bid", "best_bid_price", "bid", "bidP", "bid_price", "buy_price"):
+                bid = self._coerce_float(_pluck(field))
+                if bid is not None:
+                    break
+            depth = _pluck("depth") or {}
+            if bid is None and isinstance(depth, Mapping):
+                bid = self._coerce_float(depth.get("buy_price") or depth.get("buy_price_1"))
+            ask = None
+            for field in ("best_ask", "best_ask_price", "ask", "askP", "ask_price", "sell_price"):
+                ask = self._coerce_float(_pluck(field))
+                if ask is not None:
+                    break
+            if ask is None and isinstance(depth, Mapping):
+                ask = self._coerce_float(depth.get("sell_price") or depth.get("sell_price_1"))
+            greeks = _pluck("optionGreeks", "greeks") or {}
+            if not isinstance(greeks, Mapping):
+                greeks = {}
+            iv = self._coerce_float(_pluck("implied_volatility", "iv") or greeks.get("iv"))
+            oi = self._coerce_float(_pluck("oi", "open_interest"))
+            ts_seconds = (
+                self._extract_ts_seconds(_pluck("exchange_ts"))
+                or self._extract_ts_seconds(_pluck("timestamp"))
+                or self._extract_ts_seconds(_pluck("ts"))
+                or time.time()
+            )
+            set_last_tick_ts(key, ts_seconds)
+            publish_option_quote(
+                key,
+                str(symbol),
+                str(expiry),
+                str(opt_type),
+                strike_val,
+                ltp=ltp,
+                bid=bid,
+                ask=ask,
+                iv=iv,
+                oi=oi,
+                ts=ts_seconds,
+            )
+            return
+
+        # Underlying tick
+        spot = self._coerce_float(_pluck("ltp", "last_price", "price", "close"))
+        if spot is None:
+            return
+        ts_seconds = (
+            self._extract_ts_seconds(_pluck("exchange_ts"))
+            or self._extract_ts_seconds(_pluck("timestamp"))
+            or self._extract_ts_seconds(_pluck("ts"))
+            or time.time()
+        )
+        sym = self._underlying_symbol_for(key, payload)
+        publish_underlying(sym, spot, ts_seconds)
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _extract_ts_seconds(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                try:
+                    parsed = dt.datetime.fromisoformat(text)
+                except ValueError:
+                    return None
+                return parsed.timestamp()
+        return None
 
     async def _rest_call(self, endpoint: str, action: str, fn: Callable[[UpstoxSession], Any], *, context: Optional[dict[str, Any]] = None) -> Any:
         retries = 3
@@ -374,6 +1340,9 @@ class UpstoxBroker:
         backoffs = self._cfg.ws_backoff_seconds or (1, 2, 5, 10)
         failures = 0
         while not self._stop.is_set():
+            if not self._stream:
+                await asyncio.sleep(self._cfg.ws_heartbeat_interval)
+                continue
             try:
                 await asyncio.wait_for(self._stream.heartbeat(), timeout=self._cfg.ws_heartbeat_interval)  # type: ignore[arg-type]
                 self._last_ws_heartbeat = time.monotonic()
@@ -391,8 +1360,11 @@ class UpstoxBroker:
                 except Exception:
                     pass
                 await self._stream.connect()  # type: ignore[union-attr]
+                self._ensure_stream_reader()
+                await self._subscribe_underlying(CONFIG.data.get("index_symbol", "NIFTY"))
                 if self._subscriptions:
-                    await self._stream.subscribe(list(self._subscriptions))  # type: ignore[union-attr]
+                    await self._subscribe_batches(list(self._subscriptions), mode=self._stream_mode)
+                await self._subscribe_current_weekly(CONFIG.data.get("index_symbol", "NIFTY"))
                 if self._metrics:
                     self._metrics.ws_reconnects_total.inc()
                 if self._reconcile_cb:
@@ -523,4 +1495,4 @@ class UpstoxBroker:
         return self._session_guard_decision
 
 
-__all__ = ["BrokerError", "MarketStreamClient", "TokenBucket", "UpstoxBroker"]
+__all__ = ["BrokerError", "MarketStreamClient", "TokenBucket", "FullD30Streamer", "UpstoxBroker"]

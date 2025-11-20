@@ -7,7 +7,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, TypeVar
+from typing import Callable, Iterable, List, Optional, Sequence, TypeVar
 
 import upstox_client
 from upstox_client import ApiClient
@@ -50,7 +50,7 @@ def _kwargs_filtered(instrument_key: str, expiry: str) -> dict[str, str]:
 
 
 def _require_token() -> str:
-    token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTFkNjk4NmQxZGZmMTE1NmQzYzZkZWQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzNTM1MjM4LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjM1ODk2MDB9.E4Th1udR3I6aO6QxviX5dbJtJwWnHleSFFaWsTzXOBk").strip()
+    token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTFlOWQxNjdlOWMzYTVhNDM5YjdhMzMiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzNjEzOTc0LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjM2NzYwMDB9.CTEf01BEM-zIaLiaF9kxLjV8LM3X5U9J6cwaGccsqSo").strip()
     if not token:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     return token
@@ -147,11 +147,29 @@ class UpstoxSession:
 
         return with_retry(_call)
 
-    def get_ltp(self, instrument_keys: List[str]) -> dict:
+    def get_ltp(self, instrument_keys: Sequence[str] | str) -> dict:
         """Call the MarketQuote V3 LTP endpoint for up to ~20 keys."""
 
+        keys: List[str] = []
+        if isinstance(instrument_keys, str):
+            keys = [instrument_keys]
+        else:
+            keys = [str(k) for k in instrument_keys if k]
+        if not keys:
+            raise ValueError("instrument_keys must be non-empty")
+        primary_payload: object = keys[0] if len(keys) == 1 else keys
+
         def _call() -> dict:
-            resp = self.mq_v3.get_ltp(instrument_keys=instrument_keys)
+            try:
+                resp = self.mq_v3.get_ltp(instrument_key=primary_payload)
+            except TypeError:
+                # accommodate SDKs that expect plural param name
+                resp = self.mq_v3.get_ltp(instrument_keys=primary_payload)
+            except ApiException as exc:
+                if len(keys) == 1 and primary_payload != keys[0]:
+                    # retry with a singular string payload
+                    return self.mq_v3.get_ltp(instrument_key=keys[0])
+                raise
             return resp.to_dict() if hasattr(resp, "to_dict") else resp
 
         return with_retry(_call)

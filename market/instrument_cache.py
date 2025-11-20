@@ -316,6 +316,205 @@ class InstrumentCache:
                 return None
         return dict(row)
 
+    def list_contracts_for_expiry(self, symbol: str, expiry: str, opt_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        symbol_up = symbol.upper()
+        base_query = (
+            "SELECT instrument_key, strike, opt_type, expiry, symbol, lot_size, tick_size FROM option_contracts WHERE symbol=? AND expiry=?"
+        )
+        params: tuple[Any, ...]
+        if opt_type:
+            query = f"{base_query} AND opt_type=? ORDER BY strike ASC"
+            params = (symbol_up, expiry, opt_type.upper())
+        else:
+            query = f"{base_query} ORDER BY strike ASC"
+            params = (symbol_up, expiry)
+        rows = self._conn.execute(query, params).fetchall()
+        contracts: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                if isinstance(row, sqlite3.Row):
+                    instrument_key = row["instrument_key"]
+                    strike_val = int(float(row["strike"]))
+                    opt_val = row["opt_type"]
+                    expiry_val = row["expiry"]
+                    symbol_val = row["symbol"]
+                    lot_val = int(row["lot_size"]) if row["lot_size"] is not None else 0
+                    tick_val = float(row["tick_size"]) if row["tick_size"] is not None else 0.0
+                else:
+                    instrument_key = row[0]
+                    strike_val = int(float(row[1]))
+                    opt_val = row[2]
+                    expiry_val = row[3]
+                    symbol_val = row[4]
+                    lot_val = int(row[5]) if row[5] is not None else 0
+                    tick_val = float(row[6]) if row[6] is not None else 0.0
+            except Exception:
+                continue
+            contracts.append(
+                {
+                    "instrument_key": instrument_key,
+                    "strike": strike_val,
+                    "opt_type": opt_val,
+                    "expiry": expiry_val,
+                    "symbol": symbol_val,
+                    "lot_size": lot_val,
+                    "tick_size": tick_val,
+                }
+            )
+        return contracts
+
+    def nearest_strikes(self, symbol: str, expiry: str, spot: float, window: int = 2, opt_type: str = "CE") -> List[Dict[str, Any]]:
+        symbol_up = symbol.upper()
+        cfg_data = getattr(CONFIG, "data", None)
+        try:
+            step_map = getattr(cfg_data, "strike_steps", {}) or {}
+            step = int(step_map.get(symbol_up, 50))
+        except Exception:
+            step = 50
+        step = max(step, 1)
+        base = round(float(spot or 0.0) / step) * step
+        targets = {int(base + offset * step) for offset in range(-window, window + 1)}
+        rows = self.list_contracts_for_expiry(symbol_up, expiry, opt_type=opt_type)
+        if not rows:
+            try:
+                session = self._ensure_session()
+                self.refresh_expiry(symbol_up, expiry, session=session)
+                rows = self.list_contracts_for_expiry(symbol_up, expiry, opt_type=opt_type)
+            except Exception:
+                rows = []
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                strike_val = int(row.get("strike")) if row.get("strike") is not None else None
+            except (TypeError, ValueError):
+                strike_val = None
+            if strike_val is not None and strike_val in targets:
+                filtered.append(row)
+        if filtered:
+            return filtered
+        limit = max(2 * window + 1, 1)
+        return rows[:limit]
+
+    def labels_for_instrument(self, instrument_key: str) -> Tuple[str, str, int, str]:
+        """
+        Returns (symbol, expiry, strike:int, opt_type) for an option instrument_key.
+        Prefer DB lookup (table option_contracts). Fallback: parse pipe/key format.
+        """
+
+        def _coerce_strike(value: Any) -> int:
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return 0
+
+        key = str(instrument_key or "")
+        if not key:
+            return "", "", 0, ""
+        with self._conn as c:
+            row = c.execute(
+                "SELECT symbol, expiry, strike, opt_type FROM option_contracts WHERE instrument_key=?",
+                (key,),
+            ).fetchone()
+        if row:
+            sym = row["symbol"] if isinstance(row, sqlite3.Row) else row[0]
+            expiry = row["expiry"] if isinstance(row, sqlite3.Row) else row[1]
+            strike_val = row["strike"] if isinstance(row, sqlite3.Row) else row[2]
+            opt = row["opt_type"] if isinstance(row, sqlite3.Row) else row[3]
+            return sym or "", expiry or "", _coerce_strike(strike_val), (opt or "").upper()
+        parsed_symbol = parsed_expiry = parsed_opt = ""
+        parsed_strike = 0
+        if "|" in key:
+            parts = key.split("|")
+            if len(parts) >= 4:
+                parsed_symbol = parts[-3]
+                parsed_expiry = parts[-2]
+                parsed_opt = parts[-1].upper()
+                parsed_strike = _coerce_strike(parts[-4])
+        else:
+            dash_parts = key.split("-")
+            if len(dash_parts) >= 3:
+                parsed_symbol = dash_parts[0]
+                parsed_expiry = "-".join(dash_parts[1:-1])
+                tail = dash_parts[-1]
+                if tail.endswith(("CE", "PE")):
+                    parsed_opt = tail[-2:].upper()
+                    parsed_strike = _coerce_strike(tail[:-2])
+                else:
+                    parsed_strike = _coerce_strike(tail)
+        return parsed_symbol, parsed_expiry, parsed_strike, parsed_opt
+
+    def is_option_key(self, instrument_key: str) -> bool:
+        """Return True if the key exists in the option contracts table."""
+
+        key = str(instrument_key or "")
+        if not key:
+            return False
+        with self._conn as c:
+            row = c.execute("SELECT 1 FROM option_contracts WHERE instrument_key=?", (key,)).fetchone()
+        return bool(row)
+
+    def labels_for_key(self, instrument_key: str) -> Optional[Tuple[str, str, int, str]]:
+        """
+        Return (symbol, expiry, strike:int, opt_type) for an option key; None if not found.
+        """
+
+        key = str(instrument_key or "")
+        if not key:
+            return None
+        with self._conn as c:
+            row = c.execute(
+                "SELECT symbol, expiry, strike, opt_type FROM option_contracts WHERE instrument_key=?",
+                (key,),
+            ).fetchone()
+        if not row:
+            try:
+                parsed_symbol, parsed_expiry, parsed_strike, parsed_opt = self.labels_for_instrument(key)
+                if parsed_symbol or parsed_expiry or parsed_opt:
+                    return parsed_symbol, parsed_expiry, int(parsed_strike or 0), parsed_opt
+            except Exception:
+                return None
+            return None
+        try:
+            strike_val = int(float(row[2] if not isinstance(row, sqlite3.Row) else row["strike"]))
+        except Exception:
+            strike_val = 0
+        sym = row[0] if not isinstance(row, sqlite3.Row) else row["symbol"]
+        expiry = row[1] if not isinstance(row, sqlite3.Row) else row["expiry"]
+        opt = row[3] if not isinstance(row, sqlite3.Row) else row["opt_type"]
+        return sym, expiry, strike_val, opt
+
+    def contract_keys_for(self, symbol: str, expiry: str, opt_type: str, strikes: List[int]) -> List[Tuple[str, int]]:
+        """
+        Return [(instrument_key, strike:int)] for requested strikes.
+        """
+
+        if not strikes:
+            return []
+        placeholders = ",".join(["?"] * len(strikes))
+        query = (
+            "SELECT instrument_key, strike FROM option_contracts WHERE symbol=? AND expiry=? AND opt_type=? AND strike IN (%s) ORDER BY strike"
+            % placeholders
+        )
+        params: tuple[Any, ...] = (symbol.upper(), expiry, opt_type.upper(), *[int(s) for s in strikes])
+        with self._conn as c:
+            rows = c.execute(query, params).fetchall()
+        results: List[Tuple[str, int]] = []
+        for row in rows:
+            instrument_key = row["instrument_key"] if isinstance(row, sqlite3.Row) else row[0]
+            strike_val = row["strike"] if isinstance(row, sqlite3.Row) else row[1]
+            try:
+                strike_int = int(float(strike_val))
+            except (TypeError, ValueError):
+                continue
+            results.append((str(instrument_key), strike_int))
+        return results
+
+    def keys_for(self, symbol: str, expiry: str, opt_type: str, strikes: Iterable[int]) -> List[str]:
+        """Return a list of instrument_keys for the requested strikes."""
+
+        pairs = self.contract_keys_for(symbol, expiry, opt_type, [int(s) for s in strikes])
+        return [key for key, _ in pairs]
+
     def get_meta(self, key: str, expiry: Optional[str] = None):
         """Return contract meta for an instrument key or an expiry (tick, lot, bands)."""
 
@@ -382,12 +581,12 @@ class InstrumentCache:
                 break
         return weekly, monthly
 
-    def nearest_strikes(self, symbol: str, ltp: float, step: int = 50) -> Tuple[int, int]:
+    def nearest_strike_pair(self, symbol: str, ltp: float, step: int = 50) -> Tuple[int, int]:
         atm = int(round(ltp / step) * step)
         return atm, atm
 
     def select_default_buy_contracts(self, symbol: str, ltp: float, expiry_date: str, step: int = 50, session: Optional[UpstoxSession] = None) -> Dict[str, Optional[str]]:
-        atm_ce, atm_pe = self.nearest_strikes(symbol, ltp, step)
+        atm_ce, atm_pe = self.nearest_strike_pair(symbol, ltp, step)
         ce = self.lookup(symbol, expiry_date, atm_ce, "CE")
         pe = self.lookup(symbol, expiry_date, atm_pe, "PE")
         if (not ce or not pe) and session is not None:
@@ -663,5 +862,32 @@ class InstrumentCache:
             return [payload]
         return []
 
+def labels_for_key(key: str) -> Tuple[str, str, int, Optional[str]]:
+    """
+    Convenience wrapper that returns (symbol, expiry, strike:int, opt) for an instrument key.
 
-__all__ = ["InstrumentCache", "InstrumentMeta"]
+    Falls back to empty labels if the runtime cache is unavailable or the lookup fails.
+    """
+
+    cache = InstrumentCache.runtime_cache()
+    if cache is None:
+        return "", "", 0, None
+    try:
+        result = cache.labels_for_key(key)
+    except Exception:
+        return "", "", 0, None
+    if not result:
+        return "", "", 0, None
+    sym, expiry, strike, opt = result
+    opt_norm = (opt or "").upper() or None
+    try:
+        strike_int = int(strike)
+    except Exception:
+        try:
+            strike_int = int(float(strike))
+        except Exception:
+            strike_int = 0
+    return str(sym or ""), str(expiry or ""), strike_int, opt_norm
+
+
+__all__ = ["InstrumentCache", "InstrumentMeta", "labels_for_key"]

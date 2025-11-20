@@ -28,10 +28,24 @@ _WEEKDAY_ALIASES = {
 
 _DEPRECATION_WARNED = False
 _LOGGER = logging.getLogger("engine.config")
+_SUBSCRIPTION_PREFS = {"current", "next", "monthly"}
 
 
 def _canonical_config() -> Path:
     return Path(os.getenv("APP_CONFIG_PATH", "config/app.yml"))
+
+
+def _read_config_payload(*, strict: bool) -> Dict[str, Any]:
+    cfg_path = _canonical_config()
+    if not cfg_path.exists():
+        if strict:
+            raise FileNotFoundError(f"Canonical config {cfg_path} not found")
+        _LOGGER.warning("Config file %s missing; returning defaults", cfg_path)
+        return {}
+    _warn_engine_config()
+    with cfg_path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    return data
 
 
 def _parse_time_str(value: str) -> dt.time:
@@ -54,7 +68,7 @@ def _parse_holidays(raw: Iterable[str]) -> tuple[dt.date, ...]:
     return tuple(sorted(set(holidays)))
 
 
-def _parse_weekday(value: Any, default: int = 3) -> int:
+def _parse_weekday(value: Any, default: int = 1) -> int:
     if value is None:
         return default
     if isinstance(value, int):
@@ -80,6 +94,20 @@ def _strike_steps(payload: Mapping[str, Any]) -> dict[str, int]:
         except (TypeError, ValueError):
             continue
     return steps
+
+
+def _parse_subscription_preference(value: Any) -> str:
+    text = str(value or "current").strip().lower()
+    if text not in _SUBSCRIPTION_PREFS:
+        return "current"
+    return text
+
+
+def _parse_option_type(value: Any) -> str:
+    text = str(value or "CE").strip().upper()
+    if text not in {"CE", "PE", "BOTH"}:
+        return "CE"
+    return text
 
 
 @dataclass(frozen=True)
@@ -124,6 +152,7 @@ class DataConfig:
     allow_expiry_override: bool = False
     expiry_override_path: Optional[str] = None
     expiry_override_max_age_minutes: int = 90
+    subscription_expiry_preference: str = "current"
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "DataConfig":
@@ -138,10 +167,11 @@ class DataConfig:
             strike_steps=_strike_steps(payload.get("strike_steps", {})),
             holidays=_parse_holidays(payload.get("holidays", [])),
             expiry_ttl_minutes=int(payload.get("expiry_ttl_minutes", 5)),
-            weekly_expiry_weekday=_parse_weekday(payload.get("weekly_expiry_weekday"), default=3),
+            weekly_expiry_weekday=_parse_weekday(payload.get("weekly_expiry_weekday"), default=1),
             allow_expiry_override=bool(payload.get("allow_expiry_override", False)),
             expiry_override_path=path_value or None,
             expiry_override_max_age_minutes=int(payload.get("expiry_override_max_age_minutes", 90)),
+            subscription_expiry_preference=_parse_subscription_preference(payload.get("subscription_expiry_preference")),
         )
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -257,12 +287,44 @@ class ReplayConfig:
 
 
 @dataclass(frozen=True)
+class MarketDataConfig:
+    window_steps: int = 2
+    option_type: str = "CE"
+    stream_mode: str = "full_d30"
+    depth_levels: int = 5
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "MarketDataConfig":
+        try:
+            window_val = int(payload.get("window_steps", 2))
+        except (TypeError, ValueError):
+            window_val = 2
+        try:
+            depth_val = int(payload.get("depth_levels", 5))
+        except (TypeError, ValueError):
+            depth_val = 5
+        raw_mode = str(payload.get("stream_mode", "full_d30")).strip().lower()
+        if not raw_mode:
+            raw_mode = "full_d30"
+        return MarketDataConfig(
+            window_steps=max(window_val, 0),
+            option_type=_parse_option_type(payload.get("option_type", "CE")),
+            stream_mode=raw_mode,
+            depth_levels=max(depth_val, 1),
+        )
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     run_id: str
     persistence_path: Path
     strategy_tag: str
     risk: RiskLimits
     data: DataConfig
+    market_data: MarketDataConfig
     broker: BrokerConfig
     oms: OMSConfig
     alerts: AlertConfig
@@ -274,16 +336,13 @@ class EngineConfig:
         cfg_path = _canonical_config()
         if path and Path(path) != cfg_path:
             _LOGGER.warning("Ignoring explicit config path %s; using canonical %s", path, cfg_path)
-        if not cfg_path.exists():  # pragma: no cover - deployment guard
-            raise FileNotFoundError(f"Canonical config {cfg_path} not found")
-        _warn_engine_config()
-        with cfg_path.open("r", encoding="utf-8") as handle:
-            raw = yaml.safe_load(handle) or {}
+        raw = _read_config_payload(strict=True)
         run_id = str(raw.get("run_id") or f"run-{engine_now(IST).strftime('%Y%m%d')}")
         persistence_path = Path(raw.get("persistence_path", "engine_state.sqlite"))
         strategy_tag = str(raw.get("strategy_tag", "intraday-buy"))
         risk = RiskLimits.from_dict(raw.get("risk", {}))
         data = DataConfig.from_dict(raw.get("data", {}))
+        market_data = MarketDataConfig.from_dict(raw.get("market_data", {}))
         broker = BrokerConfig.from_dict(raw.get("broker", {}))
         oms = OMSConfig.from_dict(raw.get("oms", {}))
         alerts = AlertConfig.from_dict(raw.get("alerts", {}))
@@ -295,6 +354,7 @@ class EngineConfig:
             strategy_tag=strategy_tag,
             risk=risk,
             data=data,
+            market_data=market_data,
             broker=broker,
             oms=oms,
             alerts=alerts,
@@ -336,6 +396,12 @@ def _warn_engine_config() -> None:
     _DEPRECATION_WARNED = True
 
 
+def read_config() -> Dict[str, Any]:
+    """Return the raw config/app.yml payload for UI consumers."""
+
+    return dict(_read_config_payload(strict=False))
+
+
 __all__ = [
     "AlertConfig",
     "BrokerConfig",
@@ -343,8 +409,10 @@ __all__ = [
     "DataConfig",
     "EngineConfig",
     "IST",
+    "MarketDataConfig",
     "OMSConfig",
     "OMSSubmitConfig",
+    "read_config",
     "ReplayConfig",
     "RiskLimits",
     "TelemetryConfig",
