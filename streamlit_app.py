@@ -431,6 +431,34 @@ def _coerce_float(value: object) -> Optional[float]:
         return None
 
 
+def _parse_payload(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
+def latest_smoke_result(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if df is None or df.empty:
+        return None
+    for _, row in df.iterrows():
+        code = str(row.get("code") or "")
+        if not code.startswith("SMOKE_TEST"):
+            continue
+        if code == "SMOKE_TEST_FILLED":
+            continue
+        payload = _parse_payload(row.get("payload"))
+        payload["code"] = code
+        payload["ts"] = row.get("ts")
+        payload["reason"] = payload.get("reason") or row.get("reason")
+        return payload
+    return None
+
+
 def insert_control_intent(conn: sqlite3.Connection, run_id: str, action: str, payload: Optional[Dict[str, Any]] = None) -> None:
     ts = dt.datetime.utcnow().isoformat()
     conn.execute(
@@ -692,6 +720,46 @@ else:
                 st.warning(f"REST fallback errors: {set(errors)}")
         render_table(fallback_rows, "Cache / REST fallback")
 
+smoke_info = latest_smoke_result(incidents)
+st.subheader("Smoke Test")
+smoke_cols = st.columns([3, 2])
+running_flag = metrics_data.get("smoke_test_running", 0)
+status = "Running" if running_flag else "Idle"
+reason = None
+if smoke_info:
+    code = smoke_info.get("code")
+    if code == "SMOKE_TEST_OK":
+        status = "Completed"
+    elif code == "SMOKE_TEST_ABORT":
+        status = "Aborted"
+        reason = smoke_info.get("reason") or smoke_info.get("payload", {}).get("reason")
+    elif code and code.startswith("SMOKE_TEST"):
+        status = "Error"
+    reason = reason or smoke_info.get("reason")
+with smoke_cols[0]:
+    pnl_val = smoke_info.get("pnl_realized") if smoke_info else None
+    delta_text = f"{pnl_val:,.2f} INR" if pnl_val is not None else None
+    st.metric("Status", status, delta=delta_text)
+    if smoke_info:
+        symbol_hint = smoke_info.get("symbol") or smoke_info.get("instrument_key") or "n/a"
+        entry_val = smoke_info.get("entry_price")
+        exit_val = smoke_info.get("exit_price")
+        entry_notional = smoke_info.get("entry_notional")
+        hold_seconds = smoke_info.get("hold_seconds")
+        st.caption(f"Instrument: `{symbol_hint}` | When: {smoke_info.get('ts')}")
+        st.write(f"Entry: {entry_val if entry_val is not None else 'n/a'} • Exit: {exit_val if exit_val is not None else 'n/a'}")
+        st.write(f"Notional: {entry_notional if entry_notional is not None else 'n/a'} • Hold(s): {hold_seconds if hold_seconds is not None else 'n/a'}")
+        if reason:
+            st.info(f"Last reason: {reason}")
+    else:
+        st.info("No smoke test entries logged yet.")
+with smoke_cols[1]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if st.button("Run Smoke Test Now (1 lot)"):
+            insert_control_intent(conn, run_id, "SMOKE_TEST", {"source": "ui"})
+            st.success("Smoke test intent posted")
+
 st.subheader("Incidents")
 st.dataframe(incidents, use_container_width=True)
 
@@ -702,7 +770,7 @@ else:
     st.write("No PnL snapshots yet.")
 
 st.subheader("Controls")
-ctrl_cols = st.columns(2)
+ctrl_cols = st.columns(3)
 with sqlite3.connect(db_path) as conn:
     conn.row_factory = sqlite3.Row
     if ctrl_cols[0].button("Kill Switch"):
@@ -711,6 +779,9 @@ with sqlite3.connect(db_path) as conn:
     if ctrl_cols[1].button("Square-Off"):
         insert_control_intent(conn, run_id, "SQUARE_OFF", {"source": "ui"})
         st.success("Square-off intent posted")
+    if ctrl_cols[2].button("Start Strategy Loop"):
+        insert_control_intent(conn, run_id, "START_STRATEGY", {"source": "ui"})
+        st.success("Strategy start intent posted")
 
 if auto and fallback_refresh:
     rerun_fn = getattr(st, "experimental_rerun", None)

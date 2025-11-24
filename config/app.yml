@@ -4,9 +4,9 @@ strategy_tag: "intraday-buy"
 
 data:
   index_symbol: "NIFTY"
-  lot_step: 50
+  lot_step: 75
   tick_size: 0.05
-  price_band_low: 10.0
+  price_band_low: 1.0
   price_band_high: 99999.0
   expiry_ttl_minutes: 5
   weekly_expiry_weekday: 3
@@ -21,18 +21,18 @@ data:
   weekly_expiry_weekday: 1  # Tuesday (NSE rule)
 
 market_data:
-  window_steps: 4 # +/- steps around ATM
+  window_steps: 8 # +/- steps around ATM
   option_type: "BOTH" # CE | PE | BOTH
   stream_mode: "full_d30"
   depth_levels: 5  # render top 5 in UI to keep UI light
 
 risk:
-  daily_pnl_stop: -15000
-  per_symbol_loss_stop: -5000
-  max_open_lots: 20
-  notional_premium_cap: 250000
-  no_new_entries_after: "23:32:00"
-  square_off_by: "23:32:00"
+  daily_pnl_stop: -2000        # max you are willing to lose in a day
+  per_symbol_loss_stop: -2000
+  max_open_lots: 1
+  notional_premium_cap: 4000
+  no_new_entries_after: "15:10:00"
+  square_off_by: "15:20:00"
 
 broker:
   max_order_rate: 15
@@ -71,3 +71,11 @@ telemetry:
 
 replay:
   default_speed: 1.0
+
+smoke_test:
+  enabled: true           # turn on for the day
+  underlying: "NIFTY"     # or "BANKNIFTY" later
+  side: "CE"              # start with CALL, you can test PE on another day
+  hold_seconds: 60        # start with 60s, you can bump to 120 later
+  lots: 1
+  max_notional_rupees: 4000

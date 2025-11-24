@@ -7,7 +7,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Sequence, TypeVar
+from typing import Any, Callable, Iterable, List, Optional, Sequence, TypeVar
 
 import upstox_client
 from upstox_client import ApiClient
@@ -31,6 +31,17 @@ class UpstoxConfig:
     algo_name: str = "intraday_buy_engine"
 
 
+@dataclass(frozen=True)
+class PlacedOrder:
+    """Normalized view of PlaceOrderV3Response for backward compatibility."""
+
+    success: bool
+    order_id: Optional[str]
+    status: Optional[str] = None
+    message: Optional[str] = None
+    raw: Any = None
+
+
 T = TypeVar("T")
 
 
@@ -50,7 +61,7 @@ def _kwargs_filtered(instrument_key: str, expiry: str) -> dict[str, str]:
 
 
 def _require_token() -> str:
-    token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTFlOWQxNjdlOWMzYTVhNDM5YjdhMzMiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzNjEzOTc0LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjM2NzYwMDB9.CTEf01BEM-zIaLiaF9kxLjV8LM3X5U9J6cwaGccsqSo").strip()
+    token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTIzYzNhZGRmODMxMjRkNGYyZmE3YzEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzOTUxNTMzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQwMjE2MDB9.6Dr4w8ZaYanBqH6oKMAy0AXhxUMxHg8W1gS2hXYdNfE").strip()
     if not token:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     return token
@@ -70,6 +81,48 @@ def with_retry(fn: Callable[[], T], *, retries: int = 2, base_delay: float = 0.2
             time.sleep(sleep_for)
     assert last_exc is not None
     raise last_exc
+
+
+def normalize_place_order_response(resp: Any) -> PlacedOrder:
+    """Coerce Upstox PlaceOrderV3Response/model/dict into a simple PlacedOrder."""
+
+    if resp is None:
+        return PlacedOrder(False, None, message="empty_response", raw=resp)
+
+    def _as_dict(obj: Any) -> dict:
+        if isinstance(obj, dict):
+            return obj
+        to_dict = getattr(obj, "to_dict", None)
+        if callable(to_dict):
+            try:
+                return to_dict()
+            except Exception:
+                pass
+        if hasattr(obj, "__dict__"):
+            try:
+                return dict(obj.__dict__)
+            except Exception:
+                return {}
+        return {}
+
+    try:
+        payload = _as_dict(resp)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        status = (payload.get("status") if isinstance(payload, dict) else None) or getattr(resp, "status", None)
+        message = payload.get("message") if isinstance(payload, dict) else None
+        order_id = None
+        if isinstance(data, dict):
+            order_id = data.get("order_id") or data.get("orderId")
+        if order_id is None:
+            order_id = payload.get("order_id") if isinstance(payload, dict) else None
+        if order_id is None:
+            order_id = getattr(resp, "order_id", None) or getattr(resp, "orderId", None)
+        success = bool(order_id) or str(status or "").lower() in {"success", "ok", "submitted", "complete", "completed"}
+        order_id_str = str(order_id) if order_id is not None else None
+        status_text = str(status) if status is not None else None
+        return PlacedOrder(success, order_id_str, status=status_text, message=message, raw=payload or resp)
+    except Exception as exc:
+        return PlacedOrder(False, None, message=f"normalize_error:{exc}", raw=resp)
 
 
 class UpstoxSession:
@@ -201,8 +254,10 @@ __all__ = [
     "IST",
     "INDEX_INSTRUMENT_KEYS",
     "InvalidDateError",
+    "PlacedOrder",
     "UpstoxConfig",
     "UpstoxSession",
+    "normalize_place_order_response",
 ]
 class InvalidDateError(Exception):
     """Raised when the broker rejects an expiry parameter."""

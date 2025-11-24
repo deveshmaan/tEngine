@@ -82,6 +82,11 @@ class EngineMetrics:
             self.underlying_last_ts_seconds = _NoOpMetric()
             self.md_subscription_info = _NoOpMetric()
             self.md_last_tick_ts = _NoOpMetric()
+            self.smoke_test_runs_total = _NoOpMetric()
+            self.smoke_test_last_notional_rupees = _NoOpMetric()
+            self.smoke_test_last_ts = _NoOpMetric()
+            self.smoke_test_last_reason = _NoOpMetric()
+            self.smoke_test_running = _NoOpMetric()
             return
         registry_kwargs = {"registry": self._registry} if self._registry is not None else {}
         self.engine_up = Gauge("engine_up", "Engine up status", **registry_kwargs)
@@ -162,6 +167,11 @@ class EngineMetrics:
             ["instrument"],
             **registry_kwargs,
         )
+        self.smoke_test_runs_total = Counter("smoke_test_runs_total", "Smoke test runs", ["status"], **registry_kwargs)
+        self.smoke_test_last_notional_rupees = Gauge("smoke_test_last_notional_rupees", "Last smoke test notional", **registry_kwargs)
+        self.smoke_test_last_ts = Gauge("smoke_test_last_ts", "Epoch seconds of last smoke test", **registry_kwargs)
+        self.smoke_test_last_reason = Gauge("smoke_test_last_reason", "Last smoke test reason marker", ["reason"], **registry_kwargs)
+        self.smoke_test_running = Gauge("smoke_test_running", "Smoke test running flag", **registry_kwargs)
         self.subscription_expiry = Gauge(
             "subscription_expiry",
             "Chosen subscription expiry (0=current, 1=next, 2=monthly)",

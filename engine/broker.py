@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
 
     def set_underlying_last_ts(instrument: str, ts_seconds: float): ...
 
-from brokerage.upstox_client import InvalidDateError, UpstoxConfig, UpstoxSession
+from brokerage.upstox_client import InvalidDateError, PlacedOrder, UpstoxConfig, UpstoxSession, normalize_place_order_response
 from engine.config import BrokerConfig, CONFIG
 from engine.data import normalize_date, pick_subscription_expiry, preopen_expiry_smoke, resolve_expiries_with_fallback
 from engine.logging_utils import get_logger
@@ -391,6 +391,7 @@ class _TickCoalescer:
         self._depth_levels = max(int(depth_levels or 1), 1)
         self._underlyings: dict[str, tuple[float, float]] = {}
         self._options: dict[str, dict[str, Any]] = {}
+        self._last_option_quotes: dict[str, dict[str, Any]] = {}
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
 
@@ -415,7 +416,22 @@ class _TickCoalescer:
         self._underlyings[str(symbol or "").upper()] = (float(ltp), float(ts))
 
     def update_option(self, instrument_key: str, payload: Mapping[str, Any]) -> None:
-        self._options[str(instrument_key or "")] = dict(payload)
+        snapshot = dict(payload)
+        key = str(instrument_key or "")
+        self._options[key] = snapshot
+        self._last_option_quotes[key] = snapshot
+
+    def get_option(self, instrument_key: str) -> Optional[dict[str, Any]]:
+        key = str(instrument_key or "")
+        if not key:
+            return None
+        payload = self._last_option_quotes.get(key)
+        if not payload:
+            return None
+        return dict(payload)
+
+    def snapshot_options(self) -> dict[str, dict[str, Any]]:
+        return {k: dict(v) for k, v in self._last_option_quotes.items()}
 
     async def _run(self) -> None:
         try:
@@ -532,6 +548,21 @@ class UpstoxBroker:
         self._tick_coalescer = _TickCoalescer(depth_levels=depth_levels)
         if self._metrics:
             self._metrics.set_risk_halt_state(0)
+
+    def cached_option_quote(self, instrument_key: str) -> Optional[dict[str, Any]]:
+        if not instrument_key:
+            return None
+        snapshot = self._tick_coalescer.get_option(instrument_key)
+        return dict(snapshot) if snapshot else None
+
+    def cached_option_quotes(self) -> dict[str, dict[str, Any]]:
+        return self._tick_coalescer.snapshot_options()
+
+    def cached_spot(self, symbol: str) -> Optional[float]:
+        sym = str(symbol or "").upper()
+        if not sym:
+            return None
+        return self._last_spot.get(sym)
 
     async def get_spot(self, symbol: str) -> float:
         cache = self.instrument_cache or InstrumentCache.runtime_cache()
@@ -722,8 +753,11 @@ class UpstoxBroker:
             lambda session: session.order_api_v3.place_order(payload, algo_name=session.config.algo_name),
             context=context,
         )
-        broker_id = str(resp.get("data", {}).get("order_id") or resp.get("order_id"))
-        status = resp.get("status") or "submitted"
+        placed = normalize_place_order_response(resp)
+        if not placed.success:
+            raise BrokerError(code="submit_failed", message=placed.message or "place_order_failed")
+        broker_id = str(placed.order_id or "")
+        status = placed.status or "submitted"
         return BrokerOrderAck(broker_order_id=broker_id, status=status)
 
     async def replace_order(self, order: Order, *, price: Optional[float], qty: Optional[int]) -> None:

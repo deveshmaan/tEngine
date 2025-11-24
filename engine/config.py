@@ -318,6 +318,38 @@ class MarketDataConfig:
 
 
 @dataclass(frozen=True)
+class SmokeTestConfig:
+    enabled: bool = False
+    underlying: str = "NIFTY"
+    side: str = "CE"
+    hold_seconds: int = 60
+    lots: int = 1
+    max_notional_rupees: float = 4000.0
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "SmokeTestConfig":
+        try:
+            lots_val = int(payload.get("lots", 1))
+        except (TypeError, ValueError):
+            lots_val = 1
+        try:
+            hold_val = int(payload.get("hold_seconds", 60))
+        except (TypeError, ValueError):
+            hold_val = 60
+        side_val = str(payload.get("side", "CE")).strip().upper() or "CE"
+        if side_val not in {"CE", "PE"}:
+            side_val = "CE"
+        return SmokeTestConfig(
+            enabled=bool(payload.get("enabled", False)),
+            underlying=str(payload.get("underlying", "NIFTY")).upper(),
+            side=side_val,
+            hold_seconds=max(hold_val, 1),
+            lots=max(lots_val, 1),
+            max_notional_rupees=float(payload.get("max_notional_rupees", 4000.0)),
+        )
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     run_id: str
     persistence_path: Path
@@ -330,6 +362,7 @@ class EngineConfig:
     alerts: AlertConfig
     telemetry: TelemetryConfig
     replay: ReplayConfig
+    smoke_test: SmokeTestConfig
 
     @staticmethod
     def load(path: Optional[str | Path] = None) -> "EngineConfig":
@@ -348,6 +381,7 @@ class EngineConfig:
         alerts = AlertConfig.from_dict(raw.get("alerts", {}))
         telemetry = TelemetryConfig.from_dict(raw.get("telemetry", {}))
         replay = ReplayConfig.from_dict(raw.get("replay", {}))
+        smoke_test = SmokeTestConfig.from_dict(raw.get("smoke_test", {}))
         return EngineConfig(
             run_id=run_id,
             persistence_path=persistence_path,
@@ -360,6 +394,7 @@ class EngineConfig:
             alerts=alerts,
             telemetry=telemetry,
             replay=replay,
+            smoke_test=smoke_test,
         )
 
 
@@ -416,4 +451,5 @@ __all__ = [
     "ReplayConfig",
     "RiskLimits",
     "TelemetryConfig",
+    "SmokeTestConfig",
 ]

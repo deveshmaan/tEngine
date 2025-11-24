@@ -11,6 +11,7 @@ from typing import Callable, List, Optional
 
 from dataclasses import replace
 
+from engine import smoke_test
 from engine.alerts import configure_alerts, notify_incident
 from engine.broker import FULL_D30_LIMIT_PER_USER, FullD30Streamer, UpstoxBroker
 from engine.config import EngineConfig, IST
@@ -284,6 +285,7 @@ class EngineApp:
         self._stop = asyncio.Event()
         self._market_task: Optional[asyncio.Task] = None
         self._square_task: Optional[asyncio.Task] = None
+        self._strategy_task: Optional[asyncio.Task] = None
         self._tasks: List[asyncio.Task] = []
         self._full_d30_streamer: Optional[FullD30Streamer] = None
 
@@ -346,16 +348,29 @@ class EngineApp:
             self.logger.warning("FullD30Streamer failed to start: %s", exc)
         await RecoveryManager(self.store, self.oms).reconcile()
         self._square_task = asyncio.create_task(self._square_off_watchdog(), name="square-off")
-        strat_task = asyncio.create_task(self.strategy.run(self._stop), name="strategy-loop")
+        tasks: List[asyncio.Task] = [self._square_task]
         if replay_cfg:
             self._market_task = asyncio.create_task(self._run_replay_source(replay_cfg), name="replay-source")
         else:
             self._market_task = asyncio.create_task(self._live_market_feed(), name="market-feed")
+        if self._market_task:
+            tasks.append(self._market_task)
         fills_task = asyncio.create_task(self._consume_fills(), name="fills-consumer")
         marks_task = asyncio.create_task(self._consume_market_marks(), name="pnl-marks")
         snapshot_task = asyncio.create_task(self._pnl_snapshot_loop(), name="pnl-snapshot")
         control_task = asyncio.create_task(self._watch_control_intents(), name="control-intents")
-        self._tasks = [task for task in [self._square_task, strat_task, self._market_task, fills_task, marks_task, snapshot_task, control_task] if task]
+        tasks.extend([fills_task, marks_task, snapshot_task, control_task])
+        self._tasks = [task for task in tasks if task]
+
+        should_run_smoke = bool(self.cfg.smoke_test.enabled and not _is_dry_run_env() and replay_cfg is None)
+        if should_run_smoke:
+            smoke_task = asyncio.create_task(smoke_test.run_smoke_test_once(self, self.cfg.smoke_test), name="smoke-test-auto")
+            self._tasks.append(smoke_task)
+            try:
+                await smoke_task
+            except Exception as exc:
+                self.logger.log_event(30, "smoke_test_error", error=str(exc))
+        self._start_strategy()
         await self._stop.wait()
         for task in self._tasks:
             task.cancel()
@@ -479,7 +494,27 @@ class EngineApp:
                     await self.trigger_shutdown("control_kill")
                 elif action == "SQUARE_OFF":
                     await self._execute_square_off("CONTROL_SQUARE_OFF")
+                elif action == "START_STRATEGY":
+                    self._start_strategy(source="control_intent")
+                elif action == "SMOKE_TEST":
+                    task = asyncio.create_task(smoke_test.run_smoke_test_once(self, self.cfg.smoke_test), name="smoke-test-intent")
+                    self._tasks.append(task)
             await asyncio.sleep(1.0)
+
+    def _start_strategy(self, source: str = "auto") -> Optional[asyncio.Task]:
+        if self._stop.is_set():
+            return None
+        if self._strategy_task and not self._strategy_task.done():
+            return self._strategy_task
+        task = asyncio.create_task(self.strategy.run(self._stop), name="strategy-loop")
+        self._strategy_task = task
+        if task not in self._tasks:
+            self._tasks.append(task)
+        try:
+            self.logger.log_event(20, "strategy_started", source=source)
+        except Exception:
+            pass
+        return task
 
     def _instrument_meta(self, symbol: str) -> tuple[Optional[str], Optional[float], Optional[str]]:
         meta = self.instrument_resolver.metadata_for(symbol)
@@ -608,6 +643,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--replay-speed", dest="replay_speed", type=float, default=1.0)
     parser.add_argument("--replay-seed", dest="replay_seed", type=int, default=None)
     return parser.parse_args(argv)
+
+
+def _is_dry_run_env() -> bool:
+    return os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "on"}
 
 
 async def main(argv: Optional[List[str]] = None) -> None:
