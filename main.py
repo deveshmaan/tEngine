@@ -6,6 +6,7 @@ import datetime as dt
 import os
 import random
 import signal
+import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -30,9 +31,12 @@ from engine.pnl import Execution as PnLExecution, PnLCalculator
 from engine.recovery import RecoveryManager
 from engine.replay import ReplayConfig, configure_runtime as configure_replay_runtime, replay
 from engine.risk import OrderBudget, RiskManager
+from engine.exit import ExitEngine
 from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 from market.instrument_cache import InstrumentCache
+
+STRATEGY_LOGGER = get_logger("strategy")
 
 try:  # pragma: no cover - optional acceleration
     import uvloop
@@ -51,13 +55,19 @@ class IntradayBuyStrategy:
         risk: RiskManager,
         oms: OMS,
         bus: EventBus,
+        exit_engine: "ExitEngine",
+        instrument_cache: InstrumentCache,
+        metrics: EngineMetrics,
         subscription_expiry_provider: Optional[Callable[[str], str]] = None,
     ):
         self.cfg = config
         self.risk = risk
         self.oms = oms
         self.bus = bus
+        self.exit_engine = exit_engine
         self.logger = get_logger("IntradayStrategy")
+        self.instrument_cache = instrument_cache
+        self.metrics = metrics
         self._subscription_expiry_provider = subscription_expiry_provider
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -78,10 +88,75 @@ class IntradayBuyStrategy:
         if spot is None:
             return
         ts = self._event_ts(event.get("ts"))
+        now = time.time()
+        try:
+            self.metrics.strategy_last_eval_ts.set(now)
+            self.metrics.strategy_evals_total.inc()
+        except Exception:
+            pass
         symbol_hint = payload.get("symbol")
-        await self._maybe_trade(spot, ts, symbol_hint)
+        index_sym = self.cfg.data.index_symbol.upper()
+        if symbol_hint:
+            sym_upper = str(symbol_hint).upper()
+            if sym_upper != index_sym:
+                # Option tick: feed exits and consider entry using option's own price.
+                try:
+                    await self.exit_engine.on_tick(symbol_hint, spot, ts)
+                except Exception:
+                    self.logger.log_event(30, "exit_tick_failed", symbol=symbol_hint)
+                has_intent = await self._maybe_trade(spot, ts, symbol_hint)
+                STRATEGY_LOGGER.info(
+                    "strategy_heartbeat: run=%s underlying=%s instruments=%d has_order_intent=%s",
+                    getattr(self.cfg, "run_id", "n/a"),
+                    index_sym,
+                    1,
+                    bool(has_intent),
+                )
+                return
+        has_intent = await self._maybe_trade(spot, ts, symbol_hint if symbol_hint else None)
+        STRATEGY_LOGGER.info(
+            "strategy_heartbeat: run=%s underlying=%s instruments=%d has_order_intent=%s",
+            getattr(self.cfg, "run_id", "n/a"),
+            index_sym,
+            1,
+            bool(has_intent),
+        )
 
-    async def _maybe_trade(self, spot: float, ts: dt.datetime, symbol_hint: Optional[str]) -> None:
+    async def _maybe_trade(self, spot: float, ts: dt.datetime, symbol_hint: Optional[str]) -> bool:
+        if self.risk.should_halt():
+            await self.exit_engine.handle_risk_halt()
+            return False
+        index_sym = self.cfg.data.index_symbol.upper()
+        if symbol_hint and str(symbol_hint).upper() != index_sym:
+            # Direct option tick – use its own price and lot to keep notional realistic.
+            price = float(spot)
+            if price <= 0:
+                return False
+            lot_size = self._resolve_lot_for_symbol(symbol_hint)
+            if price * lot_size > self.cfg.risk.notional_premium_cap:
+                return False
+            budget = OrderBudget(symbol=symbol_hint, qty=lot_size, price=price, lot_size=lot_size, side="BUY")
+            self.risk.on_tick(symbol_hint, price)
+            if not self.risk.budget_ok_for(budget):
+                return False
+            try:
+                await self.oms.submit(
+                    strategy=self.cfg.strategy_tag,
+                    symbol=symbol_hint,
+                    side="BUY",
+                    qty=budget.qty,
+                    order_type="MARKET",
+                    limit_price=budget.price,
+                    ts=ts,
+                )
+            except OrderValidationError as exc:
+                self.logger.log_event(30, "order_validation_failed", symbol=symbol_hint, code=exc.code, message=str(exc))
+                return False
+            except Exception as exc:
+                self.logger.log_event(40, "order_submit_failed", symbol=symbol_hint, error=str(exc))
+                return False
+            self.logger.log_event(20, "submitted", symbol=symbol_hint, price=budget.price)
+            return True
         symbol_root = self.cfg.data.index_symbol
         preference = getattr(self.cfg.data, "subscription_expiry_preference", "current")
         expiry_str: Optional[str] = None
@@ -111,7 +186,7 @@ class IntradayBuyStrategy:
         budget = OrderBudget(symbol=symbol, qty=lot_size, price=spot, lot_size=lot_size, side="BUY")
         self.risk.on_tick(symbol, spot)
         if not self.risk.budget_ok_for(budget):
-            return
+            return False
         try:
             await self.oms.submit(
                 strategy=self.cfg.strategy_tag,
@@ -124,11 +199,12 @@ class IntradayBuyStrategy:
             )
         except OrderValidationError as exc:
             self.logger.log_event(30, "order_validation_failed", symbol=symbol, code=exc.code, message=str(exc))
-            return
+            return False
         except Exception as exc:
             self.logger.log_event(40, "order_submit_failed", symbol=symbol, error=str(exc))
-            return
+            return False
         self.logger.log_event(20, "submitted", symbol=symbol, price=budget.price)
+        return True
 
     def _event_ts(self, value: Optional[str]) -> dt.datetime:
         return _parse_ts(value, IST)
@@ -155,6 +231,36 @@ class IntradayBuyStrategy:
             except (TypeError, ValueError):
                 pass
         return lot
+
+    def _resolve_lot_for_symbol(self, symbol: str) -> int:
+        """Best-effort lot size resolution for a fully qualified option symbol."""
+
+        lot = max(int(self.cfg.data.lot_step), 1)
+        parts = symbol.split("-")
+        if len(parts) < 3:
+            return lot
+        expiry = "-".join(parts[1:-1])
+        tail = parts[-1]
+        opt_type = tail[-2:] if tail[-2:] in {"CE", "PE"} else "CE"
+        strike_part = tail[:-2] if opt_type in {"CE", "PE"} else tail
+        try:
+            strike = float(strike_part)
+        except ValueError:
+            strike = None
+        cache = self.instrument_cache
+        try:
+            meta = cache.get_meta(self.cfg.data.index_symbol, expiry)
+            if isinstance(meta, tuple) and len(meta) >= 2 and meta[1]:
+                lot = int(meta[1])
+        except Exception:
+            pass
+        if strike is not None:
+            try:
+                contract = cache.get_contract(self.cfg.data.index_symbol, expiry, strike, opt_type)
+                lot = int(contract.get("lot_size") or lot)
+            except Exception:
+                pass
+        return max(lot, 1)
 
     def _choose_subscription_expiry(self, symbol: str) -> str:
         preference = getattr(self.cfg.data, "subscription_expiry_preference", "current")
@@ -276,8 +382,23 @@ class EngineApp:
         self.broker.bind_reconcile_callback(self.oms.reconcile_from_broker)
         self.broker.bind_square_off_callback(self._execute_square_off)
         self.broker.bind_shutdown_callback(self.trigger_shutdown)
+        self.exit_engine = ExitEngine(
+            config=config.exit,
+            risk=self.risk,
+            oms=self.oms,
+            store=self.store,
+            tick_size=config.data.tick_size,
+            metrics=self.metrics,
+        )
         self.strategy = IntradayBuyStrategy(
-            config, self.risk, self.oms, self.bus, subscription_expiry_provider=self._subscription_expiry_for
+            config,
+            self.risk,
+            self.oms,
+            self.bus,
+            self.exit_engine,
+            self.instrument_cache,
+            self.metrics,
+            subscription_expiry_provider=self._subscription_expiry_for,
         )
         self.fee_config = load_fee_config()
         self.pnl = PnLCalculator(self.store, self.fee_config)
@@ -347,6 +468,17 @@ class EngineApp:
         except Exception as exc:
             self.logger.warning("FullD30Streamer failed to start: %s", exc)
         await RecoveryManager(self.store, self.oms).reconcile()
+        for pos in self.store.list_open_positions():
+            try:
+                self.exit_engine.on_fill(
+                    symbol=pos["symbol"],
+                    side="BUY",
+                    qty=int(pos.get("qty") or 0),
+                    price=float(pos.get("avg_price") or 0.0),
+                    ts=pos.get("opened_at") or engine_now(IST),
+                )
+            except Exception:
+                self.logger.log_event(30, "exit_plan_reseed_failed", symbol=pos.get("symbol"))
         self._square_task = asyncio.create_task(self._square_off_watchdog(), name="square-off")
         tasks: List[asyncio.Task] = [self._square_task]
         if replay_cfg:
@@ -446,6 +578,16 @@ class EngineApp:
                 continue
             self.pnl.on_execution(exec_obj)
             self.metrics.fills_total.inc()
+            try:
+                self.exit_engine.on_fill(
+                    symbol=exec_obj.symbol,
+                    side=exec_obj.side,
+                    qty=exec_obj.qty,
+                    price=exec_obj.price,
+                    ts=exec_obj.ts,
+                )
+            except Exception:
+                self.logger.log_event(30, "exit_plan_seed_failed", symbol=exec_obj.symbol)
 
     async def _consume_market_marks(self) -> None:
         queue = await self.bus.subscribe("market/events", maxsize=500)
@@ -491,6 +633,7 @@ class EngineApp:
                 if action == "KILL":
                     self.risk.trigger_kill("CONTROL_KILL")
                     notify_incident("WARN", "Kill switch intent", "Control intent requested halt")
+                    await self.exit_engine.handle_risk_halt("CONTROL_KILL")
                     await self.trigger_shutdown("control_kill")
                 elif action == "SQUARE_OFF":
                     await self._execute_square_off("CONTROL_SQUARE_OFF")
@@ -562,7 +705,23 @@ class EngineApp:
 
     async def _execute_square_off(self, reason: str) -> None:
         now = engine_now(IST)
-        for budget in self.risk.square_off_all(reason):
+        budgets = self.risk.square_off_all(reason)
+        if not budgets:
+            budgets = []
+            for pos in self.store.list_open_positions():
+                qty = int(pos.get("qty") or 0)
+                if qty <= 0:
+                    continue
+                budgets.append(
+                    OrderBudget(
+                        symbol=pos["symbol"],
+                        qty=qty,
+                        price=float(pos.get("avg_price") or 0.0),
+                        lot_size=max(self.cfg.data.lot_step, 1),
+                        side="SELL",
+                    )
+                )
+        for budget in budgets:
             await self.oms.submit(
                 strategy=self.cfg.strategy_tag,
                 symbol=budget.symbol,
@@ -572,6 +731,12 @@ class EngineApp:
                 limit_price=budget.price,
                 ts=now,
             )
+        try:
+            self.exit_engine.clear_all_plans()
+            if self.metrics:
+                self.metrics.exit_events_total.labels(reason="SQUARE_OFF").inc()
+        except Exception:
+            pass
 
     async def _run_replay_source(self, cfg: ReplayConfig) -> None:
         try:

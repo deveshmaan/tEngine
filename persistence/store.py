@@ -242,6 +242,112 @@ class SQLiteStore:
             )
             self._conn.commit()
 
+    def load_open_position(self, instrument: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                SELECT qty, avg_price, opened_at, closed_at, expiry, strike, opt_type
+                FROM positions
+                WHERE run_id=? AND symbol=? AND (closed_at IS NULL OR closed_at='')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (self.run_id, instrument),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            opened_at = dt.datetime.fromisoformat(row["opened_at"])
+        except Exception:
+            opened_at = None
+        try:
+            closed_at = dt.datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None
+        except Exception:
+            closed_at = None
+        return {
+            "qty": row["qty"],
+            "avg_price": row["avg_price"],
+            "opened_at": opened_at,
+            "closed_at": closed_at,
+            "expiry": row["expiry"],
+            "strike": row["strike"],
+            "opt_type": row["opt_type"],
+        }
+
+    def list_open_positions(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                SELECT symbol, qty, avg_price, opened_at, expiry, strike, opt_type
+                FROM positions
+                WHERE run_id=? AND (closed_at IS NULL OR closed_at='') AND ABS(qty) > 0
+                """,
+                (self.run_id,),
+            )
+            rows = cur.fetchall()
+        positions: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                opened_at = dt.datetime.fromisoformat(row["opened_at"]) if row["opened_at"] else None
+            except Exception:
+                opened_at = None
+            positions.append(
+                {
+                    "symbol": row["symbol"],
+                    "qty": row["qty"],
+                    "avg_price": row["avg_price"],
+                    "opened_at": opened_at,
+                    "expiry": row["expiry"],
+                    "strike": row["strike"],
+                    "opt_type": row["opt_type"],
+                }
+            )
+        return positions
+
+    def upsert_exit_plan(self, instrument: str, plan: Dict[str, Any], ts: Optional[dt.datetime] = None) -> None:
+        payload = self._json(plan) or "{}"
+        with self._lock:
+            stamp = self._ts(ts)
+            self._conn.execute(
+                """
+                INSERT INTO exit_plans(run_id, instrument, plan_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(run_id, instrument) DO UPDATE SET
+                    plan_json=excluded.plan_json,
+                    updated_at=excluded.updated_at
+                """,
+                (self.run_id, instrument, payload, stamp),
+            )
+            self._conn.commit()
+
+    def load_exit_plan(self, instrument: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT plan_json FROM exit_plans WHERE run_id=? AND instrument=?",
+                (self.run_id, instrument),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["plan_json"] or "{}")
+        except Exception:
+            return None
+
+    def delete_exit_plan(self, instrument: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM exit_plans WHERE run_id=? AND instrument=?",
+                (self.run_id, instrument),
+            )
+            self._conn.commit()
+
+    def clear_exit_plans(self) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM exit_plans WHERE run_id=?", (self.run_id,))
+            self._conn.commit()
+
     def insert_control_intent(self, action: str, payload: Optional[Dict[str, Any]] = None, ts: Optional[dt.datetime] = None) -> None:
         with self._lock:
             stamp = self._ts(ts)

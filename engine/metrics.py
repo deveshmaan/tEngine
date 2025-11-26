@@ -54,6 +54,7 @@ class EngineMetrics:
             self.fills_total = self.orders_filled_total
             self.rejects_total = self.orders_rejected_total
             self.order_latency_ms_bucketed = _NoOpMetric()
+            self.exit_events_total = _NoOpMetric()
             self.http_401_total = _NoOpMetric()
             self.rest_retries_total = _NoOpMetric()
             self.ws_reconnects_total = _NoOpMetric()
@@ -82,6 +83,8 @@ class EngineMetrics:
             self.underlying_last_ts_seconds = _NoOpMetric()
             self.md_subscription_info = _NoOpMetric()
             self.md_last_tick_ts = _NoOpMetric()
+            self.strategy_last_eval_ts = _NoOpMetric()
+            self.strategy_evals_total = _NoOpMetric()
             self.smoke_test_runs_total = _NoOpMetric()
             self.smoke_test_last_notional_rupees = _NoOpMetric()
             self.smoke_test_last_ts = _NoOpMetric()
@@ -107,6 +110,7 @@ class EngineMetrics:
         self.fills_total = self.orders_filled_total
         self.rejects_total = self.orders_rejected_total
         self.order_latency_ms_bucketed = Histogram("order_latency_ms_bucketed", "Order latency histogram", ["operation"], **registry_kwargs)
+        self.exit_events_total = Counter("exit_events_total", "Exit triggers fired", ["reason"], **registry_kwargs)
         self.http_401_total = Counter("http_401_total", "HTTP 401 responses", **registry_kwargs)
         self.rest_retries_total = Counter("rest_retries_total", "REST retries", ["endpoint"], **registry_kwargs)
         self.ws_reconnects_total = Counter("ws_reconnects_total", "WS reconnect attempts", **registry_kwargs)
@@ -185,6 +189,8 @@ class EngineMetrics:
             **registry_kwargs,
         )
         self.md_last_tick_ts = Gauge("md_last_tick_ts", "Epoch seconds of last processed tick", ["instrument"], **registry_kwargs)
+        self.strategy_last_eval_ts = Gauge("strategy_last_eval_ts", "Epoch seconds of last strategy evaluation", **registry_kwargs)
+        self.strategy_evals_total = Counter("strategy_evals_total", "Total number of strategy evaluations", **registry_kwargs)
 
     def beat(self) -> None:
         self.heartbeat_ts.set(time.time())

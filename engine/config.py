@@ -350,6 +350,41 @@ class SmokeTestConfig:
 
 
 @dataclass(frozen=True)
+class ExitConfig:
+    stop_pct: float = 0.25
+    target1_pct: float = 0.5
+    partial_fraction: float = 0.5
+    trail_lock_pct: float = 0.4
+    trail_giveback_pct: float = 0.5
+    min_trail_ticks: int = 3
+    max_holding_minutes: int = 20
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "ExitConfig":
+        def _coerce_float(key: str, default: float) -> float:
+            try:
+                return float(payload.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _coerce_int(key: str, default: int) -> int:
+            try:
+                return int(payload.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        return ExitConfig(
+            stop_pct=_coerce_float("stop_pct", 0.25),
+            target1_pct=_coerce_float("target1_pct", 0.5),
+            partial_fraction=_coerce_float("partial_fraction", 0.5),
+            trail_lock_pct=_coerce_float("trail_lock_pct", 0.4),
+            trail_giveback_pct=_coerce_float("trail_giveback_pct", 0.5),
+            min_trail_ticks=_coerce_int("min_trail_ticks", 3),
+            max_holding_minutes=_coerce_int("max_holding_minutes", 20),
+        )
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     run_id: str
     persistence_path: Path
@@ -363,6 +398,7 @@ class EngineConfig:
     telemetry: TelemetryConfig
     replay: ReplayConfig
     smoke_test: SmokeTestConfig
+    exit: ExitConfig
 
     @staticmethod
     def load(path: Optional[str | Path] = None) -> "EngineConfig":
@@ -382,6 +418,7 @@ class EngineConfig:
         telemetry = TelemetryConfig.from_dict(raw.get("telemetry", {}))
         replay = ReplayConfig.from_dict(raw.get("replay", {}))
         smoke_test = SmokeTestConfig.from_dict(raw.get("smoke_test", {}))
+        exit_cfg = ExitConfig.from_dict(raw.get("exit", {}))
         return EngineConfig(
             run_id=run_id,
             persistence_path=persistence_path,
@@ -395,6 +432,7 @@ class EngineConfig:
             telemetry=telemetry,
             replay=replay,
             smoke_test=smoke_test,
+            exit=exit_cfg,
         )
 
 
@@ -447,6 +485,7 @@ __all__ = [
     "MarketDataConfig",
     "OMSConfig",
     "OMSSubmitConfig",
+    "ExitConfig",
     "read_config",
     "ReplayConfig",
     "RiskLimits",

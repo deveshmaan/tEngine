@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-from engine.config import EngineConfig, IST, SmokeTestConfig
+from engine.config import EngineConfig, ExitConfig, IST, SmokeTestConfig
 from engine.data import resolve_weekly_expiry
+from engine.exit import ExitEngine
 from engine.logging_utils import get_logger
 from engine.oms import FINAL_STATES, OrderState
 from engine.risk import OrderBudget
@@ -38,6 +40,67 @@ class SelectedContract:
     opt_type: str
     mid_price: float
     notional: float
+
+
+@dataclass
+class SmokeTestState:
+    entry_fill_price: Optional[float] = None
+    entry_qty: int = 0
+    entry_ts: Optional[dt.datetime] = None
+    exit_order_id: Optional[str] = None
+    exit_manager: Optional[ExitEngine] = None
+    exit_reason: Optional[str] = None
+
+
+def make_smoke_exit_config(entry_price: Optional[float], tick_size: float) -> ExitConfig:
+    base = entry_price if entry_price and entry_price > 0 else max(tick_size * 20.0, 40.0)
+    max_loss_rupees = 40.0
+    target_rupees = 40.0
+    stop_pct = min(max_loss_rupees / max(base, 1.0), 0.99)
+    target_pct = min(target_rupees / max(base, 1.0), 1.0)
+    max_hold_minutes = max(int(round(180 / 60)), 1)
+    return ExitConfig(
+        stop_pct=stop_pct,
+        target1_pct=target_pct,
+        partial_fraction=1.0,
+        trail_lock_pct=0.5,
+        trail_giveback_pct=0.5,
+        min_trail_ticks=1,
+        max_holding_minutes=max_hold_minutes,
+    )
+
+
+class SmokeExitEngine(ExitEngine):
+    """ExitEngine variant that exposes submitted order ids for smoke test bookkeeping."""
+
+    def __init__(self, submit_hook: Optional[Callable[[Any, str], None]], **kwargs: Any):
+        super().__init__(**kwargs)
+        self._submit_hook = submit_hook
+
+    async def _submit_exit_order(self, instrument: str, qty: int, ltp: float, ts: dt.datetime, reason: str) -> None:  # type: ignore[override]
+        qty = int(abs(qty))
+        if qty <= 0:
+            return
+        try:
+            order = await self.oms.submit(
+                strategy="exit",
+                symbol=instrument,
+                side="SELL",
+                qty=qty,
+                order_type="MARKET",
+                limit_price=ltp,
+                ts=ts,
+            )
+            if self._submit_hook:
+                try:
+                    self._submit_hook(order, reason)
+                except Exception:
+                    pass
+            if self._metrics:
+                self._metrics.exit_events_total.labels(reason=reason).inc()
+            self._logger.log_event(20, "exit_submit", symbol=instrument, qty=qty, price=ltp, reason=reason)
+        except Exception as exc:  # pragma: no cover - fail-safe
+            self._logger.log_event(30, "exit_submit_failed", symbol=instrument, qty=qty, price=ltp, reason=reason, error=str(exc))
 
 
 def _is_dry_run() -> bool:
@@ -190,6 +253,10 @@ def select_affordable_contract(app_ctx: Any, cfg: EngineConfig) -> Optional[Sele
                 quote = None
         if not quote:
             continue
+        bid = _coerce_float(quote.get("bid"))
+        ask = _coerce_float(quote.get("ask"))
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            continue
         mid = _mid_price(quote)
         if mid is None or mid <= 0:
             continue
@@ -239,6 +306,7 @@ async def _await_quote(broker: Any, instrument_key: str, *, logger: Any, timeout
 
 async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[SmokeTestResult]:
     logger = getattr(app_ctx, "logger", get_logger("SmokeTest"))
+    state = SmokeTestState()
     if getattr(app_ctx, "_smoke_test_running", False):
         logger.log_event(20, "smoke_test_skip", reason="in_progress")
         return None
@@ -277,7 +345,7 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
         store = getattr(app_ctx, "store", None)
         config = getattr(app_ctx, "cfg", None)
 
-        if not broker or not risk or not oms or not cache or not config:
+        if not broker or not risk or not oms or not cache or not config or not store:
             _record_abort(logger, store, meter, "missing_ctx")
             return None
 
@@ -317,12 +385,16 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
         strike = selected.strike
 
         tick_size = float(getattr(config.data, "tick_size", 0.05) or 0.05)
+        band_low = _coerce_float(getattr(config.data, "price_band_low", None)) or 0.0
+        band_high = _coerce_float(getattr(config.data, "price_band_high", None)) or 0.0
         try:
             contract_meta = cache.get_contract(cfg.smoke_test.underlying, expiry, strike, cfg.smoke_test.side)
         except Exception:
             contract_meta = None
         if contract_meta:
             tick_size = _coerce_float(contract_meta.get("tick_size")) or tick_size
+            band_low = _coerce_float(contract_meta.get("band_low")) or band_low
+            band_high = _coerce_float(contract_meta.get("band_high")) or band_high
         else:
             try:
                 meta = cache.get_meta(instrument_key)
@@ -330,6 +402,8 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
                 meta = None
             if meta:
                 tick_size = _coerce_float(getattr(meta, "tick_size", None)) or tick_size
+                band_low = _coerce_float(getattr(meta, "price_band_low", None)) or band_low
+                band_high = _coerce_float(getattr(meta, "price_band_high", None)) or band_high
 
         quote = await _await_quote(broker, instrument_key, logger=logger, timeout=5.0)
         if not quote:
@@ -338,6 +412,10 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
 
         bid = _coerce_float(quote.get("bid"))
         ask = _coerce_float(quote.get("ask"))
+        if bid is not None and bid <= 0:
+            bid = None
+        if ask is not None and ask <= 0:
+            ask = None
         ltp = _coerce_float(quote.get("ltp"))
         depth = quote.get("depth") or {}
         bids = depth.get("bids") or []
@@ -347,6 +425,12 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
 
         if bid is None or ask is None:
             _record_abort(logger, store, meter, "no_liquidity", instrument_key=instrument_key)
+            return None
+        if band_low and ask < band_low:
+            _record_abort(logger, store, meter, "price_band_low", ask=ask, band_low=band_low)
+            return None
+        if band_high and band_high > 0 and ask > band_high:
+            _record_abort(logger, store, meter, "price_band_high", ask=ask, band_high=band_high)
             return None
 
         spread = ask - bid
@@ -363,9 +447,11 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
             return None
 
         qty = lot_size * lots
+        if ltp is not None and ltp <= 0:
+            ltp = None
         price_ref = ask if ask is not None else ltp
-        if price_ref is None:
-            _record_abort(logger, store, meter, "no_price")
+        if price_ref is None or price_ref <= 0:
+            _record_abort(logger, store, meter, "no_price", price=price_ref)
             return None
         notional = float(price_ref) * qty
         if notional > max_notional:
@@ -402,50 +488,179 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
             return None
 
         entry_price = entry_order.avg_fill_price or price_ref
+        state.entry_fill_price = entry_price
+        state.entry_qty = qty
+        state.entry_ts = ts_now
         if store:
             store.record_incident(
                 "SMOKE_TEST_FILLED",
                 {"symbol": symbol, "instrument_key": instrument_key, "qty": qty, "price": entry_price},
                 ts=ts_now,
             )
+            try:
+                store.upsert_position(
+                    symbol=symbol,
+                    expiry=expiry,
+                    strike=strike,
+                    opt_type=cfg.side,
+                    qty=qty,
+                    avg_price=entry_price,
+                    opened_at=ts_now,
+                    closed_at=None,
+                )
+            except Exception:
+                pass
         logger.log_event(20, "smoke_test_filled", symbol=symbol, instrument_key=instrument_key, qty=qty, price=entry_price)
-
-        await asyncio.sleep(max(int(cfg.hold_seconds), 10))
-
-        exit_quote = quote
         try:
-            fresh = broker.cached_option_quote(instrument_key)
-            if fresh:
-                exit_quote = fresh
+            risk.on_fill(symbol=symbol, side="BUY", qty=qty, price=entry_price, lot_size=lot_size)
         except Exception:
             pass
 
-        bid_exit = _coerce_float(exit_quote.get("bid")) if exit_quote else None
-        ask_exit = _coerce_float(exit_quote.get("ask")) if exit_quote else None
-        ltp_exit = _coerce_float(exit_quote.get("ltp")) if exit_quote else None
-        depth_exit = exit_quote.get("depth") if exit_quote else {}
-        bids_exit = depth_exit.get("bids") if isinstance(depth_exit, dict) else []
-        asks_exit = depth_exit.get("asks") if isinstance(depth_exit, dict) else []
-        bid_qty_exit = _best_depth_qty(bids_exit if isinstance(bids_exit, list) else [], "SELL")
-        ask_qty_exit = _best_depth_qty(asks_exit if isinstance(asks_exit, list) else [], "BUY")
-        oms.update_market_depth(symbol, bid=bid_exit or bid or 0.0, ask=ask_exit or ask or 0.0, bid_qty=int(bid_qty_exit), ask_qty=int(ask_qty_exit))
+        exit_cfg = make_smoke_exit_config(entry_price, tick_size)
+        exit_window_seconds = max(int(cfg.hold_seconds), exit_cfg.max_holding_minutes * 60)
+        exit_deadline = time.monotonic() + exit_window_seconds
 
-        exit_price_hint = bid_exit if bid_exit is not None else ltp_exit or bid
-        exit_order = await oms.submit(
-            strategy=getattr(config, "strategy_tag", "smoke_test"),
-            symbol=symbol,
-            side="SELL",
-            qty=qty,
-            order_type="MARKET",
-            limit_price=float(exit_price_hint) if exit_price_hint is not None else None,
-            ts=engine_now(IST),
+        def _capture_exit(order: Any, reason: str) -> None:
+            state.exit_order_id = getattr(order, "client_order_id", None)
+            state.exit_reason = reason
+            logger.log_event(
+                20,
+                "smoke_test_exit_submitted",
+                symbol=symbol,
+                instrument_key=instrument_key,
+                qty=qty,
+                price=getattr(order, "limit_price", None),
+                reason=reason,
+            )
+            if store:
+                try:
+                    store.record_incident(
+                        "SMOKE_TEST_EXIT_SUBMIT",
+                        {
+                            "symbol": symbol,
+                            "instrument_key": instrument_key,
+                            "qty": qty,
+                            "price": getattr(order, "limit_price", None),
+                            "reason": reason,
+                        },
+                        ts=engine_now(IST),
+                    )
+                except Exception:
+                    pass
+
+        exit_manager = SmokeExitEngine(
+            submit_hook=_capture_exit,
+            config=exit_cfg,
+            risk=risk,
+            oms=oms,
+            store=store,
+            tick_size=tick_size,
+            metrics=meter,
         )
-        exit_order = await _wait_for_final_state(app_ctx, exit_order.client_order_id)
+        state.exit_manager = exit_manager
+        exit_manager.on_fill(symbol=symbol, side="BUY", qty=qty, price=entry_price, ts=ts_now)
+
+        exit_order = None
+        last_quote = quote
+        while time.monotonic() < exit_deadline and not state.exit_order_id:
+            now_ts = engine_now(IST)
+            try:
+                live_quote = broker.cached_option_quote(instrument_key)
+            except Exception:
+                live_quote = None
+            if live_quote:
+                last_quote = live_quote
+            ltp_exit = _coerce_float((live_quote or last_quote or {}).get("ltp")) if (live_quote or last_quote) else None
+            bid_exit = _coerce_float((live_quote or last_quote or {}).get("bid")) if (live_quote or last_quote) else None
+            ask_exit = _coerce_float((live_quote or last_quote or {}).get("ask")) if (live_quote or last_quote) else None
+            if ltp_exit is None and (live_quote or last_quote):
+                ltp_exit = _mid_price(live_quote or last_quote)
+            if ltp_exit is None:
+                ltp_exit = bid_exit if bid_exit is not None else ask_exit
+            if ltp_exit is not None and ltp_exit > 0 and state.exit_manager and state.entry_qty > 0:
+                await state.exit_manager.on_tick(symbol, ltp_exit, now_ts)
+            await asyncio.sleep(1.0)
+
+        if state.exit_order_id:
+            remaining = max(exit_deadline - time.monotonic(), 1.0)
+            exit_order = await _wait_for_final_state(app_ctx, state.exit_order_id, timeout=remaining)
+            if not exit_order and oms:
+                exit_order = oms.get_order(state.exit_order_id)
+
+        if not state.exit_order_id or not exit_order or (exit_order and exit_order.state in FINAL_STATES and exit_order.state != OrderState.FILLED):
+            fallback_quote = last_quote or {}
+            bid_exit = _coerce_float(fallback_quote.get("bid"))
+            ask_exit = _coerce_float(fallback_quote.get("ask"))
+            ltp_exit = _coerce_float(fallback_quote.get("ltp"))
+            if bid_exit is not None and bid_exit <= 0:
+                bid_exit = None
+            if ask_exit is not None and ask_exit <= 0:
+                ask_exit = None
+            if ltp_exit is not None and ltp_exit <= 0:
+                ltp_exit = None
+            exit_price_hint = bid_exit if bid_exit is not None else ltp_exit or ask_exit or bid or price_ref
+            fallback_reason = state.exit_reason or ("exit_" + str(getattr(exit_order.state, "value", "fallback")).lower() if exit_order else "manual_timeout")
+            exit_order = await oms.submit(
+                strategy=getattr(config, "strategy_tag", "smoke_test"),
+                symbol=symbol,
+                side="SELL",
+                qty=qty,
+                order_type="MARKET",
+                limit_price=float(exit_price_hint) if exit_price_hint is not None else None,
+                ts=engine_now(IST),
+            )
+            state.exit_order_id = exit_order.client_order_id
+            state.exit_reason = fallback_reason
+            logger.log_event(
+                20,
+                "smoke_test_exit_submitted",
+                symbol=symbol,
+                instrument_key=instrument_key,
+                qty=qty,
+                price=getattr(exit_order, "limit_price", None),
+                reason=state.exit_reason,
+            )
+            if store:
+                try:
+                    store.record_incident(
+                        "SMOKE_TEST_EXIT_SUBMIT",
+                        {"symbol": symbol, "instrument_key": instrument_key, "qty": qty, "price": exit_price_hint, "reason": state.exit_reason},
+                        ts=engine_now(IST),
+                    )
+                except Exception:
+                    pass
+            exit_order = await _wait_for_final_state(app_ctx, state.exit_order_id, timeout=5.0)
+
         if not exit_order or exit_order.state != OrderState.FILLED:
             _record_abort(logger, store, meter, "exit_not_filled", state=str(getattr(exit_order, "state", "missing")))
             return None
 
-        exit_price = exit_order.avg_fill_price or exit_price_hint or entry_price
+        exit_price = exit_order.avg_fill_price or getattr(exit_order, "limit_price", None) or state.entry_fill_price or price_ref
+        closed_ts = engine_now(IST)
+        if state.exit_manager:
+            try:
+                state.exit_manager.on_fill(symbol=symbol, side="SELL", qty=qty, price=exit_price, ts=closed_ts)
+            except Exception:
+                pass
+        try:
+            risk.on_fill(symbol=symbol, side="SELL", qty=qty, price=exit_price or entry_price, lot_size=lot_size)
+        except Exception:
+            pass
+
+        if store:
+            try:
+                store.upsert_position(
+                    symbol=symbol,
+                    expiry=expiry,
+                    strike=strike,
+                    opt_type=cfg.side,
+                    qty=0,
+                    avg_price=exit_price or entry_price,
+                    opened_at=state.entry_ts or ts_now,
+                    closed_at=closed_ts,
+                )
+            except Exception:
+                pass
 
         await asyncio.sleep(0.1)
         flat = True
@@ -474,11 +689,13 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
         if pnl_realized is None and exit_price is not None and entry_price is not None:
             pnl_realized = (exit_price - entry_price) * qty
 
+        hold_elapsed = int((closed_ts - state.entry_ts).total_seconds()) if state.entry_ts else int(exit_window_seconds)
+        reason_label = state.exit_reason or "ok"
         payload = {
             "entry_price": entry_price,
             "exit_price": exit_price,
             "pnl_realized": pnl_realized,
-            "hold_seconds": int(cfg.hold_seconds),
+            "hold_seconds": hold_elapsed,
             "instrument_key": instrument_key,
             "expiry": expiry,
             "strike": strike,
@@ -487,15 +704,16 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
             "lots": lots,
             "lot_size": lot_size,
             "entry_notional": selected.notional,
+            "exit_reason": state.exit_reason,
         }
         if store:
-            store.record_incident("SMOKE_TEST_OK", payload, ts=engine_now(IST))
+            store.record_incident("SMOKE_TEST_OK", payload, ts=closed_ts)
         logger.log_event(20, "smoke_test_done", **payload)
         if meter:
             try:
                 meter.smoke_test_runs_total.labels(status="ok").inc()
                 meter.smoke_test_last_notional_rupees.set(selected.notional)
-                meter.smoke_test_last_reason.labels(reason="ok").set(1)
+                meter.smoke_test_last_reason.labels(reason=reason_label).set(1)
                 meter.smoke_test_last_ts.set(time.time())
                 meter.smoke_test_running.set(0)
             except Exception:
@@ -511,6 +729,7 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
             strike=strike,
             side=cfg.side,
             status="completed",
+            reason=state.exit_reason,
         )
         return result
     except Exception as exc:

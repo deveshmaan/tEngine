@@ -49,8 +49,18 @@
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[{"expr":"sum by (code) (increase(api_errors_total[15m]))","refId":"A"}]
     },
+    { "type":"stat","title":"Strategy Lag (s)","gridPos":{"x":0,"y":9,"w":4,"h":3},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"s","decimals":1,"thresholds":{"mode":"absolute","steps":[{"color":"green"},{"color":"yellow","value":2},{"color":"red","value":5}]}}},
+      "targets":[{"expr":"time() - strategy_last_eval_ts","refId":"A"}]
+    },
+    { "type":"stat","title":"Strategy evals / min","gridPos":{"x":4,"y":9,"w":4,"h":3},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"ops","decimals":0,"thresholds":{"mode":"absolute","steps":[{"color":"red","value":0},{"color":"green","value":1}]}}},
+      "targets":[{"expr":"sum(rate(strategy_evals_total[5m])) * 60","refId":"A"}]
+    },
 
-    { "type":"table","title":"Tick Freshness & Spread","gridPos":{"x":0,"y":9,"w":24,"h":8},
+    { "type":"table","title":"Tick Freshness & Spread","gridPos":{"x":0,"y":12,"w":24,"h":8},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "options":{"showHeader":true},
       "targets":[
@@ -59,28 +69,28 @@
       ]
     },
 
-    { "type":"timeseries","title":"Spread (ticks)","gridPos":{"x":0,"y":17,"w":12,"h":6},
+    { "type":"timeseries","title":"Spread (ticks)","gridPos":{"x":0,"y":20,"w":12,"h":6},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[{"expr":"option_spread_ticks","legendFormat":"{{instrument_key}}","refId":"A"}]
     },
-    { "type":"timeseries","title":"OB Imbalance (Top10)","gridPos":{"x":12,"y":17,"w":12,"h":6},
+    { "type":"timeseries","title":"OB Imbalance (Top10)","gridPos":{"x":12,"y":20,"w":12,"h":6},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[{"expr":"orderbook_imbalance_10","legendFormat":"{{instrument_key}}","refId":"A"}]
     },
 
-    { "type":"timeseries","title":"Orders vs Fills","gridPos":{"x":0,"y":23,"w":12,"h":6},
+    { "type":"timeseries","title":"Orders vs Fills","gridPos":{"x":0,"y":26,"w":12,"h":6},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[
         {"expr":"sum(rate(orders_submitted_total[5m]))","legendFormat":"submitted","refId":"A"},
         {"expr":"sum(rate(orders_filled_total[5m]))","legendFormat":"filled","refId":"B"}
       ]
     },
-    { "type":"timeseries","title":"Rejected Orders (by reason)","gridPos":{"x":12,"y":23,"w":12,"h":6},
+    { "type":"timeseries","title":"Rejected Orders (by reason)","gridPos":{"x":12,"y":26,"w":12,"h":6},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[{"expr":"sum(rate(orders_rejected_total[5m])) by (reason)","legendFormat":"{{reason}}","refId":"A"}]
     },
 
-    { "type":"timeseries","title":"Order Latency p50/p95/p99 (ms)","gridPos":{"x":0,"y":29,"w":12,"h":6},
+    { "type":"timeseries","title":"Order Latency p50/p95/p99 (ms)","gridPos":{"x":0,"y":32,"w":12,"h":6},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "fieldConfig":{"defaults":{"unit":"ms"}},
       "targets":[
@@ -89,7 +99,7 @@
         {"expr":"histogram_quantile(0.99, sum(rate(order_latency_ms_bucketed_bucket[5m])) by (le))","refId":"P99","legendFormat":"p99"}
       ]
     },
-    { "type":"timeseries","title":"Queues","gridPos":{"x":12,"y":29,"w":12,"h":6},
+    { "type":"timeseries","title":"Queues","gridPos":{"x":12,"y":32,"w":12,"h":6},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[
         {"expr":"event_queue_depth","legendFormat":"event","refId":"A"},
@@ -98,14 +108,14 @@
       ]
     },
 
-    { "type":"table","title":"IV / OI (snapshot)","gridPos":{"x":0,"y":35,"w":12,"h":8},
+    { "type":"table","title":"IV / OI (snapshot)","gridPos":{"x":0,"y":38,"w":12,"h":8},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[
         {"expr":"option_iv","legendFormat":"{{instrument_key}} IV","instant":true,"refId":"IV","format":"table"},
         {"expr":"option_oi","legendFormat":"{{instrument_key}} OI","instant":true,"refId":"OI","format":"table"}
       ]
     },
-    { "type":"table","title":"Expiry Discovery & Guardrails","gridPos":{"x":12,"y":35,"w":12,"h":8},
+    { "type":"table","title":"Expiry Discovery & Guardrails","gridPos":{"x":12,"y":38,"w":12,"h":8},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[
         {"expr":"expiry_source","legendFormat":"source","instant":true,"refId":"SRC","format":"table"},
@@ -115,22 +125,27 @@
       ]
     },
 
-    { "type":"stat","title":"Open Lots","gridPos":{"x":0,"y":43,"w":4,"h":4},
+    { "type":"stat","title":"Open Lots","gridPos":{"x":0,"y":46,"w":4,"h":4},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[{"expr":"risk_open_lots","refId":"A"}]
     },
-    { "type":"stat","title":"Notional Premium (₹)","gridPos":{"x":4,"y":43,"w":8,"h":4},
+    { "type":"stat","title":"Notional Premium (₹)","gridPos":{"x":4,"y":46,"w":8,"h":4},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "fieldConfig":{"defaults":{"unit":"currencyINR"}},
       "targets":[{"expr":"risk_notional_premium_rupees","refId":"A"}]
     },
-    { "type":"stat","title":"Minutes to Square-off","gridPos":{"x":12,"y":43,"w":6,"h":4},
+    { "type":"stat","title":"Minutes to Square-off","gridPos":{"x":12,"y":46,"w":6,"h":4},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[{"expr":"minutes_to_square_off","refId":"A"}]
     },
-    { "type":"bargauge","title":"Rate-limit tokens (min by endpoint)","gridPos":{"x":18,"y":43,"w":6,"h":4},
+    { "type":"bargauge","title":"Rate-limit tokens (min by endpoint)","gridPos":{"x":18,"y":46,"w":6,"h":4},
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "targets":[{"expr":"min by (endpoint) (ratelimit_tokens)","refId":"A"}]
+    },
+    { "type":"timeseries","title":"Strategy evals (5m)","gridPos":{"x":18,"y":50,"w":6,"h":5},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"ops","decimals":0}},
+      "targets":[{"expr":"increase(strategy_evals_total[5m])","legendFormat":"evals_5m","refId":"A"}]
     }
   ]
 }

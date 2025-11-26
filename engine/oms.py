@@ -476,7 +476,7 @@ class OMS:
             underlying, expiry, strike, opt_type = order.symbol.upper(), fallback_expiry, 0.0, "CE"
         tick_size, lot_size, band_low, band_high = self._lookup_contract_meta(underlying, expiry, strike, opt_type)
         if not skip_style:
-            self._apply_submit_style(order, tick_size)
+            self._apply_submit_style(order, tick_size, band_low, band_high)
         order_type = order.order_type.upper()
         if order_type != "MARKET" and order.limit_price is None:
             raise OrderValidationError("price_missing", "Limit orders require a price")
@@ -551,7 +551,7 @@ class OMS:
             band_high or self._default_meta[3],
         )
 
-    def _apply_submit_style(self, order: Order, tick_size: float) -> None:
+    def _apply_submit_style(self, order: Order, tick_size: float, band_low: float, band_high: float) -> None:
         if self._close_to_square_off():
             order.order_type = "MARKET"
             order.limit_price = None
@@ -560,6 +560,16 @@ class OMS:
         if not depth:
             return
         tick = tick_size or self._default_meta[0]
+        floor_price = max(band_low or 0.0, tick if tick > 0 else 0.0)
+        ceiling_price = band_high if band_high and band_high > 0 else None
+
+        def _clamp(price: float) -> float:
+            if ceiling_price and price > ceiling_price:
+                price = ceiling_price
+            if floor_price and price < floor_price:
+                price = floor_price
+            return price
+
         spread = max(0.0, depth["ask"] - depth["bid"])
         spread_ticks = spread / tick if tick > 0 else spread
         cfg = self._submit_cfg
@@ -569,16 +579,20 @@ class OMS:
         available = depth["ask_qty"] if side == "BUY" else depth["bid_qty"]
         if mode in {"auto", "ioc"} and tick > 0 and spread_ticks <= cfg.max_spread_ticks and available >= max(order.qty, min_depth):
             price = depth["ask"] if side == "BUY" else depth["bid"]
-            order.limit_price = price
+            if price is None or price <= 0:
+                return
+            order.limit_price = _clamp(price)
             order.order_type = "IOC_LIMIT"
             return
         if mode in {"auto", "limit"}:
             price = depth["ask"] if side == "BUY" else depth["bid"]
+            if price is None or price <= 0:
+                return
             peg_ticks = max(1, min(cfg.max_spread_ticks or 1, 2))
             adjustment = peg_ticks * tick if tick > 0 else 0.0
             if side == "SELL":
                 adjustment *= -1
-            pegged = max(0.0, price + adjustment)
+            pegged = _clamp(price + adjustment)
             order.limit_price = pegged
             order.order_type = "LIMIT"
 

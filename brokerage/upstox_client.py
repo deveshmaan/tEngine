@@ -61,7 +61,7 @@ def _kwargs_filtered(instrument_key: str, expiry: str) -> dict[str, str]:
 
 
 def _require_token() -> str:
-    token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTIzYzNhZGRmODMxMjRkNGYyZmE3YzEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYzOTUxNTMzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQwMjE2MDB9.6Dr4w8ZaYanBqH6oKMAy0AXhxUMxHg8W1gS2hXYdNfE").strip()
+    token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTI2NzNjZGQxMjUwOTRhYzJjOWZiMzgiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY0MTI3NjkzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQxOTQ0MDB9.ctupKJPlcPMBsTi8F1OFpduoMXttpEf2k4t-8nhsRH4").strip()
     if not token:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     return token
