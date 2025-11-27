@@ -292,6 +292,7 @@ class MarketDataConfig:
     option_type: str = "CE"
     stream_mode: str = "full_d30"
     depth_levels: int = 5
+    max_tick_age_seconds: float = 2.0
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "MarketDataConfig":
@@ -303,6 +304,10 @@ class MarketDataConfig:
             depth_val = int(payload.get("depth_levels", 5))
         except (TypeError, ValueError):
             depth_val = 5
+        try:
+            max_age = float(payload.get("max_tick_age_seconds", 2.0))
+        except (TypeError, ValueError):
+            max_age = 2.0
         raw_mode = str(payload.get("stream_mode", "full_d30")).strip().lower()
         if not raw_mode:
             raw_mode = "full_d30"
@@ -311,6 +316,7 @@ class MarketDataConfig:
             option_type=_parse_option_type(payload.get("option_type", "CE")),
             stream_mode=raw_mode,
             depth_levels=max(depth_val, 1),
+            max_tick_age_seconds=max(0.0, max_age),
         )
 
     def get(self, key: str, default: Any = None) -> Any:

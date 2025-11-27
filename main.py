@@ -12,11 +12,13 @@ from typing import Callable, List, Optional
 
 from dataclasses import replace
 
+from brokerage.upstox_client import CredentialError, load_upstox_credentials
 from engine import smoke_test
 from engine.alerts import configure_alerts, notify_incident
 from engine.broker import FULL_D30_LIMIT_PER_USER, FullD30Streamer, UpstoxBroker
 from engine.config import EngineConfig, IST
-from engine.data import pick_strike_from_spot, pick_subscription_expiry, resolve_weekly_expiry
+from engine.config_sanity import ConfigError, sanity_check_config
+from engine.data import pick_strike_from_spot, pick_subscription_expiry, record_tick_seen, resolve_weekly_expiry
 from engine.events import EventBus
 from engine.fees import load_fee_config
 from engine.instruments import InstrumentResolver
@@ -28,7 +30,7 @@ except Exception:  # pragma: no cover
     def set_risk_dials(**kwargs): ...
 from engine.oms import OMS, OrderValidationError
 from engine.pnl import Execution as PnLExecution, PnLCalculator
-from engine.recovery import RecoveryManager
+from engine.recovery import RecoveryManager, enforce_intraday_clean_start
 from engine.replay import ReplayConfig, configure_runtime as configure_replay_runtime, replay
 from engine.risk import OrderBudget, RiskManager
 from engine.exit import ExitEngine
@@ -84,6 +86,7 @@ class IntradayBuyStrategy:
         if evt_type not in {"tick", "quote", "bar"}:
             return
         payload = event.get("payload") or {}
+        instrument_key = payload.get("instrument_key") or payload.get("instrument") or payload.get("token")
         spot = self._extract_price(payload)
         if spot is None:
             return
@@ -104,7 +107,7 @@ class IntradayBuyStrategy:
                     await self.exit_engine.on_tick(symbol_hint, spot, ts)
                 except Exception:
                     self.logger.log_event(30, "exit_tick_failed", symbol=symbol_hint)
-                has_intent = await self._maybe_trade(spot, ts, symbol_hint)
+                has_intent = await self._maybe_trade(spot, ts, symbol_hint, instrument_key=instrument_key)
                 STRATEGY_LOGGER.info(
                     "strategy_heartbeat: run=%s underlying=%s instruments=%d has_order_intent=%s",
                     getattr(self.cfg, "run_id", "n/a"),
@@ -113,7 +116,7 @@ class IntradayBuyStrategy:
                     bool(has_intent),
                 )
                 return
-        has_intent = await self._maybe_trade(spot, ts, symbol_hint if symbol_hint else None)
+        has_intent = await self._maybe_trade(spot, ts, symbol_hint if symbol_hint else None, instrument_key=instrument_key)
         STRATEGY_LOGGER.info(
             "strategy_heartbeat: run=%s underlying=%s instruments=%d has_order_intent=%s",
             getattr(self.cfg, "run_id", "n/a"),
@@ -122,9 +125,15 @@ class IntradayBuyStrategy:
             bool(has_intent),
         )
 
-    async def _maybe_trade(self, spot: float, ts: dt.datetime, symbol_hint: Optional[str]) -> bool:
+    async def _maybe_trade(self, spot: float, ts: dt.datetime, symbol_hint: Optional[str], *, instrument_key: Optional[str] = None) -> bool:
         if self.risk.should_halt():
             await self.exit_engine.handle_risk_halt()
+            return False
+        threshold = getattr(self.cfg.market_data, "max_tick_age_seconds", 0.0)
+        identifier = instrument_key or symbol_hint or self.cfg.data.index_symbol
+        if self.risk.block_if_stale(identifier, threshold=threshold):
+            return False
+        if self.risk.block_if_stale(self.cfg.data.index_symbol, threshold=threshold):
             return False
         index_sym = self.cfg.data.index_symbol.upper()
         if symbol_hint and str(symbol_hint).upper() != index_sym:
@@ -368,6 +377,7 @@ class EngineApp:
             metrics=self.metrics,
             auth_halt_callback=self.risk.halt_new_entries,
             risk_manager=self.risk,
+            bus=self.bus,
         )
         default_meta = (config.data.tick_size, config.data.lot_step, config.data.price_band_low, config.data.price_band_high)
         self.oms = OMS(
@@ -407,6 +417,7 @@ class EngineApp:
         self._market_task: Optional[asyncio.Task] = None
         self._square_task: Optional[asyncio.Task] = None
         self._strategy_task: Optional[asyncio.Task] = None
+        self._reconcile_task: Optional[asyncio.Task] = None
         self._tasks: List[asyncio.Task] = []
         self._full_d30_streamer: Optional[FullD30Streamer] = None
 
@@ -483,7 +494,7 @@ class EngineApp:
         tasks: List[asyncio.Task] = [self._square_task]
         if replay_cfg:
             self._market_task = asyncio.create_task(self._run_replay_source(replay_cfg), name="replay-source")
-        else:
+        elif _is_dry_run_env():
             self._market_task = asyncio.create_task(self._live_market_feed(), name="market-feed")
         if self._market_task:
             tasks.append(self._market_task)
@@ -491,6 +502,9 @@ class EngineApp:
         marks_task = asyncio.create_task(self._consume_market_marks(), name="pnl-marks")
         snapshot_task = asyncio.create_task(self._pnl_snapshot_loop(), name="pnl-snapshot")
         control_task = asyncio.create_task(self._watch_control_intents(), name="control-intents")
+        if not replay_cfg:
+            self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="order-reconcile")
+            tasks.append(self._reconcile_task)
         tasks.extend([fills_task, marks_task, snapshot_task, control_task])
         self._tasks = [task for task in tasks if task]
 
@@ -526,6 +540,10 @@ class EngineApp:
             except Exception:
                 pass
         await self.broker.stop()
+        try:
+            self.store.close()
+        except Exception:
+            pass
         self.metrics.engine_up.set(0)
         self.logger.log_event(20, "engine_stopped")
 
@@ -622,6 +640,30 @@ class EngineApp:
         self.metrics.pnl_unrealized.set(unrealized)
         self.metrics.pnl_fees.set(fees)
         self.metrics.pnl_net.set(realized + unrealized - fees)
+
+    async def _reconcile_loop(self) -> None:
+        interval = max(float(self.cfg.oms.reconciliation_interval), 1.0)
+        backoff = interval
+        while not self._stop.is_set():
+            start = time.perf_counter()
+            try:
+                views = await self.broker.fetch_open_orders()
+                await self.oms.reconcile_from_views(views)
+                backoff = interval
+            except Exception as exc:
+                backoff = min(backoff * 2, 30.0)
+                self.logger.log_event(30, "reconcile_error", error=str(exc))
+                try:
+                    self.metrics.order_reconciliation_errors_total.inc()
+                except Exception:
+                    pass
+            else:
+                try:
+                    duration_ms = (time.perf_counter() - start) * 1000.0
+                    self.metrics.order_reconciliation_duration_ms.observe(duration_ms)
+                except Exception:
+                    pass
+            await asyncio.sleep(backoff)
 
     async def _watch_control_intents(self) -> None:
         last_ts: Optional[str] = None
@@ -745,6 +787,8 @@ class EngineApp:
             await self.trigger_shutdown("replay_complete")
 
     async def _live_market_feed(self) -> None:
+        """DRY_RUN-only mock tick generator. Live mode relies on Upstox WS via broker."""
+
         while not self._stop.is_set():
             ts = engine_now(IST)
             spot = self._mock_spot()
@@ -772,12 +816,21 @@ class EngineApp:
                 step=self.cfg.data.lot_step,
             )
             symbol = f"{self.cfg.data.index_symbol}-{expiry_str}-{int(strike)}CE"
-            payload = {"underlying": self.cfg.data.index_symbol, "ltp": spot, "symbol": symbol}
+            instrument_key = self._instrument_key_for_symbol(symbol)
+            payload = {
+                "underlying": self.cfg.data.index_symbol,
+                "ltp": spot,
+                "symbol": symbol,
+                "instrument_key": instrument_key or symbol,
+                "ts": ts.isoformat(),
+                "bid": None,
+                "ask": None,
+            }
             tick_payload = dict(payload)
             tick_payload.setdefault("ts", ts.isoformat())
-            instrument_key = self._instrument_key_for_symbol(symbol)
             if self.broker:
                 self.broker.record_market_tick(instrument_key or symbol, tick_payload)
+            record_tick_seen(instrument_key=instrument_key or symbol, underlying=self.cfg.data.index_symbol, ts_seconds=ts.timestamp())
             event = {"ts": ts.isoformat(), "type": "tick", "payload": payload}
             self.store.record_market_event("tick", payload, ts=ts)
             await self.bus.publish("market/events", event)
@@ -814,9 +867,36 @@ def _is_dry_run_env() -> bool:
     return os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "on"}
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _startup_underlyings(cfg: EngineConfig) -> set[str]:
+    roots = {"NIFTY", "BANKNIFTY"}
+    try:
+        roots.add(cfg.data.index_symbol.upper())
+    except Exception:
+        pass
+    return {r for r in roots if r}
+
+
 async def main(argv: Optional[List[str]] = None) -> None:
+    configure_logging("INFO")
     args = _parse_args(argv)
     cfg = EngineConfig.load(args.config)
+    try:
+        load_upstox_credentials()
+    except CredentialError as exc:
+        get_logger("main").log_event(40, "missing_credentials", message=str(exc))
+        raise SystemExit(1)
+    try:
+        sanity_check_config(cfg)
+    except ConfigError as exc:
+        get_logger("main").log_event(40, "config_sanity_failed", message=str(exc))
+        raise SystemExit(1)
     replay_cfg = None
     if args.replay_from_run or args.replay_from_file:
         if args.replay_from_run and args.replay_from_file:
@@ -829,6 +909,19 @@ async def main(argv: Optional[List[str]] = None) -> None:
         )
         cfg = _with_replay_run_id(cfg, replay_cfg)
     app = EngineApp(cfg)
+    strict_mode = _env_bool("INTRADAY_STRICT_MODE", default=True)
+    try:
+        await enforce_intraday_clean_start(
+            app.store,
+            instrument_cache=app.instrument_cache,
+            underlyings=_startup_underlyings(cfg),
+            strict_mode=strict_mode,
+            risk=app.risk,
+        )
+    except Exception as exc:
+        app.logger.log_event(40, "startup_guard_failed", error=str(exc), strict_mode=strict_mode)
+        await app.trigger_shutdown("startup_guard")
+        return
     await app.run(replay_cfg=replay_cfg)
 
 

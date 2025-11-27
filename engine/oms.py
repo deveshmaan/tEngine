@@ -57,6 +57,15 @@ class OrderState(str, Enum):
 
 
 FINAL_STATES = {OrderState.FILLED, OrderState.REJECTED, OrderState.CANCELED}
+ALLOWED_TRANSITIONS: dict[OrderState, set[OrderState]] = {
+    OrderState.NEW: {OrderState.SUBMITTED, OrderState.CANCELED, OrderState.REJECTED, OrderState.PARTIALLY_FILLED},
+    OrderState.SUBMITTED: {OrderState.ACKNOWLEDGED, OrderState.CANCELED, OrderState.REJECTED, OrderState.PARTIALLY_FILLED, OrderState.FILLED},
+    OrderState.ACKNOWLEDGED: {OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCELED, OrderState.REJECTED},
+    OrderState.PARTIALLY_FILLED: {OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCELED, OrderState.REJECTED},
+    OrderState.FILLED: set(),
+    OrderState.REJECTED: set(),
+    OrderState.CANCELED: set(),
+}
 
 
 class OrderValidationError(Exception):
@@ -121,16 +130,18 @@ class Order:
     last_md_tick_ts: float = 0.0
     submit_ts: float = 0.0
     ack_ts: float = 0.0
+    last_update_ts: float = 0.0
 
-    def mark_state(self, new_state: OrderState, *, ts: Optional[dt.datetime] = None) -> None:
+    def mark_state(self, new_state: OrderState, *, ts: Optional[dt.datetime] = None, reason: Optional[str] = None) -> None:
         self.state = new_state
         self.updated_at = ts or utc_now()
+        self.last_update_ts = time.time()
 
     @classmethod
     def from_snapshot(cls, snapshot: Dict[str, Any]) -> "Order":
         state = OrderState(snapshot["state"])
         ts = dt.datetime.fromisoformat(snapshot["last_update"])
-        return cls(
+        obj = cls(
             client_order_id=snapshot["client_order_id"],
             strategy=snapshot["strategy"],
             symbol=snapshot["symbol"],
@@ -144,6 +155,8 @@ class Order:
             updated_at=ts,
             idempotency_key=snapshot.get("idempotency_key"),
         )
+        obj.last_update_ts = ts.timestamp()
+        return obj
 
 
 @dataclass
@@ -159,6 +172,8 @@ class BrokerOrderView:
     status: str
     filled_qty: int
     avg_price: float
+    instrument_key: Optional[str] = None
+    side: Optional[str] = None
 
 
 class BrokerClient(Protocol):
@@ -251,7 +266,7 @@ class OMS:
                 if existing.state in FINAL_STATES:
                     return existing
                 return await self._ensure_submitted(existing)
-            stored = self._store.find_order_by_idempotency(idem)
+            stored = self._store.find_order_by_client_id(client_id) or self._store.find_order_by_idempotency(idem)
             if stored:
                 restored = Order.from_snapshot(stored)
                 self._orders[restored.client_order_id] = restored
@@ -390,20 +405,50 @@ class OMS:
     # --------------------------------------------------------------- reconciler
     async def reconcile_from_broker(self) -> None:
         remote = await self._broker.fetch_open_orders()
-        remote_map = {view.client_order_id: view for view in remote if view.client_order_id}
+        await self.reconcile_from_views(remote)
+
+    async def reconcile_from_views(self, views: List[BrokerOrderView]) -> None:
+        remote_by_broker = {view.broker_order_id: view for view in views if view.broker_order_id}
+        remote_by_client = {view.client_order_id: view for view in views if view.client_order_id}
         async with self._lock:
             local_orders = list(self._orders.values())
         for order in local_orders:
-            view = remote_map.get(order.client_order_id)
+            view = remote_by_broker.get(order.broker_order_id) or remote_by_client.get(order.client_order_id)
             if not view:
                 if order.state not in FINAL_STATES:
                     await self._persist_transition(order, order.state, OrderState.CANCELED, reason="broker_missing")
+                    try:
+                        self._store.record_incident(
+                            "RECON_MISSING_ORDER",
+                            {
+                                "client_order_id": order.client_order_id,
+                                "broker_order_id": order.broker_order_id,
+                                "state": order.state.value,
+                            },
+                            ts=order.updated_at,
+                        )
+                    except Exception:
+                        pass
                 continue
             order.broker_order_id = view.broker_order_id
-            if view.filled_qty >= order.qty:
-                await self._persist_transition(order, order.state, OrderState.FILLED, reason="reconcile")
-            elif view.filled_qty > 0 and order.state != OrderState.PARTIALLY_FILLED:
-                await self._persist_transition(order, order.state, OrderState.PARTIALLY_FILLED, reason="reconcile")
+            delta_fill = max(0, int(view.filled_qty) - int(order.filled_qty))
+            if delta_fill > 0:
+                price = view.avg_price if view.avg_price > 0 else (order.limit_price or order.avg_fill_price or 0.0)
+                await self.record_fill(order.client_order_id, qty=delta_fill, price=float(price), broker_order_id=view.broker_order_id)
+            view_status = str(view.status or "").lower()
+            target_state = order.state
+            if view_status in {"complete", "completed", "filled"} or view.filled_qty >= order.qty:
+                target_state = OrderState.FILLED
+            elif view_status in {"cancelled", "canceled"}:
+                target_state = OrderState.CANCELED
+            elif view_status in {"rejected", "rejected_by_exchange"}:
+                target_state = OrderState.REJECTED
+            elif view.filled_qty > 0:
+                target_state = OrderState.PARTIALLY_FILLED
+            elif view_status in {"open", "pending"} and order.state == OrderState.NEW:
+                target_state = OrderState.SUBMITTED
+            if target_state != order.state and order.state not in FINAL_STATES:
+                await self._persist_transition(order, order.state, target_state, reason="reconcile")
 
     async def handle_reconnect(self) -> None:
         async with self._lock:
@@ -431,6 +476,16 @@ class OMS:
         return order
 
     async def _persist_transition(self, order: Order, prev: OrderState, new: OrderState, *, reason: Optional[str] = None) -> None:
+        if prev != new and new not in ALLOWED_TRANSITIONS.get(prev, set()):
+            self._logger.log_event(
+                40,
+                "invalid_order_transition",
+                client_order_id=order.client_order_id,
+                prev_state=prev.value,
+                attempted=new.value,
+                reason=reason,
+            )
+            return
         prev_ts = order.updated_at
         if prev == new and reason == "replace":
             order.updated_at = utc_now()

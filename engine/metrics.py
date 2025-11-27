@@ -83,6 +83,7 @@ class EngineMetrics:
             self.underlying_last_ts_seconds = _NoOpMetric()
             self.md_subscription_info = _NoOpMetric()
             self.md_last_tick_ts = _NoOpMetric()
+            self.market_data_stale = _NoOpMetric()
             self.strategy_last_eval_ts = _NoOpMetric()
             self.strategy_evals_total = _NoOpMetric()
             self.smoke_test_runs_total = _NoOpMetric()
@@ -90,6 +91,12 @@ class EngineMetrics:
             self.smoke_test_last_ts = _NoOpMetric()
             self.smoke_test_last_reason = _NoOpMetric()
             self.smoke_test_running = _NoOpMetric()
+            self.config_sanity_ok = _NoOpMetric()
+            self.startup_unmanaged_positions_count = _NoOpMetric()
+            self.market_data_stale_dropped_total = _NoOpMetric()
+            self.market_data_stale_blocked_entries_total = _NoOpMetric()
+            self.order_reconciliation_errors_total = _NoOpMetric()
+            self.order_reconciliation_duration_ms = _NoOpMetric()
             return
         registry_kwargs = {"registry": self._registry} if self._registry is not None else {}
         self.engine_up = Gauge("engine_up", "Engine up status", **registry_kwargs)
@@ -137,6 +144,12 @@ class EngineMetrics:
         self.broker_queue_depth = Gauge("broker_queue_depth", "Broker queue depth", ["endpoint"], **registry_kwargs)
         self.api_errors_total = Counter("api_errors_total", "API errors", ["code"], **registry_kwargs)
         self.session_state = Gauge("session_state", "Trading session state", **registry_kwargs)
+        self.config_sanity_ok = Gauge("config_sanity_ok", "1 when config sanity checks pass", **registry_kwargs)
+        self.startup_unmanaged_positions_count = Gauge(
+            "startup_unmanaged_positions_count",
+            "Unmanaged overnight positions detected at startup",
+            **registry_kwargs,
+        )
         self.expiry_discovery_attempt_total = Counter("expiry_discovery_attempt_total", "Expiry discovery attempts", ["source"], **registry_kwargs)
         self.expiry_discovery_success_total = Counter("expiry_discovery_success_total", "Expiry discovery successes", ["source"], **registry_kwargs)
         self.expiry_override_used_total = Counter("expiry_override_used_total", "Expiry override activations", **registry_kwargs)
@@ -161,6 +174,12 @@ class EngineMetrics:
         self.option_last_ts_seconds = Gauge(
             "option_last_ts_seconds",
             "Epoch seconds of last tick",
+            ["instrument_key"],
+            **registry_kwargs,
+        )
+        self.market_data_stale = Gauge(
+            "market_data_stale",
+            "Market data staleness flag (1=stale)",
             ["instrument_key"],
             **registry_kwargs,
         )
@@ -191,6 +210,29 @@ class EngineMetrics:
         self.md_last_tick_ts = Gauge("md_last_tick_ts", "Epoch seconds of last processed tick", ["instrument"], **registry_kwargs)
         self.strategy_last_eval_ts = Gauge("strategy_last_eval_ts", "Epoch seconds of last strategy evaluation", **registry_kwargs)
         self.strategy_evals_total = Counter("strategy_evals_total", "Total number of strategy evaluations", **registry_kwargs)
+        self.market_data_stale_dropped_total = Counter(
+            "market_data_stale_dropped_total",
+            "Ticks dropped because they exceeded max_tick_age_seconds",
+            ["instrument_key"],
+            **registry_kwargs,
+        )
+        self.market_data_stale_blocked_entries_total = Counter(
+            "market_data_stale_blocked_entries_total",
+            "BUY entries blocked due to stale market data",
+            ["instrument"],
+            **registry_kwargs,
+        )
+        self.order_reconciliation_errors_total = Counter(
+            "order_reconciliation_errors_total",
+            "Errors during order reconciliation",
+            **registry_kwargs,
+        )
+        self.order_reconciliation_duration_ms = Histogram(
+            "order_reconciliation_duration_ms",
+            "Order reconciliation duration in ms",
+            buckets=(5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000),
+            **registry_kwargs,
+        )
 
     def beat(self) -> None:
         self.heartbeat_ts.set(time.time())
@@ -212,11 +254,22 @@ class EngineMetrics:
 
 
 _GLOBAL_METRICS: Optional[EngineMetrics] = None
+_LAST_CONFIG_SANITY: Optional[float] = None
+_LAST_UNMANAGED_POSITIONS: Optional[float] = None
 
 
 def bind_global_metrics(metrics: Optional[EngineMetrics]) -> None:
     global _GLOBAL_METRICS
     _GLOBAL_METRICS = metrics
+    if metrics is None:
+        return
+    try:
+        if _LAST_CONFIG_SANITY is not None:
+            metrics.config_sanity_ok.set(_LAST_CONFIG_SANITY)
+        if _LAST_UNMANAGED_POSITIONS is not None:
+            metrics.startup_unmanaged_positions_count.set(_LAST_UNMANAGED_POSITIONS)
+    except Exception:
+        pass
 
 
 def _maybe_metrics() -> Optional[EngineMetrics]:
@@ -239,6 +292,49 @@ def set_risk_halt_state(value: int | float) -> None:
     meter = _maybe_metrics()
     if meter:
         meter.set_risk_halt_state(value)
+
+
+def set_market_data_stale(instrument_key: str, value: int | float) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        try:
+            meter.market_data_stale.labels(instrument_key=str(instrument_key)).set(value)
+        except Exception:
+            pass
+
+
+def inc_market_data_stale_drop(instrument_key: str) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        try:
+            meter.market_data_stale_dropped_total.labels(instrument_key=str(instrument_key)).inc()
+        except Exception:
+            pass
+
+
+def inc_market_data_stale_blocked_entries(instrument: str) -> None:
+    meter = _maybe_metrics()
+    if meter:
+        try:
+            meter.market_data_stale_blocked_entries_total.labels(instrument=str(instrument)).inc()
+        except Exception:
+            pass
+
+
+def set_config_sanity_ok(value: int | float) -> None:
+    global _LAST_CONFIG_SANITY
+    _LAST_CONFIG_SANITY = float(value)
+    meter = _maybe_metrics()
+    if meter:
+        meter.config_sanity_ok.set(value)
+
+
+def set_startup_unmanaged_positions(count: int | float) -> None:
+    global _LAST_UNMANAGED_POSITIONS
+    _LAST_UNMANAGED_POSITIONS = float(count)
+    meter = _maybe_metrics()
+    if meter:
+        meter.startup_unmanaged_positions_count.set(count)
 
 
 def inc_expiry_attempt(source: str) -> None:
@@ -549,6 +645,13 @@ __all__ = [
     "set_session_state",
     "set_subscription_expiry",
     "set_risk_halt_state",
+    "set_market_data_stale",
+    "inc_market_data_stale_drop",
+    "inc_market_data_stale_blocked_entries",
+    "order_reconciliation_errors_total",
+    "order_reconciliation_duration_ms",
+    "set_config_sanity_ok",
+    "set_startup_unmanaged_positions",
     "start_http_server_if_available",
 ]
 

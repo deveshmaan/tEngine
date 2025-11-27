@@ -4,6 +4,7 @@ import datetime as dt
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Iterable, List, Literal, Optional, Sequence, Set, TYPE_CHECKING
 
@@ -17,7 +18,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 _APP_CONFIG_CACHE: Optional[dict] = None
 _APP_CONFIG_PATH: Optional[Path] = None
+_LAST_TICK_TS: dict[str, float] = {}
 LOG = logging.getLogger("engine.data")
+
+# Market data modes:
+#   - Live: Upstox WS feed decoded in engine.broker publishes tick events to the bus.
+#   - Replay: engine.replay replays persisted ticks/events into the same bus.
+#   - DRY_RUN: main._live_market_feed generates synthetic ticks for local testing only.
 
 
 def _load_app_config() -> dict:
@@ -57,6 +64,36 @@ def _holiday_calendar() -> Set[dt.date]:
         except ValueError:
             continue
     return holidays
+
+
+def record_tick_seen(*, instrument_key: Optional[str] = None, underlying: Optional[str] = None, ts_seconds: Optional[float] = None) -> None:
+    """Record the latest tick timestamp for staleness checks (instrument + underlying)."""
+
+    global _LAST_TICK_TS
+    if ts_seconds is None:
+        ts_seconds = engine_now(IST).timestamp()
+    for key in (instrument_key, underlying):
+        if key:
+            _LAST_TICK_TS[str(key).upper()] = float(ts_seconds)
+
+
+def last_tick_age_seconds(identifier: str, *, now: Optional[float] = None) -> Optional[float]:
+    ts = _LAST_TICK_TS.get(str(identifier).upper(), None)
+    if ts is None:
+        return None
+    ref = now if now is not None else engine_now(IST).timestamp()
+    return max(0.0, float(ref) - float(ts))
+
+
+def is_market_data_stale(identifier: str, *, threshold: float, now: Optional[float] = None) -> bool:
+    """Return True if last tick for identifier is older than threshold seconds."""
+
+    if threshold <= 0:
+        return False
+    age = last_tick_age_seconds(identifier, now=now)
+    if age is None:
+        return True
+    return age > threshold
 
 
 def _legacy_weekly(symbol: str, now: dt.datetime, holidays: Optional[Iterable[dt.date]] = None, target_weekday: int = 3) -> dt.date:
@@ -337,6 +374,9 @@ __all__ = [
     "assert_valid_expiry",
     "enforce_price_band",
     "get_app_config",
+    "record_tick_seen",
+    "last_tick_age_seconds",
+    "is_market_data_stale",
     "list_expiries",
     "normalize_date",
     "pick_subscription_expiry",

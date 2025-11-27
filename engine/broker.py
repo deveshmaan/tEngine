@@ -50,8 +50,10 @@ except Exception:  # pragma: no cover
     def set_underlying_last_ts(instrument: str, ts_seconds: float): ...
 
 from brokerage.upstox_client import InvalidDateError, PlacedOrder, UpstoxConfig, UpstoxSession, normalize_place_order_response
-from engine.config import BrokerConfig, CONFIG
+from engine.config import BrokerConfig, CONFIG, IST
+from engine.data import record_tick_seen
 from engine.data import normalize_date, pick_subscription_expiry, preopen_expiry_smoke, resolve_expiries_with_fallback
+from engine.events import EventBus
 from engine.logging_utils import get_logger
 from engine.oms import BrokerOrderAck, BrokerOrderView, Order
 from engine.instruments import InstrumentResolver
@@ -67,6 +69,8 @@ from engine.metrics import (
     publish_underlying,
     record_md_decode_error,
     record_md_frame,
+    inc_market_data_stale_drop,
+    set_market_data_stale,
     set_last_tick_ts,
     set_md_subscription,
     set_md_subscription_gauge,
@@ -123,6 +127,7 @@ class TokenBucket:
 LOG = logging.getLogger("engine.market.full_d30")
 
 FULL_D30_LIMIT_PER_USER = 50  # Upstox Plus documented limit
+INTRADAY_PRODUCT = "I"  # Upstox intraday/MIS product; this engine is intraday-only.
 
 
 class FullD30Streamer:
@@ -504,6 +509,7 @@ class UpstoxBroker:
         auth_halt_callback: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None,
         reconcile_callback: Optional[Callable[[], Awaitable[None]]] = None,
         risk_manager: Optional[RiskManager] = None,
+        bus: Optional[EventBus] = None,
     ):
         self._cfg = config
         self._session_factory = session_factory or self._default_session_factory
@@ -541,6 +547,7 @@ class UpstoxBroker:
         self._underlying_tokens: set[str] = set()
         self._starting = False
         self._stream_reader: Optional[asyncio.Task] = None
+        self._bus = bus
         try:
             depth_levels = int(CONFIG.market_data.get("depth_levels", 5))
         except Exception:
@@ -548,6 +555,11 @@ class UpstoxBroker:
         self._tick_coalescer = _TickCoalescer(depth_levels=depth_levels)
         if self._metrics:
             self._metrics.set_risk_halt_state(0)
+        try:
+            self._max_tick_age = float(getattr(CONFIG.market_data, "max_tick_age_seconds", 0.0))
+        except Exception:
+            self._max_tick_age = 0.0
+        self._last_ws_recv = time.time()
 
     def cached_option_quote(self, instrument_key: str) -> Optional[dict[str, Any]]:
         if not instrument_key:
@@ -724,14 +736,12 @@ class UpstoxBroker:
     async def submit_order(self, order: Order) -> BrokerOrderAck:
         if self._halt_new_orders and order.side.upper() == "BUY":
             raise BrokerError(code="auth_halt", message="Broker halted due to authentication state")
-        instrument_symbol = order.symbol
-        if self._resolver:
-            instrument_symbol = await self._resolver.resolve_symbol(order.symbol)
+        instrument_symbol = await self._resolve_instrument_token(order)
         payload = upstox_client.PlaceOrderV3Request(
             instrument_token=instrument_symbol,
             transaction_type=order.side.upper(),
             order_type="LIMIT" if order.order_type == "IOC_LIMIT" else order.order_type,
-            product="I",
+            product=INTRADAY_PRODUCT,
             validity="IOC" if order.order_type == "IOC_LIMIT" else "DAY",
             quantity=int(order.qty),
             disclosed_quantity=0,
@@ -739,7 +749,7 @@ class UpstoxBroker:
             price=order.limit_price or 0.0,
             is_amo=False,
             slice=False,
-            tag=order.strategy,
+            tag=f"{order.strategy}:{order.client_order_id}",
         )
         context = {
             "symbol": instrument_symbol,
@@ -761,12 +771,13 @@ class UpstoxBroker:
         return BrokerOrderAck(broker_order_id=broker_id, status=status)
 
     async def replace_order(self, order: Order, *, price: Optional[float], qty: Optional[int]) -> None:
+        instrument_symbol = await self._resolve_instrument_token(order)
         body = upstox_client.ModifyOrderV3Request(
-            instrument_token=order.symbol,
+            instrument_token=instrument_symbol,
             order_id=order.broker_order_id,
             transaction_type=order.side.upper(),
             order_type=order.order_type,
-            product="I",
+            product=INTRADAY_PRODUCT,
             validity="DAY",
             quantity=int(qty or order.qty),
             disclosed_quantity=0,
@@ -795,8 +806,6 @@ class UpstoxBroker:
         views: List[BrokerOrderView] = []
         for entry in data:
             status = str(entry.get("status") or "").lower()
-            if status in {"complete", "cancelled"}:
-                continue
             views.append(
                 BrokerOrderView(
                     broker_order_id=str(entry.get("order_id")),
@@ -804,6 +813,8 @@ class UpstoxBroker:
                     status=status,
                     filled_qty=int(entry.get("filled_quantity") or 0),
                     avg_price=float(entry.get("average_price") or 0.0),
+                    instrument_key=str(entry.get("instrument_token") or entry.get("instrument_key") or "") or None,
+                    side=str(entry.get("transaction_type") or entry.get("side") or ""),
                 )
             )
         return views
@@ -983,6 +994,11 @@ class UpstoxBroker:
 
     async def _drain_market_stream(self) -> None:
         while not self._stop.is_set():
+            if self._metrics:
+                try:
+                    self._metrics.ws_lag_ms.set(max(0.0, (time.time() - self._last_ws_recv) * 1000.0))
+                except Exception:
+                    pass
             if not self._stream:
                 await asyncio.sleep(0.5)
                 continue
@@ -997,6 +1013,7 @@ class UpstoxBroker:
                 continue
             if not frame:
                 continue
+            self._last_ws_recv = time.time()
             try:
                 record_md_frame(len(str(frame)))
             except Exception:
@@ -1108,6 +1125,24 @@ class UpstoxBroker:
             best_ask = asks[0]["price"] if asks else None
             oi = self._coerce_float(market_ff.get("oi") or payload.get("oi"))
             iv = self._coerce_float(market_ff.get("iv") or payload.get("iv"))
+            record_tick_seen(instrument_key=instrument_key, underlying=symbol or self._subscription_meta.get(instrument_key, {}).get("symbol"), ts_seconds=ts_seconds)
+            stale = False
+            if self._max_tick_age > 0:
+                stale = (time.time() - float(ts_seconds or time.time())) > self._max_tick_age
+                try:
+                    set_market_data_stale(instrument_key, 1 if stale else 0)
+                except Exception:
+                    pass
+                if stale:
+                    try:
+                        inc_market_data_stale_drop(instrument_key)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    set_market_data_stale(instrument_key, 0)
+                except Exception:
+                    pass
             set_last_tick_ts(instrument_key, ts_seconds)
             publish_spread(instrument_key, best_bid or 0.0, best_ask or 0.0, ltp or 0.0)
             if bids or asks:
@@ -1115,6 +1150,8 @@ class UpstoxBroker:
                 ask_qty10 = sum(self._coerce_float(entry.get("qty")) or 0.0 for entry in asks[:10] if isinstance(entry, Mapping))
                 if bid_qty10 or ask_qty10:
                     publish_depth10(instrument_key, bid_qty10, ask_qty10)
+            if stale:
+                return
             self._tick_coalescer.update_option(
                 instrument_key,
                 {
@@ -1131,6 +1168,30 @@ class UpstoxBroker:
                     "depth": {"bids": bids, "asks": asks},
                 },
             )
+            if self._bus:
+                try:
+                    ts_dt = dt.datetime.fromtimestamp(ts_seconds or time.time(), tz=IST)
+                except Exception:
+                    ts_dt = dt.datetime.now(IST)
+                option_symbol = ""
+                if symbol and expiry and strike:
+                    option_symbol = f"{symbol}-{expiry}-{strike}{opt_type or ''}"
+                payload_evt = {
+                    "instrument_key": instrument_key,
+                    "underlying": symbol or "",
+                    "symbol": option_symbol or symbol or instrument_key,
+                    "ltp": ltp,
+                    "bid": best_bid,
+                    "ask": best_ask,
+                    "expiry": expiry,
+                    "strike": strike,
+                    "opt_type": opt_type,
+                    "iv": iv,
+                    "oi": oi,
+                    "depth": {"bids": bids, "asks": asks},
+                    "ts": ts_dt.isoformat(),
+                }
+                asyncio.create_task(self._bus.publish("market/events", {"ts": ts_dt.isoformat(), "type": "tick", "payload": payload_evt}))
             return
         ts_seconds = (
             self._extract_ts_seconds((index_ff.get("ltpc") or {}).get("ltt"))
@@ -1143,11 +1204,46 @@ class UpstoxBroker:
             return
         sym = self._underlying_symbol_for(instrument_key, payload)
         self._last_spot[sym.upper()] = ltp
+        record_tick_seen(instrument_key=instrument_key, underlying=sym, ts_seconds=ts_seconds)
+        stale = False
+        if self._max_tick_age > 0:
+            stale = (time.time() - float(ts_seconds or time.time())) > self._max_tick_age
+            try:
+                set_market_data_stale(instrument_key, 1 if stale else 0)
+            except Exception:
+                pass
+            if stale:
+                try:
+                    inc_market_data_stale_drop(instrument_key)
+                except Exception:
+                    pass
+        else:
+            try:
+                set_market_data_stale(instrument_key, 0)
+            except Exception:
+                pass
         self._tick_coalescer.update_underlying(sym, ltp, ts_seconds)
         try:
             set_underlying_last_ts(sym, ts_seconds)
         except Exception:
             pass
+        if stale:
+            return
+        if self._bus:
+            try:
+                ts_dt = dt.datetime.fromtimestamp(ts_seconds or time.time(), tz=IST)
+            except Exception:
+                ts_dt = dt.datetime.now(IST)
+            payload_evt = {
+                "instrument_key": instrument_key,
+                "underlying": sym,
+                "symbol": sym,
+                "ltp": ltp,
+                "bid": None,
+                "ask": None,
+                "ts": ts_dt.isoformat(),
+            }
+            asyncio.create_task(self._bus.publish("market/events", {"ts": ts_dt.isoformat(), "type": "tick", "payload": payload_evt}))
 
     def _resolve_underlying_key(self, symbol: str) -> Optional[str]:
         cache = self.instrument_cache or InstrumentCache.runtime_cache()
@@ -1157,6 +1253,15 @@ class UpstoxBroker:
             return cache.resolve_index_key(symbol)
         except Exception:
             return None
+
+    async def _resolve_instrument_token(self, order: Order) -> str:
+        instrument_symbol = order.symbol
+        if self._resolver:
+            try:
+                instrument_symbol = await self._resolver.resolve_symbol(order.symbol)
+            except Exception:
+                instrument_symbol = order.symbol
+        return instrument_symbol
 
     async def _subscribe_underlying(self, symbol: str) -> None:
         key = self._resolve_underlying_key(symbol)
@@ -1270,6 +1375,11 @@ class UpstoxBroker:
                 or self._extract_ts_seconds(_pluck("ts"))
                 or time.time()
             )
+            record_tick_seen(instrument_key=key, underlying=symbol, ts_seconds=ts_seconds)
+            try:
+                set_market_data_stale(key, 0)
+            except Exception:
+                pass
             set_last_tick_ts(key, ts_seconds)
             publish_option_quote(
                 key,
@@ -1297,6 +1407,11 @@ class UpstoxBroker:
             or time.time()
         )
         sym = self._underlying_symbol_for(key, payload)
+        record_tick_seen(instrument_key=key, underlying=sym, ts_seconds=ts_seconds)
+        try:
+            set_market_data_stale(key, 0)
+        except Exception:
+            pass
         publish_underlying(sym, spot, ts_seconds)
 
     @staticmethod
@@ -1621,4 +1736,4 @@ class UpstoxBroker:
         return self._session_guard_decision
 
 
-__all__ = ["BrokerError", "MarketStreamClient", "TokenBucket", "FullD30Streamer", "UpstoxBroker"]
+__all__ = ["BrokerError", "INTRADAY_PRODUCT", "MarketStreamClient", "TokenBucket", "FullD30Streamer", "UpstoxBroker"]

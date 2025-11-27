@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from engine.data import record_tick_seen
 from engine.events import EventBus
 from engine.time_machine import travel
 from persistence import SQLiteStore
@@ -59,6 +60,11 @@ async def replay(cfg: ReplayConfig) -> str:
             await asyncio.sleep(delay)
         payload = event.get("payload") or {}
         with travel(ts_str):
+            try:
+                ts_val = _parse_ts(ts_str).timestamp()
+                record_tick_seen(instrument_key=payload.get("instrument_key") or payload.get("instrument"), underlying=payload.get("underlying") or payload.get("symbol"), ts_seconds=ts_val)
+            except Exception:
+                pass
             await _BUS.publish("market/events", event)
             _STORE.record_market_event(event["type"], payload, ts=_parse_ts(ts_str))
     return _STORE.run_id

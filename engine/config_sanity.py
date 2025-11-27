@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+import logging
+from typing import Iterable
+
+from engine.config import EngineConfig
+from engine.logging_utils import get_logger
+from engine.metrics import set_config_sanity_ok
+
+LOG = get_logger("ConfigSanity")
+
+
+class ConfigError(RuntimeError):
+    """Raised when config validation fails."""
+
+
+def _within(value: float, low: float, high: float, *, inclusive_high: bool = False) -> bool:
+    if inclusive_high:
+        return low < value <= high
+    return low < value < high
+
+
+def _positive(value: float) -> bool:
+    return value > 0
+
+
+def _validate_rate_limits(values: Iterable[float]) -> bool:
+    return all(_positive(v) and v < 50 for v in values)
+
+
+def sanity_check_config(cfg: EngineConfig) -> None:
+    """
+    Validate critical numeric parameters before the engine boots.
+
+    Raises:
+        ConfigError: when any invariant is violated.
+    """
+
+    errors: list[str] = []
+
+    def _err(code: str, message: str) -> None:
+        errors.append(message)
+        try:
+            LOG.log_event(40, code, message=message)
+        except Exception:
+            logging.getLogger("ConfigSanity").error("%s: %s", code, message)
+
+    if cfg.risk.daily_pnl_stop >= 0:
+        _err("risk_daily_pnl_stop", "risk.daily_pnl_stop must be negative (loss stop).")
+    if not _positive(cfg.risk.notional_premium_cap):
+        _err("risk_notional_premium_cap", "risk.notional_premium_cap must be > 0.")
+    if cfg.risk.max_open_lots < 0:
+        _err("risk_max_open_lots", "risk.max_open_lots must be >= 0.")
+
+    if not _within(cfg.exit.stop_pct, 0.0, 1.0):
+        _err("exit_stop_pct", "exit.stop_pct must be between 0 and 1.")
+    if not _within(cfg.exit.target1_pct, 0.0, 3.0):
+        _err("exit_target1_pct", "exit.target1_pct must be > 0 and < 3.0.")
+    if not _within(float(cfg.exit.max_holding_minutes), 0.0, 120.0, inclusive_high=True):
+        _err("exit_max_holding_minutes", "exit.max_holding_minutes must be > 0 and <= 120 minutes.")
+
+    rate_limits = cfg.broker.rate_limits
+    rates = (
+        rate_limits.place.rate_per_sec,
+        rate_limits.modify.rate_per_sec,
+        rate_limits.cancel.rate_per_sec,
+    )
+    if not _validate_rate_limits(rates):
+        _err("broker_rate_limits", "broker rate limits (place/modify/cancel) must be > 0 and < 50 per second.")
+
+    if errors:
+        set_config_sanity_ok(0)
+        raise ConfigError("; ".join(errors))
+    set_config_sanity_ok(1)
+
+
+__all__ = ["ConfigError", "sanity_check_config"]

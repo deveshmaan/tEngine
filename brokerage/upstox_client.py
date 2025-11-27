@@ -29,6 +29,8 @@ class UpstoxConfig:
     access_token: str
     sandbox: bool = False
     algo_name: str = "intraday_buy_engine"
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -60,11 +62,41 @@ def _kwargs_filtered(instrument_key: str, expiry: str) -> dict[str, str]:
     return {"instrument_key": instrument_key, "expiry_date": expiry}
 
 
-def _require_token() -> str:
-    token = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTI2NzNjZGQxMjUwOTRhYzJjOWZiMzgiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY0MTI3NjkzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQxOTQ0MDB9.ctupKJPlcPMBsTi8F1OFpduoMXttpEf2k4t-8nhsRH4").strip()
+class CredentialError(RuntimeError):
+    """Raised when broker credentials are unavailable or incomplete."""
+
+
+def _read_env(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
+def load_upstox_credentials() -> UpstoxConfig:
+    """
+    Load Upstox credentials strictly from environment variables.
+
+    Required:
+        - UPSTOX_ACCESS_TOKEN
+    Optional:
+        - UPSTOX_API_KEY
+        - UPSTOX_API_SECRET
+    """
+
+    token = _read_env("UPSTOX_ACCESS_TOKEN")
     if not token:
-        raise RuntimeError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
-    return token
+        raise CredentialError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
+    sandbox = str(os.getenv("UPSTOX_SANDBOX", "false")).lower() in {"1", "true", "yes"}
+    algo_name = os.getenv("UPSTOX_ALGO_NAME", "intraday_buy_engine")
+    return UpstoxConfig(
+        access_token=token,
+        sandbox=sandbox,
+        algo_name=algo_name,
+        api_key=_read_env("UPSTOX_API_KEY"),
+        api_secret=_read_env("UPSTOX_API_SECRET"),
+    )
 
 
 def with_retry(fn: Callable[[], T], *, retries: int = 2, base_delay: float = 0.2) -> T:
@@ -130,7 +162,7 @@ class UpstoxSession:
 
     def __init__(self, cfg: Optional[UpstoxConfig] = None):
         if cfg is None:
-            cfg = UpstoxConfig(access_token=_require_token(), sandbox=os.getenv("UPSTOX_SANDBOX", "false").lower() in {"1", "true", "yes"}, algo_name=os.getenv("UPSTOX_ALGO_NAME", "intraday_buy_engine"))
+            cfg = load_upstox_credentials()
         configuration = upstox_client.Configuration(sandbox=cfg.sandbox)
         configuration.access_token = cfg.access_token
         self._api_client = ApiClient(configuration)
@@ -138,6 +170,10 @@ class UpstoxSession:
         self.options_api = upstox_client.OptionsApi(self._api_client)
         self.order_api_v3 = upstox_client.OrderApiV3(self._api_client)
         self.mq_v3 = upstox_client.MarketQuoteV3Api(self._api_client)
+        try:
+            self.portfolio_api = upstox_client.PortfolioApi(self._api_client)
+        except Exception:
+            self.portfolio_api = None  # type: ignore[assignment]
         if os.getenv("UPSTOX_SDK_DEBUG", "").lower() in {"1", "true", "yes"}:
             self.options_api.api_client.configuration.debug = True
 
@@ -200,6 +236,30 @@ class UpstoxSession:
 
         return with_retry(_call)
 
+    def get_positions(self) -> dict:
+        """Return open positions from PortfolioApi."""
+
+        if self.portfolio_api is None:
+            raise RuntimeError("PortfolioApi unavailable; upgrade upstox_client package.")
+
+        def _call() -> dict:
+            resp = self.portfolio_api.get_positions()
+            return resp.to_dict() if hasattr(resp, "to_dict") else resp
+
+        return with_retry(_call)
+
+    def get_holdings(self) -> dict:
+        """Return holdings from PortfolioApi."""
+
+        if self.portfolio_api is None:
+            raise RuntimeError("PortfolioApi unavailable; upgrade upstox_client package.")
+
+        def _call() -> dict:
+            resp = self.portfolio_api.get_holdings()
+            return resp.to_dict() if hasattr(resp, "to_dict") else resp
+
+        return with_retry(_call)
+
     def get_ltp(self, instrument_keys: Sequence[str] | str) -> dict:
         """Call the MarketQuote V3 LTP endpoint for up to ~20 keys."""
 
@@ -253,10 +313,12 @@ class UpstoxSession:
 __all__ = [
     "IST",
     "INDEX_INSTRUMENT_KEYS",
+    "CredentialError",
     "InvalidDateError",
     "PlacedOrder",
     "UpstoxConfig",
     "UpstoxSession",
+    "load_upstox_credentials",
     "normalize_place_order_response",
 ]
 class InvalidDateError(Exception):

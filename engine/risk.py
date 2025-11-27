@@ -7,11 +7,13 @@ from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Optional
 
 from engine.config import IST, RiskLimits
+from engine.data import is_market_data_stale
 from engine.logging_utils import get_logger
 try:
-    from engine.metrics import set_risk_dials
+    from engine.metrics import inc_market_data_stale_blocked_entries, set_risk_dials
 except Exception:  # pragma: no cover
     def set_risk_dials(**kwargs): ...
+    def inc_market_data_stale_blocked_entries(*args, **kwargs): ...
 from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 
@@ -243,6 +245,29 @@ class RiskManager:
         self._emit_event("HALT", reason, None)
         self._kill_switch = True
         self._halt_reason = reason
+
+    def block_if_stale(self, instrument: str, *, threshold: float) -> bool:
+        """Return True if market data is stale and the entry should be blocked."""
+
+        if threshold <= 0:
+            return False
+        if not instrument:
+            return False
+        if not is_market_data_stale(instrument, threshold=threshold):
+            return False
+        self.store.record_risk_event(
+            code="MD_STALE",
+            message=f"Market data stale for {instrument}",
+            symbol=instrument,
+            ts=self._clock(),
+            context={"threshold": threshold},
+        )
+        try:
+            inc_market_data_stale_blocked_entries(instrument)
+        except Exception:
+            pass
+        self._logger.log_event(30, "md_stale_block", instrument=instrument, threshold=threshold)
+        return True
 
     def square_off_all(self, reason: str) -> list[OrderBudget]:
         budgets: list[OrderBudget] = []

@@ -103,3 +103,11 @@ The script:
 - Automatically frees default ports (Prometheus 9090, Streamlit 8502, metrics exporter 9103). Override them via `PROM_PORT`, `STREAMLIT_PORT`, or `METRICS_PORT` if you need different bindings.
 
 Override binaries/paths by exporting `PROM_BIN`, `PROM_CONFIG`, or `PROM_STORAGE` before running the script.
+
+## Tests
+
+Run the fast test suite locally:
+
+```
+./scripts/run_tests.sh
+```

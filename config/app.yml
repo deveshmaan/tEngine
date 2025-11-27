@@ -9,7 +9,7 @@ data:
   price_band_low: 10
   price_band_high: 99999.0
   expiry_ttl_minutes: 5
-  weekly_expiry_weekday: 3
+  weekly_expiry_weekday: 1  # 0=Monday … 6=Sunday; 1 == Tuesday for NIFTY weekly expiry
   subscription_expiry_preference: "current" # allowed: current | next | monthly
   holidays:
     - "2024-08-15"
@@ -18,13 +18,13 @@ data:
   strike_steps:
     NIFTY: 50
     BANKNIFTY: 100
-  weekly_expiry_weekday: 1  # Tuesday (NSE rule)
 
 market_data:
   window_steps: 8 # +/- steps around ATM
   option_type: "BOTH" # CE | PE | BOTH
   stream_mode: "full_d30"
   depth_levels: 5  # render top 5 in UI to keep UI light
+  max_tick_age_seconds: 2.0
 
 risk:
   daily_pnl_stop: -5000        # max you are willing to lose in a day

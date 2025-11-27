@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING
 
@@ -29,6 +31,10 @@ class SQLiteStore:
         self._latest_ts = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
         run_migrations(self._conn)
         self._ensure_run()
+        self._event_queue: deque[Tuple[str, Dict[str, Any], dt.datetime]] = deque()
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._drain_events, name="store-event-worker", daemon=True)
+        self._worker.start()
 
     def _ensure_run(self) -> None:
         with self._lock:
@@ -51,6 +57,17 @@ class SQLiteStore:
         if payload is None:
             return None
         return json.dumps(payload, separators=(",", ":"))
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._worker.is_alive():
+            self._worker.join(timeout=2.0)
+        with self._lock:
+            self._flush_event_queue()
+            try:
+                self._conn.commit()
+            except Exception:
+                pass
 
     # -------------------------------------------------------------- order logs
     def record_order_snapshot(self, order: "Order") -> None:
@@ -151,16 +168,8 @@ class SQLiteStore:
 
     # ---------------------------------------------------------- market events
     def record_market_event(self, event_type: str, payload: Dict[str, Any], ts: Optional[dt.datetime] = None) -> None:
-        with self._lock:
-            stamp = self._ts(ts)
-            self._conn.execute(
-                """
-                INSERT INTO event_log(run_id, ts, event_type, payload)
-                VALUES (?, ?, ?, ?)
-                """,
-                (self.run_id, stamp, event_type, self._json(payload) or "{}"),
-            )
-            self._conn.commit()
+        stamp = self._ts(ts)
+        self._event_queue.append((event_type, dict(payload), dt.datetime.fromisoformat(stamp)))
 
     # -------------------------------------------------------------- cost ledger
     def record_cost(
@@ -360,6 +369,34 @@ class SQLiteStore:
             )
             self._conn.commit()
 
+    # ----------------------------------------------------------- async helpers
+    def _drain_events(self) -> None:
+        """Background worker to flush non-critical market events in batches."""
+
+        while not self._stop_event.is_set():
+            time.sleep(0.5)
+            self._flush_event_queue()
+        self._flush_event_queue()
+
+    def _flush_event_queue(self) -> None:
+        if not self._event_queue:
+            return
+        rows: list[tuple[str, str, str]] = []
+        while self._event_queue:
+            event_type, payload, ts = self._event_queue.popleft()
+            rows.append((self.run_id, ts.isoformat(), event_type, self._json(payload) or "{}"))
+        if not rows:
+            return
+        with self._lock:
+            self._conn.executemany(
+                """
+                INSERT INTO event_log(run_id, ts, event_type, payload)
+                VALUES (?, ?, ?, ?)
+                """,
+                rows,
+            )
+            self._conn.commit()
+
     # -------------------------------------------------------------- query utils
     def list_risk_events(self) -> List[Dict[str, Any]]:
         cur = self._conn.execute(
@@ -459,6 +496,17 @@ class SQLiteStore:
             FROM orders WHERE run_id=? AND idempotency_key=?
             """,
             (self.run_id, key),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def find_order_by_client_id(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        cur = self._conn.execute(
+            """
+            SELECT client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id, idempotency_key
+            FROM orders WHERE run_id=? AND client_order_id=?
+            """,
+            (self.run_id, client_order_id),
         )
         row = cur.fetchone()
         return dict(row) if row else None
