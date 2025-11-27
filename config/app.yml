@@ -9,7 +9,7 @@ data:
   price_band_low: 10
   price_band_high: 99999.0
   expiry_ttl_minutes: 5
-  weekly_expiry_weekday: 1  # 0=Monday … 6=Sunday; 1 == Tuesday for NIFTY weekly expiry
+  weekly_expiry_weekday: 1 # 0=Monday … 6=Sunday; 1 == Tuesday for NIFTY weekly expiry
   subscription_expiry_preference: "current" # allowed: current | next | monthly
   holidays:
     - "2024-08-15"
@@ -23,16 +23,17 @@ market_data:
   window_steps: 8 # +/- steps around ATM
   option_type: "BOTH" # CE | PE | BOTH
   stream_mode: "full_d30"
-  depth_levels: 5  # render top 5 in UI to keep UI light
+  depth_levels: 5 # render top 5 in UI to keep UI light
   max_tick_age_seconds: 2.0
 
 risk:
-  daily_pnl_stop: -5000        # max you are willing to lose in a day
-  per_symbol_loss_stop: -5000
-  max_open_lots: 4
-  notional_premium_cap: 15000
-  no_new_entries_after: "15:10:00"
-  square_off_by: "15:20:00"
+  daily_pnl_stop: -1000 # max you are willing to lose in a day
+  per_symbol_loss_stop: -1000
+  max_open_lots: 2
+  notional_premium_cap: 5000
+  no_new_entries_after: "15:28:00"
+  square_off_by: "15:28:00"
+  max_order_rate: 5
 
 broker:
   max_order_rate: 15
@@ -57,11 +58,11 @@ broker:
 oms:
   resubmit_backoff: 0.5
   reconciliation_interval: 2.0
-  max_inflight_orders: 8
+  max_inflight_orders: 2
   submit:
     default: "auto"
-    max_spread_ticks: 16
-    depth_threshold: 0 
+    max_spread_ticks: 2
+    depth_threshold: 10
 
 exit:
   stop_pct: 0.25
@@ -82,9 +83,9 @@ replay:
   default_speed: 1.0
 
 smoke_test:
-  enabled: false           # turn on for the day
-  underlying: "NIFTY"     # or "BANKNIFTY" later
-  side: "CE"              # start with CALL, you can test PE on another day
-  hold_seconds: 60        # start with 60s, you can bump to 120 later
+  enabled: false # turn on for the day
+  underlying: "NIFTY" # or "BANKNIFTY" later
+  side: "CE" # start with CALL, you can test PE on another day
+  hold_seconds: 60 # start with 60s, you can bump to 120 later
   lots: 1
   max_notional_rupees: 7000

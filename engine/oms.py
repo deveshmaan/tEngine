@@ -279,7 +279,7 @@ class OMS:
                 side=side,
                 qty=qty,
                 order_type=order_type,
-                limit_price=limit_price,
+                limit_price=limit_price if str(order_type).upper() != "MARKET" else None,
                 idempotency_key=idem,
             )
             try:
@@ -468,6 +468,13 @@ class OMS:
             if self._metrics:
                 self._metrics.orders_submitted_total.inc()
             ack = await self._broker.submit_order(order)
+        except BrokerError as exc:
+            if getattr(exc, "code", "") == "insufficient_funds":
+                await self._persist_transition(order, OrderState.SUBMITTED, OrderState.REJECTED, reason="insufficient_funds")
+                self._record_reject_metric("broker")
+                raise
+            await self._persist_transition(order, OrderState.SUBMITTED, OrderState.NEW, reason="retry")
+            raise
         except Exception:
             await self._persist_transition(order, OrderState.SUBMITTED, OrderState.NEW, reason="retry")
             raise
@@ -535,6 +542,8 @@ class OMS:
         order_type = order.order_type.upper()
         if order_type != "MARKET" and order.limit_price is None:
             raise OrderValidationError("price_missing", "Limit orders require a price")
+        if order_type == "MARKET":
+            order.limit_price = None
         qty, rounded_price = validate_order(
             underlying,
             expiry,

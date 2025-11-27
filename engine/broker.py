@@ -1470,6 +1470,8 @@ class UpstoxBroker:
                 if exc.status == 401:
                     await self._handle_auth_failure(sanitized_context)
                     raise BrokerError(code="auth", message=f"{action} returned 401", status=401, context=sanitized_context) from exc
+                if self._is_insufficient_funds_error(exc):
+                    raise BrokerError(code="insufficient_funds", message=str(exc), status=exc.status, context=sanitized_context) from exc
                 if self._should_retry(exc.status) and attempt < retries:
                     await self._record_retry(endpoint)
                     await asyncio.sleep(backoff + random.uniform(0, backoff))
@@ -1504,6 +1506,17 @@ class UpstoxBroker:
             body_text = str(body)
         text = body_text or str(exc)
         return "UDAPI1088" in text or "Invalid date" in text
+
+    @staticmethod
+    def _is_insufficient_funds_error(exc: ApiException) -> bool:
+        body = getattr(exc, "body", "") or ""
+        if isinstance(body, bytes):
+            text = body.decode("utf-8", errors="ignore").lower()
+        else:
+            text = str(body).lower()
+        combined = f"{text} {str(exc).lower()}"
+        tokens = ("insufficient", "add rs", "add funds", "add money", "not enough balance", "insufficient margin")
+        return any(tok in combined for tok in tokens)
 
     def _handle_invalid_date(self, action: str, exc: ApiException, context: Optional[dict[str, Any]]) -> None:
         if self._metrics:

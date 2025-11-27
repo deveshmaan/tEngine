@@ -85,7 +85,8 @@ def load_upstox_credentials() -> UpstoxConfig:
         - UPSTOX_API_SECRET
     """
 
-    token = _read_env("UPSTOX_ACCESS_TOKEN")
+    # token = _read_env("UPSTOX_ACCESS_TOKEN")
+    token = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTI3ZDJhMzhjZDgwMjRlMjQ1NWVlYjgiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY0MjE3NTA3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQyODA4MDB9.I75IlguJ2rPEu9razXGvEIn2WfPCuWJjYDDyfPmivKQ"
     if not token:
         raise CredentialError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     sandbox = str(os.getenv("UPSTOX_SANDBOX", "false")).lower() in {"1", "true", "yes"}
@@ -97,6 +98,12 @@ def load_upstox_credentials() -> UpstoxConfig:
         api_key=_read_env("UPSTOX_API_KEY"),
         api_secret=_read_env("UPSTOX_API_SECRET"),
     )
+
+
+def _api_version() -> str:
+    """Return Upstox API version header (defaults to 2.0)."""
+
+    return os.getenv("UPSTOX_API_VERSION", "2.0")
 
 
 def with_retry(fn: Callable[[], T], *, retries: int = 2, base_delay: float = 0.2) -> T:
@@ -243,7 +250,7 @@ class UpstoxSession:
             raise RuntimeError("PortfolioApi unavailable; upgrade upstox_client package.")
 
         def _call() -> dict:
-            resp = self.portfolio_api.get_positions()
+            resp = self.portfolio_api.get_positions(_api_version())
             return resp.to_dict() if hasattr(resp, "to_dict") else resp
 
         return with_retry(_call)
@@ -255,7 +262,7 @@ class UpstoxSession:
             raise RuntimeError("PortfolioApi unavailable; upgrade upstox_client package.")
 
         def _call() -> dict:
-            resp = self.portfolio_api.get_holdings()
+            resp = self.portfolio_api.get_holdings(_api_version())
             return resp.to_dict() if hasattr(resp, "to_dict") else resp
 
         return with_retry(_call)

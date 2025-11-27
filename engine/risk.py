@@ -332,7 +332,8 @@ class RiskManager:
         return True
 
     def _purge_old_orders(self, now: dt.datetime) -> None:
-        horizon = now - dt.timedelta(seconds=60)
+        # Enforce rate as a per-second ceiling to avoid overly conservative minute-long windows.
+        horizon = now - dt.timedelta(seconds=1)
         while self._order_timestamps and self._order_timestamps[0] < horizon:
             self._order_timestamps.popleft()
 
@@ -362,7 +363,8 @@ class RiskManager:
 
     def _evaluate_limits(self, symbol: str) -> None:
         total_pnl = self._total_pnl()
-        if total_pnl <= -self.cfg.daily_pnl_stop:
+        # daily_pnl_stop is expected to be negative (loss stop). Trigger when total PnL breaches it.
+        if self.cfg.daily_pnl_stop < 0 and total_pnl <= self.cfg.daily_pnl_stop:
             self.trigger_kill("DAILY_STOP")
         state = self._positions.get(symbol)
         if not state:
