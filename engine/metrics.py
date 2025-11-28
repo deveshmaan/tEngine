@@ -119,6 +119,16 @@ class EngineMetrics:
             self.strategy_oi_trend = _NoOpMetric()
             self.strategy_selected_strike = _NoOpMetric()
             self.exit_at_pct_config = _NoOpMetric()
+            self.scalping_signals_total = _NoOpMetric()
+            self.scalping_trades_total = _NoOpMetric()
+            self.scalping_avg_duration_seconds = _NoOpMetric()
+            self.scalping_breakout_window = _NoOpMetric()
+            self.scalping_breakout_margin = _NoOpMetric()
+            self.scalping_volume_mult = _NoOpMetric()
+            self.scalping_pcr_low = _NoOpMetric()
+            self.scalping_pcr_high = _NoOpMetric()
+            self.scalping_spread_max_pct = _NoOpMetric()
+            self.scalping_risk_pct = _NoOpMetric()
             return
         registry_kwargs = {"registry": self._registry} if self._registry is not None else {}
         self.engine_up = Gauge("engine_up", "Engine up status", **registry_kwargs)
@@ -279,6 +289,16 @@ class EngineMetrics:
             self.strategy_oi_trend = strategy_oi_trend
             self.strategy_selected_strike = strategy_selected_strike
             self.exit_at_pct_config = exit_at_pct_config
+            self.scalping_signals_total = scalping_signals_total
+            self.scalping_trades_total = scalping_trades_total
+            self.scalping_avg_duration_seconds = scalping_avg_duration_seconds
+            self.scalping_breakout_window = scalping_breakout_window
+            self.scalping_breakout_margin = scalping_breakout_margin
+            self.scalping_volume_mult = scalping_volume_mult
+            self.scalping_pcr_low = scalping_pcr_low
+            self.scalping_pcr_high = scalping_pcr_high
+            self.scalping_spread_max_pct = scalping_spread_max_pct
+            self.scalping_risk_pct = scalping_risk_pct
         except Exception:
             pass
 
@@ -823,6 +843,16 @@ exit_trailing_step_config = _gauge("exit_trailing_step_config", "Config: premium
 exit_time_buffer_minutes_config = _gauge("exit_time_buffer_minutes_config", "Config: minutes before expiry to force exit.")
 exit_partial_tp_mult_config = _gauge("exit_partial_tp_mult_config", "Config: premium multiple to take partial profit.")
 exit_at_pct_config = _gauge("exit_at_pct_config", "Config: ATR multiple for trailing stop.")
+scalping_signals_total = _counter("scalping_signals_total", "Scalping signals emitted.")
+scalping_trades_total = _counter("scalping_trades_total", "Scalping trades submitted.")
+scalping_avg_duration_seconds = _gauge("scalping_avg_duration_seconds", "Average scalp duration in seconds.")
+scalping_breakout_window = _gauge("scalping_breakout_window", "Scalping breakout window (bars).")
+scalping_breakout_margin = _gauge("scalping_breakout_margin", "Scalping breakout margin (price units).")
+scalping_volume_mult = _gauge("scalping_volume_mult", "Scalping volume multiplier.")
+scalping_pcr_low = _gauge("scalping_pcr_low", "Scalping PCR lower bound.")
+scalping_pcr_high = _gauge("scalping_pcr_high", "Scalping PCR upper bound.")
+scalping_spread_max_pct = _gauge("scalping_spread_max_pct", "Max allowed spread pct for scalps.")
+scalping_risk_pct = _gauge("scalping_risk_pct", "Risk per scalp (% of capital).")
 strategy_realized_vol = _gauge("strategy_realized_vol", "Realized 1m return volatility", labelnames=("symbol",))
 strategy_realized_vol_avg = _gauge("strategy_realized_vol_avg", "Average realized volatility", labelnames=("symbol",))
 strategy_vol_breakout_state = _gauge("strategy_vol_breakout_state", "1 when realized vol is in breakout", labelnames=("symbol",))
@@ -945,6 +975,24 @@ def set_exit_config_metrics(trailing_pct: float, trailing_step: float, time_buff
     exit_at_pct_config.set(float(at_pct))
 
 
+def set_scalping_config_metrics(
+    breakout_window: float,
+    breakout_margin: float,
+    volume_mult: float,
+    pcr_low: float,
+    pcr_high: float,
+    spread_max_pct: float,
+    risk_pct: float,
+) -> None:
+    scalping_breakout_window.set(float(breakout_window))
+    scalping_breakout_margin.set(float(breakout_margin))
+    scalping_volume_mult.set(float(volume_mult))
+    scalping_pcr_low.set(float(pcr_low))
+    scalping_pcr_high.set(float(pcr_high))
+    scalping_spread_max_pct.set(float(spread_max_pct))
+    scalping_risk_pct.set(float(risk_pct))
+
+
 __all__ += [
     "md_decode_errors_total",
     "md_messages_total",
@@ -978,6 +1026,16 @@ __all__ += [
     "exit_time_buffer_minutes_config",
     "exit_partial_tp_mult_config",
     "exit_at_pct_config",
+    "scalping_signals_total",
+    "scalping_trades_total",
+    "scalping_avg_duration_seconds",
+    "scalping_breakout_window",
+    "scalping_breakout_margin",
+    "scalping_volume_mult",
+    "scalping_pcr_low",
+    "scalping_pcr_high",
+    "scalping_spread_max_pct",
+    "scalping_risk_pct",
     "strategy_realized_vol",
     "strategy_realized_vol_avg",
     "strategy_vol_breakout_state",
@@ -1002,4 +1060,5 @@ __all__ += [
     "set_strategy_config_metrics",
     "set_capital_config",
     "set_exit_config_metrics",
+    "set_scalping_config_metrics",
 ]

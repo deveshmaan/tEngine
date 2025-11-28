@@ -143,6 +143,8 @@ class RiskLimits:
     square_off_by: dt.time
     risk_percent_per_trade: float = 1.0
     post_close_behavior: str = "halt_if_flat"
+    scalping_risk_pct: float = 0.5
+    scalping_trades_per_hour: int = 30
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "RiskLimits":
@@ -159,6 +161,8 @@ class RiskLimits:
             square_off_by=_parse_time_str(str(payload["square_off_by"])),
             risk_percent_per_trade=float(payload.get("risk_percent_per_trade", 1.0)),
             post_close_behavior=behavior,
+            scalping_risk_pct=float(payload.get("scalping_risk_pct", 0.5)),
+            scalping_trades_per_hour=int(payload.get("scalping_trades_per_hour", 30)),
         )
 
 
@@ -380,6 +384,12 @@ class StrategyConfig:
     gamma_threshold: float = 0.0
     min_minutes_to_expiry: int = 0
     event_halt_minutes: int = 0
+    # Scalping-specific
+    breakout_window: int = 5
+    breakout_margin: float = 0.0
+    volume_mult: float = 1.5
+    pcr_range: tuple[float, float] = (0.7, 1.3)
+    spread_max_pct: float = 0.05
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "StrategyConfig":
@@ -435,6 +445,30 @@ class StrategyConfig:
             event_halt = int(payload.get("event_halt_minutes", 0))
         except (TypeError, ValueError):
             event_halt = 0
+        try:
+            breakout_window = int(payload.get("breakout_window", 5))
+        except (TypeError, ValueError):
+            breakout_window = 5
+        try:
+            breakout_margin = float(payload.get("breakout_margin", 0.0))
+        except (TypeError, ValueError):
+            breakout_margin = 0.0
+        try:
+            volume_mult = float(payload.get("volume_mult", 1.5))
+        except (TypeError, ValueError):
+            volume_mult = 1.5
+        try:
+            pcr_low = float(payload.get("pcr_range", (0.7, 1.3))[0] if isinstance(payload.get("pcr_range"), (list, tuple)) else payload.get("pcr_range_low", 0.7))
+        except Exception:
+            pcr_low = 0.7
+        try:
+            pcr_high = float(payload.get("pcr_range", (0.7, 1.3))[1] if isinstance(payload.get("pcr_range"), (list, tuple)) else payload.get("pcr_range_high", 1.3))
+        except Exception:
+            pcr_high = 1.3
+        try:
+            spread_max_pct = float(payload.get("spread_max_pct", 0.05))
+        except (TypeError, ValueError):
+            spread_max_pct = 0.05
         event_path = str(payload.get("event_file_path") or "").strip() or None
         short = max(short_val, 1)
         long = max(long_val, short + 1)
@@ -453,6 +487,11 @@ class StrategyConfig:
             gamma_threshold=max(gamma_thr, 0.0),
             min_minutes_to_expiry=max(min_expiry_minutes, 0),
             event_halt_minutes=max(event_halt, 0),
+            breakout_window=max(breakout_window, 1),
+            breakout_margin=max(breakout_margin, 0.0),
+            volume_mult=max(volume_mult, 0.0),
+            pcr_range=(max(pcr_low, 0.0), max(pcr_high, 0.0)),
+            spread_max_pct=max(spread_max_pct, 0.0),
         )
 
 
@@ -518,6 +557,9 @@ class ExitConfig:
     time_buffer_minutes: int = 0
     partial_tp_mult: float = 0.0
     at_pct: float = 0.0
+    scalping_profit_target_pct: float = 0.0
+    scalping_stop_loss_pct: float = 0.0
+    scalping_time_limit_minutes: int = 0
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "ExitConfig":
@@ -549,6 +591,9 @@ class ExitConfig:
             time_buffer_minutes=_coerce_int("time_buffer_minutes", 0),
             partial_tp_mult=_coerce_float("partial_tp_mult", 0.0),
             at_pct=_coerce_float("at_pct", 0.0),
+            scalping_profit_target_pct=_coerce_float("scalping_profit_target_pct", 0.0),
+            scalping_stop_loss_pct=_coerce_float("scalping_stop_loss_pct", 0.0),
+            scalping_time_limit_minutes=_coerce_int("scalping_time_limit_minutes", 0),
         )
 
 
