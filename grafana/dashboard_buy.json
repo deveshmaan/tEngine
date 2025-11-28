@@ -173,6 +173,26 @@
         {"expr":"strategy_realized_vol{symbol=\"NIFTY\"}","legendFormat":"realized","refId":"RV"},
         {"expr":"strategy_realized_vol_avg{symbol=\"NIFTY\"}","legendFormat":"avg","refId":"AVG"}
       ]
+    },
+
+    { "type":"stat","title":"IMI (NIFTY)","gridPos":{"x":0,"y":65,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"percent","decimals":1,"thresholds":{"mode":"absolute","steps":[{"color":"red","value":0},{"color":"green","value":30},{"color":"yellow","value":70}]}}},
+      "targets":[{"expr":"strategy_imi{symbol=\"NIFTY\"}","refId":"A"}]
+    },
+    { "type":"stat","title":"PCR (NIFTY)","gridPos":{"x":6,"y":65,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"strategy_pcr{symbol=\"NIFTY\"}","refId":"A"}]
+    },
+    { "type":"stat","title":"IV Percentile (NIFTY)","gridPos":{"x":12,"y":65,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"percent","decimals":1}},
+      "targets":[{"expr":"strategy_iv_percentile{symbol=\"NIFTY\"}","refId":"A"}]
+    },
+    { "type":"stat","title":"OI Trend (last)","gridPos":{"x":18,"y":65,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"max(strategy_oi_trend)","refId":"A"}],
+      "fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"-1":{"text":"Falling"},"0":{"text":"Neutral"},"1":{"text":"Rising"}}}]}}
     }
   ]
 }

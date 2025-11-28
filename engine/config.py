@@ -370,6 +370,16 @@ class StrategyConfig:
     long_ma: int = 20
     iv_threshold: float = 0.0
     vol_breakout_mult: float = 1.5
+    imi_period: int = 14
+    pcr_extreme_high: float = 1.3
+    pcr_extreme_low: float = 0.7
+    iv_percentile_threshold: float = 0.6
+    iv_exit_percentile: float = 0.9
+    oi_volume_min_threshold: float = 0.0
+    event_file_path: Optional[str] = None
+    gamma_threshold: float = 0.0
+    min_minutes_to_expiry: int = 0
+    event_halt_minutes: int = 0
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "StrategyConfig":
@@ -389,9 +399,61 @@ class StrategyConfig:
             vol_mult_val = float(payload.get("vol_breakout_mult", 1.5))
         except (TypeError, ValueError):
             vol_mult_val = 1.5
+        try:
+            imi_val = int(payload.get("imi_period", 14))
+        except (TypeError, ValueError):
+            imi_val = 14
+        try:
+            pcr_hi = float(payload.get("pcr_extreme_high", 1.3))
+        except (TypeError, ValueError):
+            pcr_hi = 1.3
+        try:
+            pcr_lo = float(payload.get("pcr_extreme_low", 0.7))
+        except (TypeError, ValueError):
+            pcr_lo = 0.7
+        try:
+            iv_pct = float(payload.get("iv_percentile_threshold", 0.6))
+        except (TypeError, ValueError):
+            iv_pct = 0.6
+        try:
+            iv_exit_pct = float(payload.get("iv_exit_percentile", 0.9))
+        except (TypeError, ValueError):
+            iv_exit_pct = 0.9
+        try:
+            oi_vol_min = float(payload.get("oi_volume_min_threshold", 0.0))
+        except (TypeError, ValueError):
+            oi_vol_min = 0.0
+        try:
+            gamma_thr = float(payload.get("gamma_threshold", 0.0))
+        except (TypeError, ValueError):
+            gamma_thr = 0.0
+        try:
+            min_expiry_minutes = int(payload.get("min_minutes_to_expiry", 0))
+        except (TypeError, ValueError):
+            min_expiry_minutes = 0
+        try:
+            event_halt = int(payload.get("event_halt_minutes", 0))
+        except (TypeError, ValueError):
+            event_halt = 0
+        event_path = str(payload.get("event_file_path") or "").strip() or None
         short = max(short_val, 1)
         long = max(long_val, short + 1)
-        return StrategyConfig(short_ma=short, long_ma=long, iv_threshold=max(iv_val, 0.0), vol_breakout_mult=max(vol_mult_val, 0.0))
+        return StrategyConfig(
+            short_ma=short,
+            long_ma=long,
+            iv_threshold=max(iv_val, 0.0),
+            vol_breakout_mult=max(vol_mult_val, 0.0),
+            imi_period=max(imi_val, 1),
+            pcr_extreme_high=max(pcr_hi, 0.0),
+            pcr_extreme_low=max(pcr_lo, 0.0),
+            iv_percentile_threshold=max(iv_pct, 0.0),
+            iv_exit_percentile=max(iv_exit_pct, 0.0),
+            oi_volume_min_threshold=max(oi_vol_min, 0.0),
+            event_file_path=event_path,
+            gamma_threshold=max(gamma_thr, 0.0),
+            min_minutes_to_expiry=max(min_expiry_minutes, 0),
+            event_halt_minutes=max(event_halt, 0),
+        )
 
 
 @dataclass(frozen=True)
@@ -455,6 +517,7 @@ class ExitConfig:
     trailing_step: float = 0.0
     time_buffer_minutes: int = 0
     partial_tp_mult: float = 0.0
+    at_pct: float = 0.0
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "ExitConfig":
@@ -485,6 +548,7 @@ class ExitConfig:
             trailing_step=_coerce_float("trailing_step", 0.0),
             time_buffer_minutes=_coerce_int("time_buffer_minutes", 0),
             partial_tp_mult=_coerce_float("partial_tp_mult", 0.0),
+            at_pct=_coerce_float("at_pct", 0.0),
         )
 
 
