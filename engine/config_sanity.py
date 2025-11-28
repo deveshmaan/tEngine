@@ -66,6 +66,12 @@ def sanity_check_config(cfg: EngineConfig) -> None:
     iv_threshold = getattr(cfg.strategy, "iv_threshold", 0.0)
     if iv_threshold < 0:
         _err("strategy_iv_threshold", "strategy.iv_threshold must be >= 0.")
+    vol_mult = getattr(cfg.strategy, "vol_breakout_mult", 0.0)
+    if vol_mult <= 0:
+        _err("strategy_vol_breakout_mult", "strategy.vol_breakout_mult must be > 0.")
+    bn_vol_mult = getattr(cfg.banknifty, "vol_breakout_mult", 0.0)
+    if bn_vol_mult <= 0:
+        _err("banknifty_vol_breakout_mult", "banknifty.vol_breakout_mult must be > 0.")
 
     for ip in getattr(cfg, "allowed_ips", ()):
         try:
@@ -73,10 +79,10 @@ def sanity_check_config(cfg: EngineConfig) -> None:
         except ValueError:
             _err("allowed_ips", f"Invalid allowed IP entry: {ip}")
 
-    if not _within(cfg.exit.stop_pct, 0.0, 1.0):
-        _err("exit_stop_pct", "exit.stop_pct must be between 0 and 1.")
-    if not _within(cfg.exit.target1_pct, 0.0, 3.0):
-        _err("exit_target1_pct", "exit.target1_pct must be > 0 and < 3.0.")
+    if cfg.exit.stop_pct < 0 or cfg.exit.stop_pct >= 1:
+        _err("exit_stop_pct", "exit.stop_pct must be >= 0 and < 1.")
+    if cfg.exit.target1_pct < 0 or cfg.exit.target1_pct >= 3.0:
+        _err("exit_target1_pct", "exit.target1_pct must be >= 0 and < 3.0.")
     if not _within(float(cfg.exit.max_holding_minutes), 0.0, 120.0, inclusive_high=True):
         _err("exit_max_holding_minutes", "exit.max_holding_minutes must be > 0 and <= 120 minutes.")
     if cfg.exit.trailing_stop_pct < 0 or cfg.exit.trailing_stop_pct >= 1:
@@ -85,6 +91,14 @@ def sanity_check_config(cfg: EngineConfig) -> None:
         _err("exit_time_stop_minutes", "exit.time_stop_minutes must be >= 0.")
     if cfg.exit.partial_target_multiplier < 0:
         _err("exit_partial_target_multiplier", "exit.partial_target_multiplier must be >= 0.")
+    if getattr(cfg.exit, "trailing_pct", 0.0) < 0 or getattr(cfg.exit, "trailing_pct", 0.0) >= 1:
+        _err("exit_trailing_pct", "exit.trailing_pct must be >= 0 and < 1.")
+    if getattr(cfg.exit, "trailing_step", 0.0) < 0 or getattr(cfg.exit, "trailing_step", 0.0) >= 1:
+        _err("exit_trailing_step", "exit.trailing_step must be >= 0 and < 1.")
+    if getattr(cfg.exit, "time_buffer_minutes", 0) < 0:
+        _err("exit_time_buffer_minutes", "exit.time_buffer_minutes must be >= 0.")
+    if getattr(cfg.exit, "partial_tp_mult", 0.0) < 0:
+        _err("exit_partial_tp_mult", "exit.partial_tp_mult must be >= 0.")
 
     rate_limits = cfg.broker.rate_limits
     rates = (

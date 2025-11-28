@@ -49,7 +49,7 @@ print("Config:", dict(UNDERLYING=UNDERLYING, DRY_RUN=DRY_RUN, TARGET=EXIT_TARGET
 
 def make_configuration():
     cfg = upstox_client.Configuration(sandbox=USE_SANDBOX)
-    cfg.access_token = os.environ.get("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTI3ZDJhMzhjZDgwMjRlMjQ1NWVlYjgiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY0MjE3NTA3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQyODA4MDB9.I75IlguJ2rPEu9razXGvEIn2WfPCuWJjYDDyfPmivKQ").strip()
+    cfg.access_token = os.environ.get("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTI5NDhlZmY0NmQ1ZjdjYTNkY2QwNGQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY0MzEzMzI3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQzNjcyMDB9.v6OgGq9GB_jUf9udvhMs3uZ3kF1FAnmQtWczzK55FyM").strip()
     if not cfg.access_token:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN is not set.")
     return cfg

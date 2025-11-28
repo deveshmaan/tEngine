@@ -520,6 +520,7 @@ class UpstoxBroker:
             raise
         except Exception as exc:
             raise RuntimeError(f"Static IP validation failed: {exc}") from exc
+        self._static_ip_ok = True
         self._session_factory = session_factory or self._default_session_factory
         self._session = self._session_factory(None)
         self._stream = stream_client
@@ -740,6 +741,20 @@ class UpstoxBroker:
             self._watchdog = None
         if self._stream:
             await self._stream.close()
+
+    def static_ip_ok(self) -> bool:
+        return bool(self._static_ip_ok)
+
+    def is_streaming_alive(self, max_lag_seconds: float = 5.0) -> bool:
+        if self._stop.is_set():
+            return False
+        if not self._stream:
+            return False
+        try:
+            allowed_lag = max(float(max_lag_seconds), float(self._cfg.ws_heartbeat_interval))
+        except Exception:
+            allowed_lag = max_lag_seconds
+        return (time.monotonic() - self._last_ws_heartbeat) <= max(allowed_lag, 0.0)
 
     async def submit_order(self, order: Order) -> BrokerOrderAck:
         if self._halt_new_orders and order.side.upper() == "BUY":

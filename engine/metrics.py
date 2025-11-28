@@ -100,6 +100,19 @@ class EngineMetrics:
             self.market_data_stale_blocked_entries_total = _NoOpMetric()
             self.order_reconciliation_errors_total = _NoOpMetric()
             self.order_reconciliation_duration_ms = _NoOpMetric()
+            self.strategy_vol_breakout_mult = _NoOpMetric()
+            self.banknifty_vol_breakout_mult = _NoOpMetric()
+            self.exit_trailing_pct_config = _NoOpMetric()
+            self.exit_trailing_step_config = _NoOpMetric()
+            self.exit_time_buffer_minutes_config = _NoOpMetric()
+            self.exit_partial_tp_mult_config = _NoOpMetric()
+            self.strategy_realized_vol = _NoOpMetric()
+            self.strategy_realized_vol_avg = _NoOpMetric()
+            self.strategy_vol_breakout_state = _NoOpMetric()
+            self.strategy_ma_crossover_state = _NoOpMetric()
+            self.strategy_position_size = _NoOpMetric()
+            self.strategy_short_ema = _NoOpMetric()
+            self.strategy_long_ema = _NoOpMetric()
             return
         registry_kwargs = {"registry": self._registry} if self._registry is not None else {}
         self.engine_up = Gauge("engine_up", "Engine up status", **registry_kwargs)
@@ -239,6 +252,23 @@ class EngineMetrics:
             buckets=(5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000),
             **registry_kwargs,
         )
+        # Expose config/runtime strategy gauges as attributes for convenience.
+        try:
+            self.strategy_vol_breakout_mult = strategy_vol_breakout_mult
+            self.banknifty_vol_breakout_mult = banknifty_vol_breakout_mult
+            self.exit_trailing_pct_config = exit_trailing_pct_config
+            self.exit_trailing_step_config = exit_trailing_step_config
+            self.exit_time_buffer_minutes_config = exit_time_buffer_minutes_config
+            self.exit_partial_tp_mult_config = exit_partial_tp_mult_config
+            self.strategy_realized_vol = strategy_realized_vol
+            self.strategy_realized_vol_avg = strategy_realized_vol_avg
+            self.strategy_vol_breakout_state = strategy_vol_breakout_state
+            self.strategy_ma_crossover_state = strategy_ma_crossover_state
+            self.strategy_position_size = strategy_position_size
+            self.strategy_short_ema = strategy_short_ema
+            self.strategy_long_ema = strategy_long_ema
+        except Exception:
+            pass
 
     def beat(self) -> None:
         self.heartbeat_ts.set(time.time())
@@ -774,6 +804,19 @@ capital_base_rupees = _gauge("capital_base_rupees", "Configured capital base for
 strategy_short_ma = _gauge("strategy_short_ma", "Short MA lookback for the strategy.")
 strategy_long_ma = _gauge("strategy_long_ma", "Long MA lookback for the strategy.")
 strategy_iv_threshold = _gauge("strategy_iv_threshold", "IV threshold gate for entries.")
+strategy_vol_breakout_mult = _gauge("strategy_vol_breakout_mult", "Volatility breakout multiple for base index.")
+banknifty_vol_breakout_mult = _gauge("banknifty_vol_breakout_mult", "Volatility breakout multiple override for BANKNIFTY.")
+exit_trailing_pct_config = _gauge("exit_trailing_pct_config", "Config: premium trailing initial stop percent.")
+exit_trailing_step_config = _gauge("exit_trailing_step_config", "Config: premium trailing giveback percent of gains.")
+exit_time_buffer_minutes_config = _gauge("exit_time_buffer_minutes_config", "Config: minutes before expiry to force exit.")
+exit_partial_tp_mult_config = _gauge("exit_partial_tp_mult_config", "Config: premium multiple to take partial profit.")
+strategy_realized_vol = _gauge("strategy_realized_vol", "Realized 1m return volatility", labelnames=("symbol",))
+strategy_realized_vol_avg = _gauge("strategy_realized_vol_avg", "Average realized volatility", labelnames=("symbol",))
+strategy_vol_breakout_state = _gauge("strategy_vol_breakout_state", "1 when realized vol is in breakout", labelnames=("symbol",))
+strategy_ma_crossover_state = _gauge("strategy_ma_crossover_state", "1 when short EMA is above long EMA", labelnames=("symbol",))
+strategy_position_size = _gauge("strategy_position_size", "Last computed position size (qty)", labelnames=("instrument",))
+strategy_short_ema = _gauge("strategy_short_ema", "Short EMA value", labelnames=("symbol",))
+strategy_long_ema = _gauge("strategy_long_ema", "Long EMA value", labelnames=("symbol",))
 
 
 # --- Convenience publishers (safe no-ops if unused) ---
@@ -855,15 +898,32 @@ def set_risk_dials(
         minutes_to_square_off.set(int(minutes_to_sqoff))
 
 
-def set_strategy_config_metrics(short_ma: float, long_ma: float, iv_threshold: float) -> None:
+def set_strategy_config_metrics(
+    short_ma: float,
+    long_ma: float,
+    iv_threshold: float,
+    vol_breakout_mult: float | None = None,
+    banknifty_vol_breakout_mult: float | None = None,
+) -> None:
     strategy_short_ma.set(float(short_ma))
     strategy_long_ma.set(float(long_ma))
     strategy_iv_threshold.set(float(iv_threshold))
+    if vol_breakout_mult is not None:
+        strategy_vol_breakout_mult.set(float(vol_breakout_mult))
+    if banknifty_vol_breakout_mult is not None:
+        banknifty_vol_breakout_mult.set(float(banknifty_vol_breakout_mult))
 
 
 def set_capital_config(capital_base: float, risk_pct: float) -> None:
     capital_base_rupees.set(float(capital_base))
     risk_percent_per_trade.set(float(risk_pct))
+
+
+def set_exit_config_metrics(trailing_pct: float, trailing_step: float, time_buffer_minutes: float, partial_tp_mult: float) -> None:
+    exit_trailing_pct_config.set(float(trailing_pct))
+    exit_trailing_step_config.set(float(trailing_step))
+    exit_time_buffer_minutes_config.set(float(time_buffer_minutes))
+    exit_partial_tp_mult_config.set(float(partial_tp_mult))
 
 
 __all__ += [
@@ -892,6 +952,19 @@ __all__ += [
     "strategy_short_ma",
     "strategy_long_ma",
     "strategy_iv_threshold",
+    "strategy_vol_breakout_mult",
+    "banknifty_vol_breakout_mult",
+    "exit_trailing_pct_config",
+    "exit_trailing_step_config",
+    "exit_time_buffer_minutes_config",
+    "exit_partial_tp_mult_config",
+    "strategy_realized_vol",
+    "strategy_realized_vol_avg",
+    "strategy_vol_breakout_state",
+    "strategy_ma_crossover_state",
+    "strategy_position_size",
+    "strategy_short_ema",
+    "strategy_long_ema",
     "strategy_entry_signals_total",
     "record_md_frame",
     "publish_spread",
@@ -903,4 +976,5 @@ __all__ += [
     "set_risk_dials",
     "set_strategy_config_metrics",
     "set_capital_config",
+    "set_exit_config_metrics",
 ]

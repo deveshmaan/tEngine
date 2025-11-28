@@ -85,7 +85,8 @@ def load_upstox_credentials(secrets: Optional[object] = None) -> UpstoxConfig:
         - UPSTOX_API_SECRET
     """
 
-    token = getattr(secrets, "upstox_access_token", None) or _read_env("UPSTOX_ACCESS_TOKEN")
+    # token = getattr(secrets, "upstox_access_token", None) or _read_env("UPSTOX_ACCESS_TOKEN")
+    token = 'eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTI5NDhlZmY0NmQ1ZjdjYTNkY2QwNGQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY0MzEzMzI3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQzNjcyMDB9.v6OgGq9GB_jUf9udvhMs3uZ3kF1FAnmQtWczzK55FyM'
     if not token:
         raise CredentialError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     sandbox = str(os.getenv("UPSTOX_SANDBOX", "false")).lower() in {"1", "true", "yes"}

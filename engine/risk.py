@@ -38,6 +38,8 @@ def compute_position_size(
     lot_size: int,
     *,
     stop_loss_pct: float = 0.1,
+    max_open_lots: Optional[float] = None,
+    open_lots: float = 0.0,
 ) -> int:
     """
     Return quantity (aligned to lot size) sized off risk per trade.
@@ -51,14 +53,21 @@ def compute_position_size(
         stop_pct = float(stop_loss_pct)
     except (TypeError, ValueError):
         return 0
-    if capital <= 0 or pct <= 0 or premium_val <= 0 or lot <= 0 or stop_pct <= 0:
+    if capital <= 0 or pct <= 0 or premium_val <= 0 or lot <= 0:
         return 0
     risk_fraction = pct / 100.0
-    per_lot_risk = premium_val * lot * stop_pct
-    if per_lot_risk <= 0:
+    budget = capital * risk_fraction
+    per_lot_cost = premium_val * lot
+    if budget <= 0 or per_lot_cost <= 0:
         return 0
-    lots = max(int(round((capital * risk_fraction) / per_lot_risk)), 1)
-    return lots * lot
+    lots = int(budget // per_lot_cost)
+    if max_open_lots is not None:
+        try:
+            remaining = max(float(max_open_lots) - float(open_lots), 0.0)
+            lots = min(lots, int(remaining))
+        except Exception:
+            lots = max(lots, 0)
+    return max(lots, 0) * lot
 
 
 @dataclass
@@ -205,7 +214,16 @@ class RiskManager:
     # ----------------------------------------------------------------- checks
     def position_size(self, *, premium: float, lot_size: int, stop_loss_pct: Optional[float] = None) -> int:
         stop_pct = self._default_stop_loss_pct if stop_loss_pct is None else stop_loss_pct
-        qty = compute_position_size(self.capital_base, getattr(self.cfg, "risk_percent_per_trade", 0.0), premium, lot_size, stop_loss_pct=stop_pct)
+        open_lots = self._total_open_lots()
+        qty = compute_position_size(
+            self.capital_base,
+            getattr(self.cfg, "risk_percent_per_trade", 0.0),
+            premium,
+            lot_size,
+            stop_loss_pct=stop_pct,
+            max_open_lots=getattr(self.cfg, "max_open_lots", None),
+            open_lots=open_lots,
+        )
         if qty > 0:
             try:
                 lot = max(int(lot_size), 1)

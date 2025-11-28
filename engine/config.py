@@ -369,6 +369,7 @@ class StrategyConfig:
     short_ma: int = 5
     long_ma: int = 20
     iv_threshold: float = 0.0
+    vol_breakout_mult: float = 1.5
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "StrategyConfig":
@@ -384,9 +385,26 @@ class StrategyConfig:
             iv_val = float(payload.get("iv_threshold", 0.0))
         except (TypeError, ValueError):
             iv_val = 0.0
+        try:
+            vol_mult_val = float(payload.get("vol_breakout_mult", 1.5))
+        except (TypeError, ValueError):
+            vol_mult_val = 1.5
         short = max(short_val, 1)
         long = max(long_val, short + 1)
-        return StrategyConfig(short_ma=short, long_ma=long, iv_threshold=max(iv_val, 0.0))
+        return StrategyConfig(short_ma=short, long_ma=long, iv_threshold=max(iv_val, 0.0), vol_breakout_mult=max(vol_mult_val, 0.0))
+
+
+@dataclass(frozen=True)
+class BankNiftyConfig:
+    vol_breakout_mult: float = 1.2
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "BankNiftyConfig":
+        try:
+            mult_val = float(payload.get("vol_breakout_mult", 1.2))
+        except (TypeError, ValueError):
+            mult_val = 1.2
+        return BankNiftyConfig(vol_breakout_mult=max(mult_val, 0.0))
 
 
 @dataclass(frozen=True)
@@ -433,6 +451,10 @@ class ExitConfig:
     trailing_stop_pct: float = 0.0
     time_stop_minutes: int = 0
     partial_target_multiplier: float = 0.0
+    trailing_pct: float = 0.0
+    trailing_step: float = 0.0
+    time_buffer_minutes: int = 0
+    partial_tp_mult: float = 0.0
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "ExitConfig":
@@ -459,6 +481,10 @@ class ExitConfig:
             trailing_stop_pct=_coerce_float("trailing_stop_pct", 0.0),
             time_stop_minutes=_coerce_int("time_stop_minutes", 0),
             partial_target_multiplier=_coerce_float("partial_target_multiplier", 0.0),
+            trailing_pct=_coerce_float("trailing_pct", 0.0),
+            trailing_step=_coerce_float("trailing_step", 0.0),
+            time_buffer_minutes=_coerce_int("time_buffer_minutes", 0),
+            partial_tp_mult=_coerce_float("partial_tp_mult", 0.0),
         )
 
 
@@ -478,6 +504,7 @@ class EngineConfig:
     replay: ReplayConfig
     smoke_test: SmokeTestConfig
     exit: ExitConfig
+    banknifty: BankNiftyConfig = field(default_factory=BankNiftyConfig)
     capital_base: float = 0.0
     allowed_ips: tuple[str, ...] = field(default_factory=tuple)
     secrets: SecretsConfig = field(default_factory=SecretsConfig)
@@ -502,6 +529,7 @@ class EngineConfig:
         replay = ReplayConfig.from_dict(raw.get("replay", {}))
         smoke_test = SmokeTestConfig.from_dict(raw.get("smoke_test", {}))
         exit_cfg = ExitConfig.from_dict(raw.get("exit", {}))
+        banknifty = BankNiftyConfig.from_dict(raw.get("banknifty", {}))
         capital_base = float(raw.get("capital_base", 0.0))
         allowed_ips = _parse_allowed_ips(raw.get("allowed_ips"))
         secrets = SecretsConfig.from_env()
@@ -520,6 +548,7 @@ class EngineConfig:
             replay=replay,
             smoke_test=smoke_test,
             exit=exit_cfg,
+            banknifty=banknifty,
             capital_base=capital_base,
             allowed_ips=allowed_ips,
             secrets=secrets,
@@ -568,6 +597,7 @@ def read_config() -> Dict[str, Any]:
 __all__ = [
     "AlertConfig",
     "BrokerConfig",
+    "BankNiftyConfig",
     "CONFIG",
     "DataConfig",
     "EngineConfig",

@@ -20,7 +20,7 @@ data:
     - "2024-12-25"
   strike_steps:
     NIFTY: 50
-    BANKNIFTY: 100
+    BANKNIFTY: 50
 
 market_data:
   window_steps: 8 # +/- steps around ATM
@@ -33,6 +33,10 @@ strategy:
   short_ma: 5
   long_ma: 20
   iv_threshold: 0.0
+  vol_breakout_mult: 1.5
+
+banknifty:
+  vol_breakout_mult: 1.2
 
 risk:
   daily_pnl_stop: -1000 # max you are willing to lose in a day
@@ -75,16 +79,20 @@ oms:
     depth_threshold: 10
 
 exit:
-  stop_pct: 0.25
-  target1_pct: 0.5
+  stop_pct: 0.0
+  target1_pct: 0.0
   partial_fraction: 0.5
   trail_lock_pct: 0.4
   trail_giveback_pct: 0.5
   min_trail_ticks: 3
   max_holding_minutes: 20
-  trailing_stop_pct: 0.05
+  trailing_stop_pct: 0.0
   time_stop_minutes: 30
-  partial_target_multiplier: 2.0
+  partial_target_multiplier: 0.0
+  trailing_pct: 0.2
+  trailing_step: 0.1
+  time_buffer_minutes: 20
+  partial_tp_mult: 2.0
 
 alerts:
   throttle_seconds: 30

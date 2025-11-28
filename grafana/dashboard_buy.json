@@ -146,6 +146,33 @@
       "datasource":{"type":"prometheus","uid":"prometheus"},
       "fieldConfig":{"defaults":{"unit":"ops","decimals":0}},
       "targets":[{"expr":"increase(strategy_evals_total[5m])","legendFormat":"evals_5m","refId":"A"}]
+    },
+
+    { "type":"stat","title":"MA crossover (NIFTY)","gridPos":{"x":0,"y":55,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"strategy_ma_crossover_state{symbol=\"NIFTY\"}","refId":"A"}],
+      "fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"Below"},"1":{"text":"Above"}}}]}}
+    },
+    { "type":"stat","title":"Vol breakout (NIFTY)","gridPos":{"x":6,"y":55,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"strategy_vol_breakout_state{symbol=\"NIFTY\"}","refId":"A"}],
+      "fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"Calm"},"1":{"text":"Breakout"}}}]}}
+    },
+    { "type":"stat","title":"Last position size","gridPos":{"x":12,"y":55,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"max(strategy_position_size)","refId":"A"}]
+    },
+    { "type":"bargauge","title":"Exit triggers (5m)","gridPos":{"x":18,"y":55,"w":6,"h":4},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "targets":[{"expr":"sum by (reason) (increase(exit_events_total[5m]))","refId":"A"}]
+    },
+    { "type":"timeseries","title":"Realized vol vs avg (NIFTY)","gridPos":{"x":0,"y":59,"w":24,"h":6},
+      "datasource":{"type":"prometheus","uid":"prometheus"},
+      "fieldConfig":{"defaults":{"unit":"percentunit","decimals":4}},
+      "targets":[
+        {"expr":"strategy_realized_vol{symbol=\"NIFTY\"}","legendFormat":"realized","refId":"RV"},
+        {"expr":"strategy_realized_vol_avg{symbol=\"NIFTY\"}","legendFormat":"avg","refId":"AVG"}
+      ]
     }
   ]
 }

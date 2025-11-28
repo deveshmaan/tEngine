@@ -46,7 +46,7 @@ class ExitEngine:
         if side_upper == "BUY":
             if not self._exits_enabled():
                 return
-            stop_price = self._stop_price(float(price))
+            stop_price = self._initial_stop_price(symbol, float(price))
             plan = {
                 "entry_price": float(price),
                 "entry_ts": ts.isoformat(),
@@ -60,6 +60,8 @@ class ExitEngine:
                 "pending_exit_ts": None,
                 "highest_price": float(price),
                 "risk_per_unit": self._risk_per_unit(float(price), stop_price),
+                "partial_trigger_price": self._partial_trigger_price(float(price)),
+                "expiry": self._parse_expiry_from_symbol(symbol),
             }
             self.store.upsert_exit_plan(symbol, plan, ts=ts)
             return
@@ -113,43 +115,59 @@ class ExitEngine:
         reason: Optional[str] = None
         exit_qty = qty
 
-        # 1) Hard stop
-        if stop_price and ltp <= stop_price and self.cfg.stop_pct > 0:
-            reason = "STOP"
+        premium_trailing = self._premium_trailing_enabled()
+        if premium_trailing:
+            reason, exit_qty = self._evaluate_premium_trailing(
+                instrument_key,
+                plan,
+                ltp,
+                qty,
+                entry_price,
+                highest_price,
+                ts_dt,
+            )
+        else:
+            # 1) Hard stop
+            if stop_price and ltp <= stop_price and self.cfg.stop_pct > 0:
+                reason = "STOP"
 
-        # 2) Target / partial
-        elif target1_price and ltp >= target1_price and not trailing_active:
-            partial_qty = self._partial_exit_qty(qty - int(plan.get("partial_filled_qty") or 0))
-            trail_anchor = max(trail_anchor, ltp)
-            plan["trailing_active"] = True
-            plan["trail_anchor_price"] = trail_anchor
-            plan["trailing_stop"] = self._compute_trailing_stop(entry_price, trail_anchor, stop_price, trailing_stop, highest_price)
-            if partial_qty > 0:
-                reason = "PARTIAL_TARGET"
-                exit_qty = partial_qty
-                plan["partial_filled_qty"] = plan.get("partial_filled_qty", 0) + partial_qty
-            else:
-                self.store.upsert_exit_plan(instrument_key, plan, ts=ts_dt)
-                return
+            # 2) Target / partial
+            elif target1_price and ltp >= target1_price and not trailing_active:
+                partial_qty = self._partial_exit_qty(qty - int(plan.get("partial_filled_qty") or 0))
+                trail_anchor = max(trail_anchor, ltp)
+                plan["trailing_active"] = True
+                plan["trail_anchor_price"] = trail_anchor
+                plan["trailing_stop"] = self._compute_trailing_stop(entry_price, trail_anchor, stop_price, trailing_stop, highest_price)
+                if partial_qty > 0:
+                    reason = "PARTIAL_TARGET"
+                    exit_qty = partial_qty
+                    plan["partial_filled_qty"] = plan.get("partial_filled_qty", 0) + partial_qty
+                else:
+                    self.store.upsert_exit_plan(instrument_key, plan, ts=ts_dt)
+                    return
 
-        # 3) Trailing stop
-        elif trailing_active:
-            trail_anchor = max(trail_anchor, ltp)
-            plan["trail_anchor_price"] = trail_anchor
-            plan["trailing_stop"] = self._compute_trailing_stop(entry_price, trail_anchor, stop_price, trailing_stop, highest_price)
-            trailing_stop = float(plan["trailing_stop"]) if plan.get("trailing_stop") else None
-            if trailing_stop and ltp <= trailing_stop:
-                reason = "TRAIL"
+            # 3) Trailing stop
+            elif trailing_active:
+                trail_anchor = max(trail_anchor, ltp)
+                plan["trail_anchor_price"] = trail_anchor
+                plan["trailing_stop"] = self._compute_trailing_stop(entry_price, trail_anchor, stop_price, trailing_stop, highest_price)
+                trailing_stop = float(plan["trailing_stop"]) if plan.get("trailing_stop") else None
+                if trailing_stop and ltp <= trailing_stop:
+                    reason = "TRAIL"
 
-        # 4) Time stop
-        time_stop = self.cfg.time_stop_minutes or self.cfg.max_holding_minutes
-        if not reason and time_stop > 0:
-            age_minutes = (ts_dt - entry_ts).total_seconds() / 60.0
-            if age_minutes >= time_stop:
-                above_stop = stop_price is None or ltp > stop_price
-                below_target = target1_price is None or ltp < target1_price
-                if above_stop and below_target:
-                    reason = "TIME"
+            # 4) Time stop
+            time_stop = self.cfg.time_stop_minutes or self.cfg.max_holding_minutes
+            if not reason and time_stop > 0:
+                age_minutes = (ts_dt - entry_ts).total_seconds() / 60.0
+                if age_minutes >= time_stop:
+                    above_stop = stop_price is None or ltp > stop_price
+                    below_target = target1_price is None or ltp < target1_price
+                    if above_stop and below_target:
+                        reason = "TIME"
+
+        expiry_deadline = self._expiry_deadline(instrument_key, plan, ts_dt)
+        if not reason and expiry_deadline and ts_dt >= expiry_deadline:
+            reason = "EXPIRY_BUFFER"
 
         if not reason:
             self.store.upsert_exit_plan(instrument_key, plan, ts=ts_dt)
@@ -231,6 +249,13 @@ class ExitEngine:
         except Exception as exc:  # pragma: no cover - fail-safe
             self._logger.log_event(30, "exit_submit_failed", symbol=instrument, qty=qty, price=ltp, reason=reason, error=str(exc))
 
+    def _initial_stop_price(self, symbol: str, entry: float) -> Optional[float]:
+        pct_cfg = getattr(self.cfg, "trailing_pct", 0.0)
+        if pct_cfg > 0:
+            pct, _ = self._trailing_params(symbol)
+            return max(entry * (1 - pct), 0.0)
+        return self._stop_price(entry)
+
     def _stop_price(self, entry: float) -> Optional[float]:
         if self.cfg.stop_pct <= 0:
             return None
@@ -251,6 +276,12 @@ class ExitEngine:
         fraction = max(min(float(self.cfg.partial_fraction), 1.0), 0.0)
         qty = int(open_qty * fraction)
         return qty if qty > 0 else (1 if open_qty > 0 and fraction > 0 else 0)
+
+    def _partial_trigger_price(self, entry: float) -> Optional[float]:
+        multiplier = getattr(self.cfg, "partial_tp_mult", 0.0)
+        if multiplier and multiplier > 0:
+            return max(entry * multiplier, 0.0)
+        return None
 
     def _compute_trailing_stop(
         self,
@@ -280,6 +311,64 @@ class ExitEngine:
             candidate = anchor - min_move
         return max(candidate, 0.0)
 
+    def _premium_trailing_stop(self, entry_price: float, highest_price: float, floor: Optional[float], giveback_pct: float) -> Optional[float]:
+        if giveback_pct <= 0:
+            return floor
+        gain = max(highest_price - entry_price, 0.0)
+        candidate = highest_price - (gain * giveback_pct)
+        if floor is not None:
+            candidate = max(candidate, floor)
+        return max(candidate, 0.0)
+
+    def _evaluate_premium_trailing(
+        self,
+        instrument: str,
+        plan: Dict[str, Any],
+        ltp: float,
+        qty: int,
+        entry_price: float,
+        highest_price: float,
+        ts: dt.datetime,
+    ) -> tuple[Optional[str], int]:
+        pct, step = self._trailing_params(instrument)
+        base_floor = entry_price * (1 - pct) if pct > 0 else None
+        plan["stop_price"] = base_floor
+        plan["highest_price"] = max(highest_price, ltp)
+        trail_stop = self._premium_trailing_stop(entry_price, plan["highest_price"], base_floor, step)
+        plan["trailing_stop"] = trail_stop
+        plan["trailing_active"] = True
+        plan["trail_anchor_price"] = plan["highest_price"]
+        reason: Optional[str] = None
+        exit_qty = qty
+        partial_trigger = plan.get("partial_trigger_price") or self._partial_trigger_price(entry_price)
+        if partial_trigger and ltp >= partial_trigger:
+            remaining = qty - int(plan.get("partial_filled_qty") or 0)
+            partial_qty = self._partial_exit_qty(remaining)
+            if partial_qty > 0:
+                plan["partial_filled_qty"] = plan.get("partial_filled_qty", 0) + partial_qty
+                exit_qty = partial_qty
+                reason = "PARTIAL_TP"
+        if not reason and trail_stop and ltp <= trail_stop:
+            reason = "TRAIL"
+        if not reason and base_floor and ltp <= base_floor:
+            reason = "STOP"
+        expiry_deadline = self._expiry_deadline(instrument, plan, ts)
+        if not reason and expiry_deadline and ts >= expiry_deadline:
+            reason = "EXPIRY_BUFFER"
+        return reason, exit_qty
+
+    def _trailing_params(self, symbol: str) -> tuple[float, float]:
+        base_pct = max(getattr(self.cfg, "trailing_pct", 0.0), 0.0)
+        base_step = max(getattr(self.cfg, "trailing_step", 0.0), 0.0)
+        if base_pct == 0.0:
+            base_pct = self.cfg.stop_pct if getattr(self.cfg, "stop_pct", 0.0) > 0 else 0.2
+        if base_step == 0.0:
+            base_step = 0.1
+        if symbol and symbol.upper().startswith("BANKNIFTY"):
+            base_pct = max(base_pct, 0.25)
+            base_step = max(base_step, 0.15)
+        return base_pct, base_step
+
     def _parse_ts(self, value: Any) -> dt.datetime:
         if isinstance(value, dt.datetime):
             return value
@@ -293,6 +382,44 @@ class ExitEngine:
             return parsed
         return dt.datetime.now(IST)
 
+    def _premium_trailing_enabled(self) -> bool:
+        return any(
+            [
+                getattr(self.cfg, "trailing_pct", 0.0) > 0,
+                getattr(self.cfg, "trailing_step", 0.0) > 0,
+                getattr(self.cfg, "partial_tp_mult", 0.0) > 0,
+                getattr(self.cfg, "time_buffer_minutes", 0) > 0,
+            ]
+        )
+
+    def _expiry_deadline(self, symbol: str, plan: Dict[str, Any], now: dt.datetime) -> Optional[dt.datetime]:
+        buffer_minutes = getattr(self.cfg, "time_buffer_minutes", 0)
+        if buffer_minutes <= 0:
+            return None
+        expiry_str = plan.get("expiry") or self._parse_expiry_from_symbol(symbol)
+        if not expiry_str:
+            return None
+        try:
+            expiry_date = dt.date.fromisoformat(expiry_str) if isinstance(expiry_str, str) else expiry_str
+        except Exception:
+            return None
+        expiry_dt = dt.datetime.combine(expiry_date, dt.time(15, 30), tzinfo=IST)
+        deadline = expiry_dt - dt.timedelta(minutes=buffer_minutes)
+        return deadline if deadline > now else expiry_dt
+
+    def _parse_expiry_from_symbol(self, symbol: str) -> Optional[str]:
+        if not symbol:
+            return None
+        parts = symbol.split("-")
+        if len(parts) < 3:
+            return None
+        expiry = "-".join(parts[1:-1])
+        try:
+            dt.date.fromisoformat(expiry)
+        except Exception:
+            return None
+        return expiry
+
     def _exits_enabled(self) -> bool:
         return any(
             [
@@ -301,6 +428,10 @@ class ExitEngine:
                 self.cfg.partial_target_multiplier > 0,
                 (self.cfg.time_stop_minutes or 0) > 0 or self.cfg.max_holding_minutes > 0,
                 self.cfg.trailing_stop_pct > 0,
+                getattr(self.cfg, "trailing_pct", 0.0) > 0,
+                getattr(self.cfg, "trailing_step", 0.0) > 0,
+                getattr(self.cfg, "partial_tp_mult", 0.0) > 0,
+                getattr(self.cfg, "time_buffer_minutes", 0) > 0,
             ]
         )
 

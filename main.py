@@ -25,11 +25,12 @@ from engine.instruments import InstrumentResolver
 from engine.logging_utils import configure_logging, get_logger
 from engine.metrics import EngineMetrics, bind_global_metrics, set_subscription_expiry, start_http_server_if_available
 try:
-    from engine.metrics import set_capital_config, set_risk_dials, set_strategy_config_metrics
+    from engine.metrics import set_capital_config, set_exit_config_metrics, set_risk_dials, set_strategy_config_metrics
 except Exception:  # pragma: no cover
     def set_risk_dials(**kwargs): ...
     def set_strategy_config_metrics(*args, **kwargs): ...
     def set_capital_config(*args, **kwargs): ...
+    def set_exit_config_metrics(*args, **kwargs): ...
 from engine.oms import OMS
 from engine.pnl import Execution as PnLExecution, PnLCalculator
 from engine.recovery import RecoveryManager, enforce_intraday_clean_start
@@ -67,8 +68,20 @@ class EngineApp:
         self.metrics = EngineMetrics()
         bind_global_metrics(self.metrics)
         try:
-            set_strategy_config_metrics(config.strategy.short_ma, config.strategy.long_ma, config.strategy.iv_threshold)
+            set_strategy_config_metrics(
+                config.strategy.short_ma,
+                config.strategy.long_ma,
+                config.strategy.iv_threshold,
+                config.strategy.vol_breakout_mult,
+                getattr(config.banknifty, "vol_breakout_mult", None),
+            )
             set_capital_config(config.capital_base, config.risk.risk_percent_per_trade)
+            set_exit_config_metrics(
+                getattr(config.exit, "trailing_pct", 0.0),
+                getattr(config.exit, "trailing_step", 0.0),
+                getattr(config.exit, "time_buffer_minutes", 0),
+                getattr(config.exit, "partial_tp_mult", 0.0),
+            )
         except Exception:
             pass
         self.risk = RiskManager(config.risk, self.store, capital_base=config.capital_base)
@@ -123,6 +136,7 @@ class EngineApp:
         self._square_task: Optional[asyncio.Task] = None
         self._strategy_task: Optional[asyncio.Task] = None
         self._reconcile_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._tasks: List[asyncio.Task] = []
 
     def _choose_subscription_expiry(self, symbol: str) -> str:
@@ -167,6 +181,10 @@ class EngineApp:
         metrics_started = start_http_server_if_available(metrics_port)
         self.logger.log_event(20, "metrics_bootstrap", port=metrics_port, started=metrics_started)
         self.metrics.engine_up.set(1)
+        try:
+            self.metrics.beat()
+        except Exception:
+            pass
         self._subscription_expiry_for(self.cfg.data.index_symbol)
         await self.broker.start()
         decision = self.broker.session_guard_decision or {"action": "continue", "state": 1, "positions": 0}
@@ -200,10 +218,11 @@ class EngineApp:
         marks_task = asyncio.create_task(self._consume_market_marks(), name="pnl-marks")
         snapshot_task = asyncio.create_task(self._pnl_snapshot_loop(), name="pnl-snapshot")
         control_task = asyncio.create_task(self._watch_control_intents(), name="control-intents")
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="metrics-heartbeat")
         if not replay_cfg:
             self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="order-reconcile")
             tasks.append(self._reconcile_task)
-        tasks.extend([fills_task, marks_task, snapshot_task, control_task])
+        tasks.extend([fills_task, marks_task, snapshot_task, control_task, self._heartbeat_task])
         self._tasks = [task for task in tasks if task]
 
         should_run_smoke = bool(self.cfg.smoke_test.enabled and not _is_dry_run_env() and replay_cfg is None)
@@ -239,6 +258,20 @@ class EngineApp:
             pass
         self.metrics.engine_up.set(0)
         self.logger.log_event(20, "engine_stopped")
+
+    async def _heartbeat_loop(self) -> None:
+        """Emit heartbeat gauge regularly so Grafana lag panels stay current."""
+
+        while not self._stop.is_set():
+            try:
+                self.metrics.beat()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        try:
+            self.metrics.beat()
+        except Exception:
+            pass
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
