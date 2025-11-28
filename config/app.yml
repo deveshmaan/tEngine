@@ -1,0 +1,123 @@
+run_id: "dev-run"
+persistence_path: "engine_state.sqlite"
+strategy_tag: "advanced-buy"
+capital_base: 100000
+# Secrets (Upstox tokens/API keys) must be set via environment variables, not committed here.
+allowed_ips: [] # Optional static IP allowlist; can also be set via ALLOWED_IPS env var (comma-separated)
+
+data:
+  index_symbol: "NIFTY"
+  lot_step: 75
+  tick_size: 0.05
+  price_band_low: 10
+  price_band_high: 99999.0
+  expiry_ttl_minutes: 5
+  weekly_expiry_weekday: 1 # 0=Monday … 6=Sunday; 1 == Tuesday for NIFTY weekly expiry
+  subscription_expiry_preference: "current" # allowed: current | next | monthly
+  holidays:
+    - "2024-08-15"
+    - "2024-10-02"
+    - "2024-12-25"
+  strike_steps:
+    NIFTY: 50
+    BANKNIFTY: 50
+
+market_data:
+  window_steps: 8 # +/- steps around ATM
+  option_type: "BOTH" # CE | PE | BOTH
+  stream_mode: "full_d30"
+  depth_levels: 5 # render top 5 in UI to keep UI light
+  max_tick_age_seconds: 2.0
+
+strategy:
+  short_ma: 5
+  long_ma: 20
+  iv_threshold: 0.0
+  vol_breakout_mult: 1.5
+  imi_period: 14
+  pcr_extreme_high: 1.3
+  pcr_extreme_low: 0.7
+  iv_percentile_threshold: 0.6
+  iv_exit_percentile: 0.9
+  oi_volume_min_threshold: 5000
+  event_file_path: "config/events.yml"
+  gamma_threshold: 0.0
+  min_minutes_to_expiry: 30
+  event_halt_minutes: 30
+
+banknifty:
+  vol_breakout_mult: 1.2
+
+risk:
+  daily_pnl_stop: -1000 # max you are willing to lose in a day
+  per_symbol_loss_stop: -1000
+  max_open_lots: 2
+  notional_premium_cap: 5000
+  no_new_entries_after: "15:20:00"
+  square_off_by: "15:25:00"
+  max_order_rate: 5
+  risk_percent_per_trade: 1.0
+
+broker:
+  max_order_rate: 15
+  rest_timeout: 3.0
+  ws_heartbeat_interval: 3.0
+  ws_backoff_seconds: [1, 2, 5, 10]
+  oauth_refresh_margin: 60
+  rate_limits:
+    place:
+      rate_per_sec: 5
+      burst: 10
+    modify:
+      rate_per_sec: 3
+      burst: 6
+    cancel:
+      rate_per_sec: 3
+      burst: 6
+    history:
+      rate_per_sec: 2
+      burst: 4
+
+oms:
+  resubmit_backoff: 0.5
+  reconciliation_interval: 2.0
+  max_inflight_orders: 2
+  order_timeout_seconds: 3.0
+  submit:
+    default: "auto"
+    max_spread_ticks: 2
+    depth_threshold: 10
+
+exit:
+  stop_pct: 0.0
+  target1_pct: 0.0
+  partial_fraction: 0.5
+  trail_lock_pct: 0.4
+  trail_giveback_pct: 0.5
+  min_trail_ticks: 3
+  max_holding_minutes: 20
+  trailing_stop_pct: 0.0
+  time_stop_minutes: 30
+  partial_target_multiplier: 0.0
+  trailing_pct: 0.2
+  trailing_step: 0.1
+  time_buffer_minutes: 20
+  partial_tp_mult: 2.0
+  at_pct: 1.0
+
+alerts:
+  throttle_seconds: 30
+
+telemetry:
+  metrics_port_env: "METRICS_PORT"
+
+replay:
+  default_speed: 1.0
+
+smoke_test:
+  enabled: false # turn on for the day
+  underlying: "NIFTY" # or "BANKNIFTY" later
+  side: "CE" # start with CALL, you can test PE on another day
+  hold_seconds: 60 # start with 60s, you can bump to 120 later
+  lots: 1
+  max_notional_rupees: 7000

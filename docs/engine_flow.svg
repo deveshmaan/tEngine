@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1200" height="720" viewBox="0 0 1200 720" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fbfdff"/>
+      <stop offset="100%" stop-color="#edf3ff"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto-start-reverse">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#1f3c88"/>
+    </marker>
+    <style>
+      text{font-family:"Courier New",monospace;font-size:14px;fill:#0f172a}
+      .title{font-weight:bold;font-size:16px}
+      .box{stroke:#1f3c88;stroke-width:2;rx:12;ry:12;fill:#fff}
+      .flow{stroke:#1f3c88;stroke-width:2;fill:none;marker-end:url(#arrow)}
+      .label{font-size:12px;fill:#1f3c88}
+    </style>
+  </defs>
+  <rect x="0" y="0" width="1200" height="720" fill="url(#bg)"/>
+  <text x="600" y="40" text-anchor="middle" class="title">Trading Engine – High Level Flow</text>
+
+  <!-- Config & Persistence -->
+  <rect class="box" x="40" y="80" width="240" height="180" fill="#e0ecff"/>
+  <text class="title" x="60" y="110">Config &amp; State</text>
+  <text x="60" y="140">• engine_config.yaml</text>
+  <text x="60" y="160">• EngineConfig.load()</text>
+  <text x="60" y="180">• SQLiteStore (run_id)</text>
+  <text x="60" y="200">• InstrumentCache bootstrap</text>
+  <text x="60" y="220">• RecoveryManager</text>
+
+  <!-- Controls & Alerts -->
+  <rect class="box" x="40" y="300" width="240" height="200" fill="#fcefdc"/>
+  <text class="title" x="60" y="330">Controls &amp; Alerts</text>
+  <text x="60" y="360">• Square-off watchdog</text>
+  <text x="60" y="380">• Control intents table</text>
+  <text x="60" y="400">• AlertService (Slack/Telegram)</text>
+  <text x="60" y="420">• notify_incident()</text>
+  <text x="60" y="440">• Risk kill-switch triggers</text>
+
+  <!-- Market Data Sources -->
+  <rect class="box" x="320" y="60" width="260" height="200" fill="#e1faf1"/>
+  <text class="title" x="340" y="90">Market Data Sources</text>
+  <text x="340" y="120">• Replay (SQLite / JSONL)</text>
+  <text x="340" y="140">• Mock feed (main._live_market_feed)</text>
+  <text x="340" y="160">• Live Upstox WS client</text>
+  <text x="340" y="180">• InstrumentResolver hints</text>
+  <text x="340" y="200">• Persists via record_market_event</text>
+
+  <!-- Event Bus -->
+  <rect class="box" x="320" y="300" width="260" height="140" fill="#fff"/>
+  <text class="title" x="340" y="330">Event Bus &amp; Log</text>
+  <text x="340" y="360">• EventBus (async pub/sub)</text>
+  <text x="340" y="380">• Topics: market/events, orders/fill</text>
+  <text x="340" y="400">• store.event_log for replay</text>
+
+  <!-- PnL & Metrics -->
+  <rect class="box" x="320" y="470" width="260" height="170" fill="#fff0f7"/>
+  <text class="title" x="340" y="500">PnL &amp; Observability</text>
+  <text x="340" y="530">• PnLCalculator + fees.yml</text>
+  <text x="340" y="550">• mark_to_market from ticks</text>
+  <text x="340" y="570">• EngineMetrics → Prometheus</text>
+  <text x="340" y="590">• Grafana dashboards / alerts</text>
+
+  <!-- Strategy -->
+  <rect class="box" x="620" y="160" width="240" height="170" fill="#f4f9ff"/>
+  <text class="title" x="640" y="190">Strategy &amp; Data Utils</text>
+  <text x="640" y="220">• IntradayBuyStrategy</text>
+  <text x="640" y="240">• resolve_weekly_expiry</text>
+  <text x="640" y="260">• pick_strike_from_spot</text>
+  <text x="640" y="280">• OrderBudget creation</text>
+  <text x="640" y="300">• Publishes OMS intents</text>
+
+  <!-- Risk -->
+  <rect class="box" x="620" y="360" width="240" height="190" fill="#fff"/>
+  <text class="title" x="640" y="390">Risk Manager</text>
+  <text x="640" y="420">• RiskLimits (PnL, lots, premium)</text>
+  <text x="640" y="440">• Order rate throttling</text>
+  <text x="640" y="460">• Halt &amp; square-off logic</text>
+  <text x="640" y="480">• Records risk_events</text>
+
+  <!-- OMS -->
+  <rect class="box" x="900" y="180" width="260" height="170" fill="#f0faff"/>
+  <text class="title" x="920" y="210">OMS &amp; Persistence</text>
+  <text x="920" y="240">• Deterministic client IDs</text>
+  <text x="920" y="260">• Idempotency (store.orders)</text>
+  <text x="920" y="280">• EventBus: orders/fill</text>
+  <text x="920" y="300">• Recovery/resubmit loops</text>
+
+  <!-- Broker -->
+  <rect class="box" x="900" y="370" width="260" height="220" fill="#fff"/>
+  <text class="title" x="920" y="400">Upstox Broker &amp; Market</text>
+  <text x="920" y="430">• UpstoxBroker (REST + WS)</text>
+  <text x="920" y="450">• RateLimiter + backoff</text>
+  <text x="920" y="470">• InstrumentResolver lookup</text>
+  <text x="920" y="490">• Records executions/fills</text>
+  <text x="920" y="510">• Sends ticks to EventBus</text>
+
+  <!-- Flows -->
+  <path class="flow" d="M280 170 H320"/>
+  <text class="label" x="290" y="158">config</text>
+
+  <path class="flow" d="M450 260 V300"/>
+  <text class="label" x="456" y="285">market/events</text>
+
+  <path class="flow" d="M580 370 H620"/>
+  <text class="label" x="590" y="358">ticks &amp; fills</text>
+
+  <path class="flow" d="M580 230 H620"/>
+  <text class="label" x="590" y="218">strategy loop</text>
+
+  <path class="flow" d="M860 245 H900"/>
+  <text class="label" x="870" y="230">orders</text>
+
+  <path class="flow" d="M860 455 H900"/>
+  <text class="label" x="870" y="440">fills / executions</text>
+
+  <path class="flow" d="M450 440 V470"/>
+  <text class="label" x="458" y="455">pnl snapshot</text>
+
+  <path class="flow" d="M320 360 H280 V210" marker-end="url(#arrow)"/>
+  <text class="label" x="286" y="245">config updates</text>
+
+  <path class="flow" d="M280 400 H620"/>
+  <text class="label" x="340" y="390">kill / alerts</text>
+
+  <path class="flow" d="M580 450 H320"/>
+  <text class="label" x="420" y="438">risk events</text>
+
+  <path class="flow" d="M580 520 H900"/>
+  <text class="label" x="690" y="508">PnL feedback</text>
+
+  <path class="flow" d="M1030 590 H450 V640"/>
+  <text class="label" x="780" y="610">metrics feed</text>
+</svg>

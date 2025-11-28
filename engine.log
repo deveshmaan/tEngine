@@ -1,0 +1,28 @@
+/Users/deveshmaan/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:34: NotOpenSSLWarning: urllib3 v2.0 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+{"event":"engine_starting","ts":"2025-11-26T07:09:07.914984+00:00","run_id":"dev-run","persistence":"engine_state.sqlite"}
+Traceback (most recent call last):
+  File "/Users/deveshmaan/Desktop/TradingEngine/main.py", line 768, in <module>
+    asyncio.run(main())
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "uvloop/loop.pyx", line 1517, in uvloop.loop.Loop.run_until_complete
+  File "/Users/deveshmaan/Desktop/TradingEngine/main.py", line 743, in main
+    await app.run(replay_cfg=replay_cfg)
+  File "/Users/deveshmaan/Desktop/TradingEngine/main.py", line 363, in run
+    metrics_started = start_http_server_if_available(metrics_port)
+  File "/Users/deveshmaan/Desktop/TradingEngine/engine/metrics.py", line 521, in start_http_server_if_available
+    start_http_server(port or 9103, addr=addr)
+  File "/Users/deveshmaan/Library/Python/3.9/lib/python/site-packages/prometheus_client/exposition.py", line 221, in start_wsgi_server
+    httpd = make_server(addr, port, app, TmpServer, handler_class=_SilentHandler)
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/wsgiref/simple_server.py", line 154, in make_server
+    server = server_class((host, port), handler_class)
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socketserver.py", line 452, in __init__
+    self.server_bind()
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/wsgiref/simple_server.py", line 50, in server_bind
+    HTTPServer.server_bind(self)
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/server.py", line 138, in server_bind
+    socketserver.TCPServer.server_bind(self)
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socketserver.py", line 466, in server_bind
+    self.socket.bind(self.server_address)
+OSError: [Errno 48] Address already in use

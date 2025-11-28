@@ -1,6 +1,13 @@
 CredentialTo
 envt/
 logs/
-__pycache__
+__pycache__/
 .conda
+.engine-env/
 .DS_Store
+.env/
+data/
+cache/
+prometheus/
+trading_resource/
+.env
