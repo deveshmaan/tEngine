@@ -1,6 +1,6 @@
 run_id: "dev-run"
 persistence_path: "engine_state.sqlite"
-strategy_tag: "intraday-buy"
+strategy_tag: "advanced-buy"
 capital_base: 100000
 # Secrets (Upstox tokens/API keys) must be set via environment variables, not committed here.
 allowed_ips: [] # Optional static IP allowlist; can also be set via ALLOWED_IPS env var (comma-separated)
@@ -53,8 +53,8 @@ risk:
   per_symbol_loss_stop: -1000
   max_open_lots: 2
   notional_premium_cap: 5000
-  no_new_entries_after: "15:28:00"
-  square_off_by: "15:28:00"
+  no_new_entries_after: "15:20:00"
+  square_off_by: "15:25:00"
   max_order_rate: 5
   risk_percent_per_trade: 1.0
 

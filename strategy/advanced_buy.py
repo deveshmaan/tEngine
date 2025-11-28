@@ -586,18 +586,17 @@ class AdvancedBuyStrategy(BaseStrategy):
         crossover: bool,
     ) -> None:
         try:
-            if imi is not None:
-                self.metrics.strategy_imi.labels(symbol=symbol).set(imi)
-            if pcr is not None:
-                self.metrics.strategy_pcr.labels(symbol=symbol).set(pcr)
-            if iv_pct is not None:
-                self.metrics.strategy_iv_percentile.labels(symbol=symbol).set(iv_pct)
+            self.metrics.strategy_imi.labels(symbol=symbol).set(imi if imi is not None else 0.0)
+            self.metrics.strategy_pcr.labels(symbol=symbol).set(pcr if pcr is not None else 0.0)
+            self.metrics.strategy_iv_percentile.labels(symbol=symbol).set(iv_pct if iv_pct is not None else 0.0)
             self.metrics.strategy_vol_breakout_state.labels(symbol=symbol).set(1 if breakout else 0)
             self.metrics.strategy_ma_crossover_state.labels(symbol=symbol).set(1 if crossover else 0)
             if symbol in self._ema_short:
                 self.metrics.strategy_short_ema.labels(symbol=symbol).set(self._ema_short[symbol])
             if symbol in self._ema_long:
                 self.metrics.strategy_long_ema.labels(symbol=symbol).set(self._ema_long[symbol])
+            # Ensure OI trend gauge is always present, even if chain is missing.
+            self.metrics.strategy_oi_trend.labels(instrument=f"{symbol}-NA").set(0)
         except Exception:
             pass
 
