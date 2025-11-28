@@ -57,6 +57,8 @@ class EngineMetrics:
             self.exit_events_total = _NoOpMetric()
             self.http_401_total = _NoOpMetric()
             self.rest_retries_total = _NoOpMetric()
+            self.order_timeouts_total = _NoOpMetric()
+            self.order_timeout_retries_total = _NoOpMetric()
             self.ws_reconnects_total = _NoOpMetric()
             self.md_subscription_count = _NoOpMetric()
             self.md_decode_errors_total = _NoOpMetric()
@@ -86,6 +88,7 @@ class EngineMetrics:
             self.market_data_stale = _NoOpMetric()
             self.strategy_last_eval_ts = _NoOpMetric()
             self.strategy_evals_total = _NoOpMetric()
+            self.strategy_entry_signals_total = _NoOpMetric()
             self.smoke_test_runs_total = _NoOpMetric()
             self.smoke_test_last_notional_rupees = _NoOpMetric()
             self.smoke_test_last_ts = _NoOpMetric()
@@ -120,6 +123,8 @@ class EngineMetrics:
         self.exit_events_total = Counter("exit_events_total", "Exit triggers fired", ["reason"], **registry_kwargs)
         self.http_401_total = Counter("http_401_total", "HTTP 401 responses", **registry_kwargs)
         self.rest_retries_total = Counter("rest_retries_total", "REST retries", ["endpoint"], **registry_kwargs)
+        self.order_timeouts_total = Counter("order_timeouts_total", "Orders that hit submit timeout and were retried", **registry_kwargs)
+        self.order_timeout_retries_total = Counter("order_timeout_retries_total", "Order resubmits after timeout", **registry_kwargs)
         self.ws_reconnects_total = Counter("ws_reconnects_total", "WS reconnect attempts", **registry_kwargs)
         self.md_subscription_count = Gauge("md_subscription_count", "Active market-data subscriptions", **registry_kwargs)
         try:
@@ -210,6 +215,7 @@ class EngineMetrics:
         self.md_last_tick_ts = Gauge("md_last_tick_ts", "Epoch seconds of last processed tick", ["instrument"], **registry_kwargs)
         self.strategy_last_eval_ts = Gauge("strategy_last_eval_ts", "Epoch seconds of last strategy evaluation", **registry_kwargs)
         self.strategy_evals_total = Counter("strategy_evals_total", "Total number of strategy evaluations", **registry_kwargs)
+        self.strategy_entry_signals_total = Counter("strategy_entry_signals_total", "Strategy entry signals emitted", **registry_kwargs)
         self.market_data_stale_dropped_total = Counter(
             "market_data_stale_dropped_total",
             "Ticks dropped because they exceeded max_tick_age_seconds",
@@ -763,6 +769,11 @@ risk_daily_stop_rupees = _gauge("risk_daily_stop_rupees", "Daily stop from confi
 risk_open_lots = _gauge("risk_open_lots", "Total open lots.")
 risk_notional_premium_rupees = _gauge("risk_notional_premium_rupees", "Gross notional premium exposure (₹).")
 minutes_to_square_off = _gauge("minutes_to_square_off", "Minutes remaining to mandated square-off.")
+risk_percent_per_trade = _gauge("risk_percent_per_trade", "Configured risk per trade (% of capital).")
+capital_base_rupees = _gauge("capital_base_rupees", "Configured capital base for sizing (₹).")
+strategy_short_ma = _gauge("strategy_short_ma", "Short MA lookback for the strategy.")
+strategy_long_ma = _gauge("strategy_long_ma", "Long MA lookback for the strategy.")
+strategy_iv_threshold = _gauge("strategy_iv_threshold", "IV threshold gate for entries.")
 
 
 # --- Convenience publishers (safe no-ops if unused) ---
@@ -844,6 +855,17 @@ def set_risk_dials(
         minutes_to_square_off.set(int(minutes_to_sqoff))
 
 
+def set_strategy_config_metrics(short_ma: float, long_ma: float, iv_threshold: float) -> None:
+    strategy_short_ma.set(float(short_ma))
+    strategy_long_ma.set(float(long_ma))
+    strategy_iv_threshold.set(float(iv_threshold))
+
+
+def set_capital_config(capital_base: float, risk_pct: float) -> None:
+    capital_base_rupees.set(float(capital_base))
+    risk_percent_per_trade.set(float(risk_pct))
+
+
 __all__ += [
     "md_decode_errors_total",
     "md_messages_total",
@@ -859,10 +881,18 @@ __all__ += [
     "order_state_transitions_total",
     "tick_to_submit_ms_bucket",
     "ack_to_fill_ms_bucket",
+    "order_timeouts_total",
+    "order_timeout_retries_total",
     "risk_daily_stop_rupees",
     "risk_open_lots",
     "risk_notional_premium_rupees",
     "minutes_to_square_off",
+    "risk_percent_per_trade",
+    "capital_base_rupees",
+    "strategy_short_ma",
+    "strategy_long_ma",
+    "strategy_iv_threshold",
+    "strategy_entry_signals_total",
     "record_md_frame",
     "publish_spread",
     "publish_depth10",
@@ -871,4 +901,6 @@ __all__ += [
     "observe_tick_to_submit_ms",
     "observe_ack_to_fill_ms",
     "set_risk_dials",
+    "set_strategy_config_metrics",
+    "set_capital_config",
 ]

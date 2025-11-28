@@ -78,6 +78,7 @@ from engine.metrics import (
     set_session_state,
     update_option_quote,
 )
+from utils.ip_check import assert_static_ip
 from engine.alerts import notify_incident
 from engine.risk import RiskManager
 from market.instrument_cache import InstrumentCache, labels_for_key
@@ -510,8 +511,15 @@ class UpstoxBroker:
         reconcile_callback: Optional[Callable[[], Awaitable[None]]] = None,
         risk_manager: Optional[RiskManager] = None,
         bus: Optional[EventBus] = None,
+        allowed_ips: Optional[Sequence[str]] = None,
     ):
         self._cfg = config
+        try:
+            assert_static_ip(allowed_ips)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Static IP validation failed: {exc}") from exc
         self._session_factory = session_factory or self._default_session_factory
         self._session = self._session_factory(None)
         self._stream = stream_client

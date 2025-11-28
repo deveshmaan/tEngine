@@ -6,7 +6,7 @@ import hashlib
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Protocol
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence
 
 from engine.alerts import notify_incident
 from engine.config import IST, OMSConfig
@@ -131,6 +131,7 @@ class Order:
     submit_ts: float = 0.0
     ack_ts: float = 0.0
     last_update_ts: float = 0.0
+    timeout_retries: int = 0
 
     def mark_state(self, new_state: OrderState, *, ts: Optional[dt.datetime] = None, reason: Optional[str] = None) -> None:
         self.state = new_state
@@ -314,6 +315,17 @@ class OMS:
             pass
         return result
 
+    async def submit_batch(self, orders: Sequence[Order]) -> List[Order]:
+        """
+        Placeholder for batch order submit if the broker exposes it.
+        Currently falls back to sequential submits.
+        """
+
+        results: List[Order] = []
+        for order in orders:
+            results.append(await self._ensure_submitted(order))
+        return results
+
     async def replace(self, client_order_id: str, *, price: Optional[float] = None, qty: Optional[int] = None) -> Order:
         async with self._lock:
             order = self._orders[client_order_id]
@@ -408,6 +420,7 @@ class OMS:
         await self.reconcile_from_views(remote)
 
     async def reconcile_from_views(self, views: List[BrokerOrderView]) -> None:
+        await self._handle_timeouts(time.time())
         remote_by_broker = {view.broker_order_id: view for view in views if view.broker_order_id}
         remote_by_client = {view.client_order_id: view for view in views if view.client_order_id}
         async with self._lock:
@@ -457,6 +470,34 @@ class OMS:
             await self._ensure_submitted(order)
 
     # --------------------------------------------------------------- internals
+    async def _handle_timeouts(self, now: float) -> None:
+        timeout = max(float(self._cfg.order_timeout_seconds or 0.0), 0.0)
+        if timeout <= 0:
+            return
+        async with self._lock:
+            candidates = [order for order in self._orders.values() if order.state == OrderState.SUBMITTED and not order.broker_order_id]
+        for order in candidates:
+            if order.submit_ts <= 0:
+                continue
+            if now - order.submit_ts < timeout:
+                continue
+            if order.timeout_retries >= 1:
+                continue
+            order.timeout_retries += 1
+            try:
+                if self._metrics:
+                    self._metrics.order_timeouts_total.inc()
+            except Exception:
+                pass
+            await self._persist_transition(order, order.state, OrderState.NEW, reason="timeout")
+            await asyncio.sleep(self._cfg.resubmit_backoff)
+            await self._ensure_submitted(order)
+            try:
+                if self._metrics:
+                    self._metrics.order_timeout_retries_total.inc()
+            except Exception:
+                pass
+
     async def _ensure_submitted(self, order: Order) -> Order:
         if order.state == OrderState.NEW:
             await self._persist_transition(order, OrderState.NEW, OrderState.SUBMITTED, reason="submit")

@@ -60,6 +60,7 @@ Then point Grafana’s Prometheus datasource at the Prometheus server (default `
 - **Never** commit API keys or OAuth tokens. All broker and analytics credentials (Upstox, AngelOne, Finvasia, OpenAI) are now loaded through environment variables (see `CredentialTo/CredentialToBrokerAPI.py`). Rotate any previously exposed keys before running the engine.
 - Export `UPSTOX_ACCESS_TOKEN`, `UPSTOX_API_KEY`, etc. via a secrets manager (`direnv`, `1Password CLI`, `aws secretsmanager`, etc.) before running `main.py`.
 - The engine refuses to connect without `UPSTOX_ACCESS_TOKEN`, keeping the repo compliant with Upstox/NSE audits.
+- Optional static-IP hardening: set `ALLOWED_IPS` (comma-separated) or `allowed_ips` in `config/app.yml`. The broker will abort startup if the current public IP is not whitelisted. See `docs/setup.md` for the full env checklist.
 
 ## Engine Workflow (BUY-side)
 

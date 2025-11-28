@@ -31,6 +31,36 @@ class OrderBudget:
     side: str = "BUY"
 
 
+def compute_position_size(
+    capital_base: float,
+    risk_percent_per_trade: float,
+    premium: float,
+    lot_size: int,
+    *,
+    stop_loss_pct: float = 0.1,
+) -> int:
+    """
+    Return quantity (aligned to lot size) sized off risk per trade.
+    """
+
+    try:
+        capital = float(capital_base)
+        pct = float(risk_percent_per_trade)
+        premium_val = float(premium)
+        lot = int(lot_size)
+        stop_pct = float(stop_loss_pct)
+    except (TypeError, ValueError):
+        return 0
+    if capital <= 0 or pct <= 0 or premium_val <= 0 or lot <= 0 or stop_pct <= 0:
+        return 0
+    risk_fraction = pct / 100.0
+    per_lot_risk = premium_val * lot * stop_pct
+    if per_lot_risk <= 0:
+        return 0
+    lots = max(int(round((capital * risk_fraction) / per_lot_risk)), 1)
+    return lots * lot
+
+
 @dataclass
 class PositionState:
     lot_size: int = 1
@@ -107,10 +137,21 @@ class SessionGuard:
 class RiskManager:
     """Production-ready risk controller for the BUY-only strategy."""
 
-    def __init__(self, config: RiskLimits, store: SQLiteStore, *, clock: Optional[Callable[[], dt.datetime]] = None, logger: Optional[logging.Logger] = None):
+    def __init__(
+        self,
+        config: RiskLimits,
+        store: SQLiteStore,
+        *,
+        capital_base: float = 0.0,
+        default_stop_loss_pct: float = 0.1,
+        clock: Optional[Callable[[], dt.datetime]] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
         self.cfg = config
         self.store = store
         self._clock = clock or (lambda: engine_now(IST))
+        self.capital_base = max(float(capital_base or 0.0), 0.0)
+        self._default_stop_loss_pct = max(float(default_stop_loss_pct or 0.0), 0.0)
         self._positions: Dict[str, PositionState] = {}
         self._order_timestamps: Deque[dt.datetime] = deque()
         self._halt_reason: Optional[str] = None
@@ -162,6 +203,20 @@ class RiskManager:
         self._update_risk_metrics()
 
     # ----------------------------------------------------------------- checks
+    def position_size(self, *, premium: float, lot_size: int, stop_loss_pct: Optional[float] = None) -> int:
+        stop_pct = self._default_stop_loss_pct if stop_loss_pct is None else stop_loss_pct
+        qty = compute_position_size(self.capital_base, getattr(self.cfg, "risk_percent_per_trade", 0.0), premium, lot_size, stop_loss_pct=stop_pct)
+        if qty > 0:
+            try:
+                lot = max(int(lot_size), 1)
+                pending_lots = qty / lot
+                exposure = self._premium_exposure() + (qty * premium)
+                open_lots = self._total_open_lots() + pending_lots
+                set_risk_dials(open_lots=open_lots, notional_rupees=exposure, daily_stop_rupees=self.cfg.daily_pnl_stop)
+            except Exception:
+                pass
+        return qty
+
     def budget_ok_for(self, order: OrderBudget) -> bool:
         side = order.side.upper()
         now_dt = self._now()

@@ -110,6 +110,28 @@ def _parse_option_type(value: Any) -> str:
     return text
 
 
+def _read_env(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _parse_allowed_ips(raw: Any) -> tuple[str, ...]:
+    env_value = _read_env("ALLOWED_IPS")
+    source = env_value if env_value is not None else raw
+    if source is None:
+        return tuple()
+    ips: list[str] = []
+    if isinstance(source, str):
+        parts = source.replace(";", ",").split(",")
+        ips = [part.strip() for part in parts if part.strip()]
+    elif isinstance(source, Iterable):
+        ips = [str(entry).strip() for entry in source if str(entry).strip()]
+    return tuple(dict.fromkeys(ips))
+
+
 @dataclass(frozen=True)
 class RiskLimits:
     daily_pnl_stop: float
@@ -119,6 +141,7 @@ class RiskLimits:
     max_order_rate: int
     no_new_entries_after: dt.time
     square_off_by: dt.time
+    risk_percent_per_trade: float = 1.0
     post_close_behavior: str = "halt_if_flat"
 
     @staticmethod
@@ -134,6 +157,7 @@ class RiskLimits:
             max_order_rate=int(payload.get("max_order_rate", 15)),
             no_new_entries_after=_parse_time_str(str(payload["no_new_entries_after"])),
             square_off_by=_parse_time_str(str(payload["square_off_by"])),
+            risk_percent_per_trade=float(payload.get("risk_percent_per_trade", 1.0)),
             post_close_behavior=behavior,
         )
 
@@ -242,6 +266,7 @@ class OMSConfig:
     reconciliation_interval: float
     max_inflight_orders: int
     submit: OMSSubmitConfig = field(default_factory=lambda: OMSSubmitConfig(default="market", max_spread_ticks=1, depth_threshold=0))
+    order_timeout_seconds: float = 0.0
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "OMSConfig":
@@ -256,6 +281,7 @@ class OMSConfig:
             reconciliation_interval=float(payload.get("reconciliation_interval", 2.0)),
             max_inflight_orders=int(payload.get("max_inflight_orders", 8)),
             submit=submit,
+            order_timeout_seconds=float(payload.get("order_timeout_seconds", 0.0)),
         )
 
 
@@ -324,6 +350,46 @@ class MarketDataConfig:
 
 
 @dataclass(frozen=True)
+class SecretsConfig:
+    upstox_access_token: Optional[str] = None
+    upstox_api_key: Optional[str] = None
+    upstox_api_secret: Optional[str] = None
+
+    @staticmethod
+    def from_env() -> "SecretsConfig":
+        return SecretsConfig(
+            upstox_access_token=_read_env("UPSTOX_ACCESS_TOKEN"),
+            upstox_api_key=_read_env("UPSTOX_API_KEY"),
+            upstox_api_secret=_read_env("UPSTOX_API_SECRET"),
+        )
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    short_ma: int = 5
+    long_ma: int = 20
+    iv_threshold: float = 0.0
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "StrategyConfig":
+        try:
+            short_val = int(payload.get("short_ma", 5))
+        except (TypeError, ValueError):
+            short_val = 5
+        try:
+            long_val = int(payload.get("long_ma", 20))
+        except (TypeError, ValueError):
+            long_val = 20
+        try:
+            iv_val = float(payload.get("iv_threshold", 0.0))
+        except (TypeError, ValueError):
+            iv_val = 0.0
+        short = max(short_val, 1)
+        long = max(long_val, short + 1)
+        return StrategyConfig(short_ma=short, long_ma=long, iv_threshold=max(iv_val, 0.0))
+
+
+@dataclass(frozen=True)
 class SmokeTestConfig:
     enabled: bool = False
     underlying: str = "NIFTY"
@@ -364,6 +430,9 @@ class ExitConfig:
     trail_giveback_pct: float = 0.5
     min_trail_ticks: int = 3
     max_holding_minutes: int = 20
+    trailing_stop_pct: float = 0.0
+    time_stop_minutes: int = 0
+    partial_target_multiplier: float = 0.0
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "ExitConfig":
@@ -387,6 +456,9 @@ class ExitConfig:
             trail_giveback_pct=_coerce_float("trail_giveback_pct", 0.5),
             min_trail_ticks=_coerce_int("min_trail_ticks", 3),
             max_holding_minutes=_coerce_int("max_holding_minutes", 20),
+            trailing_stop_pct=_coerce_float("trailing_stop_pct", 0.0),
+            time_stop_minutes=_coerce_int("time_stop_minutes", 0),
+            partial_target_multiplier=_coerce_float("partial_target_multiplier", 0.0),
         )
 
 
@@ -395,6 +467,7 @@ class EngineConfig:
     run_id: str
     persistence_path: Path
     strategy_tag: str
+    strategy: StrategyConfig
     risk: RiskLimits
     data: DataConfig
     market_data: MarketDataConfig
@@ -405,6 +478,9 @@ class EngineConfig:
     replay: ReplayConfig
     smoke_test: SmokeTestConfig
     exit: ExitConfig
+    capital_base: float = 0.0
+    allowed_ips: tuple[str, ...] = field(default_factory=tuple)
+    secrets: SecretsConfig = field(default_factory=SecretsConfig)
 
     @staticmethod
     def load(path: Optional[str | Path] = None) -> "EngineConfig":
@@ -415,6 +491,7 @@ class EngineConfig:
         run_id = str(raw.get("run_id") or f"run-{engine_now(IST).strftime('%Y%m%d')}")
         persistence_path = Path(raw.get("persistence_path", "engine_state.sqlite"))
         strategy_tag = str(raw.get("strategy_tag", "intraday-buy"))
+        strategy_cfg = StrategyConfig.from_dict(raw.get("strategy", {}))
         risk = RiskLimits.from_dict(raw.get("risk", {}))
         data = DataConfig.from_dict(raw.get("data", {}))
         market_data = MarketDataConfig.from_dict(raw.get("market_data", {}))
@@ -425,10 +502,14 @@ class EngineConfig:
         replay = ReplayConfig.from_dict(raw.get("replay", {}))
         smoke_test = SmokeTestConfig.from_dict(raw.get("smoke_test", {}))
         exit_cfg = ExitConfig.from_dict(raw.get("exit", {}))
+        capital_base = float(raw.get("capital_base", 0.0))
+        allowed_ips = _parse_allowed_ips(raw.get("allowed_ips"))
+        secrets = SecretsConfig.from_env()
         return EngineConfig(
             run_id=run_id,
             persistence_path=persistence_path,
             strategy_tag=strategy_tag,
+            strategy=strategy_cfg,
             risk=risk,
             data=data,
             market_data=market_data,
@@ -439,6 +520,9 @@ class EngineConfig:
             replay=replay,
             smoke_test=smoke_test,
             exit=exit_cfg,
+            capital_base=capital_base,
+            allowed_ips=allowed_ips,
+            secrets=secrets,
         )
 
 
@@ -495,6 +579,8 @@ __all__ = [
     "read_config",
     "ReplayConfig",
     "RiskLimits",
+    "SecretsConfig",
+    "StrategyConfig",
     "TelemetryConfig",
     "SmokeTestConfig",
 ]

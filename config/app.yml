@@ -1,6 +1,9 @@
 run_id: "dev-run"
 persistence_path: "engine_state.sqlite"
 strategy_tag: "intraday-buy"
+capital_base: 100000
+# Secrets (Upstox tokens/API keys) must be set via environment variables, not committed here.
+allowed_ips: [] # Optional static IP allowlist; can also be set via ALLOWED_IPS env var (comma-separated)
 
 data:
   index_symbol: "NIFTY"
@@ -26,6 +29,11 @@ market_data:
   depth_levels: 5 # render top 5 in UI to keep UI light
   max_tick_age_seconds: 2.0
 
+strategy:
+  short_ma: 5
+  long_ma: 20
+  iv_threshold: 0.0
+
 risk:
   daily_pnl_stop: -1000 # max you are willing to lose in a day
   per_symbol_loss_stop: -1000
@@ -34,6 +42,7 @@ risk:
   no_new_entries_after: "15:28:00"
   square_off_by: "15:28:00"
   max_order_rate: 5
+  risk_percent_per_trade: 1.0
 
 broker:
   max_order_rate: 15
@@ -59,6 +68,7 @@ oms:
   resubmit_backoff: 0.5
   reconciliation_interval: 2.0
   max_inflight_orders: 2
+  order_timeout_seconds: 3.0
   submit:
     default: "auto"
     max_spread_ticks: 2
@@ -72,6 +82,9 @@ exit:
   trail_giveback_pct: 0.5
   min_trail_ticks: 3
   max_holding_minutes: 20
+  trailing_stop_pct: 0.05
+  time_stop_minutes: 30
+  partial_target_multiplier: 2.0
 
 alerts:
   throttle_seconds: 30

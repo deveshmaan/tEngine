@@ -15,7 +15,7 @@ from dataclasses import replace
 from brokerage.upstox_client import CredentialError, load_upstox_credentials
 from engine import smoke_test
 from engine.alerts import configure_alerts, notify_incident
-from engine.broker import FULL_D30_LIMIT_PER_USER, FullD30Streamer, UpstoxBroker
+from engine.broker import UpstoxBroker
 from engine.config import EngineConfig, IST
 from engine.config_sanity import ConfigError, sanity_check_config
 from engine.data import pick_strike_from_spot, pick_subscription_expiry, record_tick_seen, resolve_weekly_expiry
@@ -25,10 +25,12 @@ from engine.instruments import InstrumentResolver
 from engine.logging_utils import configure_logging, get_logger
 from engine.metrics import EngineMetrics, bind_global_metrics, set_subscription_expiry, start_http_server_if_available
 try:
-    from engine.metrics import set_risk_dials
+    from engine.metrics import set_capital_config, set_risk_dials, set_strategy_config_metrics
 except Exception:  # pragma: no cover
     def set_risk_dials(**kwargs): ...
-from engine.oms import OMS, OrderValidationError
+    def set_strategy_config_metrics(*args, **kwargs): ...
+    def set_capital_config(*args, **kwargs): ...
+from engine.oms import OMS
 from engine.pnl import Execution as PnLExecution, PnLCalculator
 from engine.recovery import RecoveryManager, enforce_intraday_clean_start
 from engine.replay import ReplayConfig, configure_runtime as configure_replay_runtime, replay
@@ -37,8 +39,7 @@ from engine.exit import ExitEngine
 from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 from market.instrument_cache import InstrumentCache
-
-STRATEGY_LOGGER = get_logger("strategy")
+from strategy import IntradayBuyStrategy
 
 try:  # pragma: no cover - optional acceleration
     import uvloop
@@ -46,308 +47,6 @@ try:  # pragma: no cover - optional acceleration
     uvloop.install()
 except Exception:  # pragma: no cover
     pass
-
-
-class IntradayBuyStrategy:
-    """Toy BUY-side strategy that demonstrates the risk→data→oms pipeline."""
-
-    def __init__(
-        self,
-        config: EngineConfig,
-        risk: RiskManager,
-        oms: OMS,
-        bus: EventBus,
-        exit_engine: "ExitEngine",
-        instrument_cache: InstrumentCache,
-        metrics: EngineMetrics,
-        subscription_expiry_provider: Optional[Callable[[str], str]] = None,
-    ):
-        self.cfg = config
-        self.risk = risk
-        self.oms = oms
-        self.bus = bus
-        self.exit_engine = exit_engine
-        self.logger = get_logger("IntradayStrategy")
-        self.instrument_cache = instrument_cache
-        self.metrics = metrics
-        self._subscription_expiry_provider = subscription_expiry_provider
-
-    async def run(self, stop_event: asyncio.Event) -> None:
-        queue = await self.bus.subscribe("market/events", maxsize=1000)
-        while not stop_event.is_set():
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-            await self._handle_event(event)
-
-    async def _handle_event(self, event: dict) -> None:
-        evt_type = event.get("type")
-        if evt_type not in {"tick", "quote", "bar"}:
-            return
-        payload = event.get("payload") or {}
-        instrument_key = payload.get("instrument_key") or payload.get("instrument") or payload.get("token")
-        spot = self._extract_price(payload)
-        if spot is None:
-            return
-        ts = self._event_ts(event.get("ts"))
-        now = time.time()
-        try:
-            self.metrics.strategy_last_eval_ts.set(now)
-            self.metrics.strategy_evals_total.inc()
-        except Exception:
-            pass
-        symbol_hint = payload.get("symbol")
-        index_sym = self.cfg.data.index_symbol.upper()
-        if symbol_hint:
-            sym_upper = str(symbol_hint).upper()
-            if sym_upper != index_sym:
-                # Option tick: feed exits and consider entry using option's own price.
-                try:
-                    await self.exit_engine.on_tick(symbol_hint, spot, ts)
-                except Exception:
-                    self.logger.log_event(30, "exit_tick_failed", symbol=symbol_hint)
-                has_intent = await self._maybe_trade(spot, ts, symbol_hint, instrument_key=instrument_key)
-                STRATEGY_LOGGER.info(
-                    "strategy_heartbeat: run=%s underlying=%s instruments=%d has_order_intent=%s",
-                    getattr(self.cfg, "run_id", "n/a"),
-                    index_sym,
-                    1,
-                    bool(has_intent),
-                )
-                return
-        has_intent = await self._maybe_trade(spot, ts, symbol_hint if symbol_hint else None, instrument_key=instrument_key)
-        STRATEGY_LOGGER.info(
-            "strategy_heartbeat: run=%s underlying=%s instruments=%d has_order_intent=%s",
-            getattr(self.cfg, "run_id", "n/a"),
-            index_sym,
-            1,
-            bool(has_intent),
-        )
-
-    async def _maybe_trade(self, spot: float, ts: dt.datetime, symbol_hint: Optional[str], *, instrument_key: Optional[str] = None) -> bool:
-        if self.risk.should_halt():
-            await self.exit_engine.handle_risk_halt()
-            return False
-        threshold = getattr(self.cfg.market_data, "max_tick_age_seconds", 0.0)
-        identifier = instrument_key or symbol_hint or self.cfg.data.index_symbol
-        if self.risk.block_if_stale(identifier, threshold=threshold):
-            return False
-        if self.risk.block_if_stale(self.cfg.data.index_symbol, threshold=threshold):
-            return False
-        index_sym = self.cfg.data.index_symbol.upper()
-        if symbol_hint and str(symbol_hint).upper() != index_sym:
-            # Direct option tick – use its own price and lot to keep notional realistic.
-            price = float(spot)
-            if price <= 0:
-                return False
-            lot_size = self._resolve_lot_for_symbol(symbol_hint)
-            if price * lot_size > self.cfg.risk.notional_premium_cap:
-                return False
-            budget = OrderBudget(symbol=symbol_hint, qty=lot_size, price=price, lot_size=lot_size, side="BUY")
-            self.risk.on_tick(symbol_hint, price)
-            if not self.risk.budget_ok_for(budget):
-                return False
-            try:
-                await self.oms.submit(
-                    strategy=self.cfg.strategy_tag,
-                    symbol=symbol_hint,
-                    side="BUY",
-                    qty=budget.qty,
-                    order_type="MARKET",
-                    limit_price=budget.price,
-                    ts=ts,
-                )
-            except OrderValidationError as exc:
-                self.logger.log_event(30, "order_validation_failed", symbol=symbol_hint, code=exc.code, message=str(exc))
-                return False
-            except Exception as exc:
-                self.logger.log_event(40, "order_submit_failed", symbol=symbol_hint, error=str(exc))
-                return False
-            self.logger.log_event(20, "submitted", symbol=symbol_hint, price=budget.price)
-            return True
-        symbol_root = self.cfg.data.index_symbol
-        preference = getattr(self.cfg.data, "subscription_expiry_preference", "current")
-        expiry_str: Optional[str] = None
-        if self._subscription_expiry_provider:
-            try:
-                expiry_str = self._subscription_expiry_provider(symbol_root)
-            except Exception:
-                expiry_str = None
-        if not expiry_str:
-            try:
-                expiry_str = pick_subscription_expiry(symbol_root, preference)
-            except Exception:
-                fallback_expiry = resolve_weekly_expiry(
-                    symbol_root,
-                    ts,
-                    self.cfg.data.holidays,
-                    weekly_weekday=self.cfg.data.weekly_expiry_weekday,
-                )
-                expiry_str = fallback_expiry.isoformat()
-        strike = pick_strike_from_spot(
-            spot,
-            step=self.cfg.data.lot_step,
-        )
-        option_type = "CE"
-        lot_size = self._resolve_lot_size(expiry_str)
-        symbol = symbol_hint or f"{self.cfg.data.index_symbol}-{expiry_str}-{int(strike)}{option_type}"
-        budget = OrderBudget(symbol=symbol, qty=lot_size, price=spot, lot_size=lot_size, side="BUY")
-        self.risk.on_tick(symbol, spot)
-        if not self.risk.budget_ok_for(budget):
-            return False
-        try:
-            await self.oms.submit(
-                strategy=self.cfg.strategy_tag,
-                symbol=symbol,
-                side="BUY",
-                qty=budget.qty,
-                order_type="MARKET",
-                limit_price=budget.price,
-                ts=ts,
-            )
-        except OrderValidationError as exc:
-            self.logger.log_event(30, "order_validation_failed", symbol=symbol, code=exc.code, message=str(exc))
-            return False
-        except Exception as exc:
-            self.logger.log_event(40, "order_submit_failed", symbol=symbol, error=str(exc))
-            return False
-        self.logger.log_event(20, "submitted", symbol=symbol, price=budget.price)
-        return True
-
-    def _event_ts(self, value: Optional[str]) -> dt.datetime:
-        return _parse_ts(value, IST)
-
-    def _extract_price(self, payload: dict) -> Optional[float]:
-        for key in ("ltp", "price", "close", "last"):
-            if key in payload and payload[key] is not None:
-                try:
-                    return float(payload[key])
-                except (TypeError, ValueError):
-                    continue
-        return None
-
-    def _resolve_lot_size(self, expiry: str) -> int:
-        lot = max(int(self.cfg.data.lot_step), 1)
-        cache = self.instrument_cache
-        try:
-            meta = cache.get_meta(self.cfg.data.index_symbol, expiry)
-        except Exception:
-            meta = None
-        if isinstance(meta, tuple) and len(meta) >= 2 and meta[1]:
-            try:
-                lot = max(int(meta[1]), 1)
-            except (TypeError, ValueError):
-                pass
-        return lot
-
-    def _resolve_lot_for_symbol(self, symbol: str) -> int:
-        """Best-effort lot size resolution for a fully qualified option symbol."""
-
-        lot = max(int(self.cfg.data.lot_step), 1)
-        parts = symbol.split("-")
-        if len(parts) < 3:
-            return lot
-        expiry = "-".join(parts[1:-1])
-        tail = parts[-1]
-        opt_type = tail[-2:] if tail[-2:] in {"CE", "PE"} else "CE"
-        strike_part = tail[:-2] if opt_type in {"CE", "PE"} else tail
-        try:
-            strike = float(strike_part)
-        except ValueError:
-            strike = None
-        cache = self.instrument_cache
-        try:
-            meta = cache.get_meta(self.cfg.data.index_symbol, expiry)
-            if isinstance(meta, tuple) and len(meta) >= 2 and meta[1]:
-                lot = int(meta[1])
-        except Exception:
-            pass
-        if strike is not None:
-            try:
-                contract = cache.get_contract(self.cfg.data.index_symbol, expiry, strike, opt_type)
-                lot = int(contract.get("lot_size") or lot)
-            except Exception:
-                pass
-        return max(lot, 1)
-
-    def _choose_subscription_expiry(self, symbol: str) -> str:
-        preference = getattr(self.cfg.data, "subscription_expiry_preference", "current")
-        pref = preference if preference in {"current", "next", "monthly"} else "current"
-        try:
-            expiry = pick_subscription_expiry(symbol, pref)
-        except Exception as exc:
-            self.logger.log_event(30, "subscription_expiry_fallback", symbol=symbol, preference=pref, error=str(exc))
-            fallback = resolve_weekly_expiry(
-                symbol,
-                engine_now(IST),
-                self.cfg.data.holidays,
-                weekly_weekday=self.cfg.data.weekly_expiry_weekday,
-            )
-            expiry = fallback.isoformat()
-            pref = "current"
-        try:
-            if self.broker:
-                self.broker.record_subscription_expiry(symbol, expiry, pref)
-            else:
-                set_subscription_expiry(symbol, expiry, pref)
-        except Exception:
-            set_subscription_expiry(symbol, expiry, pref)
-        return expiry
-
-    def _subscription_expiry_for(self, symbol: str) -> str:
-        sym = symbol.upper()
-        expiry = self.subscription_expiries.get(sym)
-        if expiry:
-            return expiry
-        expiry = self._choose_subscription_expiry(sym)
-        self.subscription_expiries[sym] = expiry
-        return expiry
-
-    async def _maybe_start_full_d30_streamer(self) -> None:
-        """Optional FULL_D30 metrics streamer using the new protobuf feed."""
-
-        if str(self.cfg.market_data.stream_mode).lower() != "full_d30":
-            return
-        token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-        if not token:
-            self.logger.warning("FullD30Streamer skipped: UPSTOX_ACCESS_TOKEN not set")
-            return
-        cache = self.instrument_cache
-        if cache is None:
-            self.logger.warning("FullD30Streamer skipped: instrument cache unavailable")
-            return
-        try:
-            underlying_key = cache.resolve_index_key(self.cfg.data.index_symbol)
-        except Exception as exc:
-            self.logger.warning("FullD30Streamer skipped: unable to resolve underlying key: %s", exc)
-            underlying_key = None
-        expiry = self._subscription_expiry_for(self.cfg.data.index_symbol)
-        spot = None
-        try:
-            spot = await self.broker.get_spot(self.cfg.data.index_symbol)
-        except Exception as exc:
-            self.logger.warning("FullD30Streamer spot lookup failed: %s", exc)
-        window = max(int(self.cfg.market_data.window_steps or 0), 0)
-        opt_mode = str(self.cfg.market_data.option_type or "CE").upper()
-        opt_types = ["CE", "PE"] if opt_mode == "BOTH" else [opt_mode if opt_mode in {"CE", "PE"} else "CE"]
-        instrument_keys: List[str] = []
-        if underlying_key:
-            instrument_keys.append(underlying_key)
-        if expiry and spot is not None:
-            for opt in opt_types:
-                rows = cache.nearest_strikes(self.cfg.data.index_symbol, expiry, spot, window=window, opt_type=opt)
-                for row in rows:
-                    key = row.get("instrument_key")
-                    if key:
-                        instrument_keys.append(str(key))
-        if not instrument_keys:
-            self.logger.warning("FullD30Streamer skipped: no instrument keys resolved")
-            return
-        unique_keys = list(dict.fromkeys(instrument_keys))[:FULL_D30_LIMIT_PER_USER]
-        streamer = FullD30Streamer(token, unique_keys)
-        self._full_d30_streamer = streamer
-        await streamer.start()
 
 
 class EngineApp:
@@ -367,7 +66,12 @@ class EngineApp:
         self.instrument_resolver = InstrumentResolver(self.instrument_cache)
         self.metrics = EngineMetrics()
         bind_global_metrics(self.metrics)
-        self.risk = RiskManager(config.risk, self.store)
+        try:
+            set_strategy_config_metrics(config.strategy.short_ma, config.strategy.long_ma, config.strategy.iv_threshold)
+            set_capital_config(config.capital_base, config.risk.risk_percent_per_trade)
+        except Exception:
+            pass
+        self.risk = RiskManager(config.risk, self.store, capital_base=config.capital_base)
         self.subscription_expiries: dict[str, str] = {}
         self.broker = UpstoxBroker(
             config=config.broker,
@@ -378,6 +82,7 @@ class EngineApp:
             auth_halt_callback=self.risk.halt_new_entries,
             risk_manager=self.risk,
             bus=self.bus,
+            allowed_ips=config.allowed_ips,
         )
         default_meta = (config.data.tick_size, config.data.lot_step, config.data.price_band_low, config.data.price_band_high)
         self.oms = OMS(
@@ -419,7 +124,6 @@ class EngineApp:
         self._strategy_task: Optional[asyncio.Task] = None
         self._reconcile_task: Optional[asyncio.Task] = None
         self._tasks: List[asyncio.Task] = []
-        self._full_d30_streamer: Optional[FullD30Streamer] = None
 
     def _choose_subscription_expiry(self, symbol: str) -> str:
         preference = getattr(self.cfg.data, "subscription_expiry_preference", "current")
@@ -472,12 +176,6 @@ class EngineApp:
             await self.trigger_shutdown("session_guard_shutdown")
             await self._cleanup()
             return
-        try:
-            maybe_streamer = getattr(self, "_maybe_start_full_d30_streamer", None)
-            if callable(maybe_streamer):
-                await maybe_streamer()
-        except Exception as exc:
-            self.logger.warning("FullD30Streamer failed to start: %s", exc)
         await RecoveryManager(self.store, self.oms).reconcile()
         for pos in self.store.list_open_positions():
             try:
@@ -534,11 +232,6 @@ class EngineApp:
 
     async def _cleanup(self) -> None:
         await self.oms.cancel_all(reason="shutdown")
-        if self._full_d30_streamer:
-            try:
-                await self._full_d30_streamer.stop()
-            except Exception:
-                pass
         await self.broker.stop()
         try:
             self.store.close()
@@ -691,15 +384,26 @@ class EngineApp:
             return None
         if self._strategy_task and not self._strategy_task.done():
             return self._strategy_task
-        task = asyncio.create_task(self.strategy.run(self._stop), name="strategy-loop")
+        task = asyncio.create_task(self._run_strategy_with_init(source), name="strategy-loop")
         self._strategy_task = task
         if task not in self._tasks:
             self._tasks.append(task)
+        return task
+
+    async def _run_strategy_with_init(self, source: str = "auto") -> None:
+        try:
+            if not getattr(self.strategy, "_initialized", False):
+                await self.strategy.init(self)
+        except Exception as exc:
+            try:
+                self.logger.log_event(30, "strategy_init_failed", error=str(exc))
+            except Exception:
+                pass
         try:
             self.logger.log_event(20, "strategy_started", source=source)
         except Exception:
             pass
-        return task
+        await self.strategy.run(self._stop)
 
     def _instrument_meta(self, symbol: str) -> tuple[Optional[str], Optional[float], Optional[str]]:
         meta = self.instrument_resolver.metadata_for(symbol)
@@ -888,7 +592,7 @@ async def main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv)
     cfg = EngineConfig.load(args.config)
     try:
-        load_upstox_credentials()
+        load_upstox_credentials(cfg.secrets)
     except CredentialError as exc:
         get_logger("main").log_event(40, "missing_credentials", message=str(exc))
         raise SystemExit(1)

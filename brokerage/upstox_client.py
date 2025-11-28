@@ -74,7 +74,7 @@ def _read_env(name: str) -> Optional[str]:
     return text or None
 
 
-def load_upstox_credentials() -> UpstoxConfig:
+def load_upstox_credentials(secrets: Optional[object] = None) -> UpstoxConfig:
     """
     Load Upstox credentials strictly from environment variables.
 
@@ -85,8 +85,7 @@ def load_upstox_credentials() -> UpstoxConfig:
         - UPSTOX_API_SECRET
     """
 
-    # token = _read_env("UPSTOX_ACCESS_TOKEN")
-    token = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTI3ZDJhMzhjZDgwMjRlMjQ1NWVlYjgiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY0MjE3NTA3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQyODA4MDB9.I75IlguJ2rPEu9razXGvEIn2WfPCuWJjYDDyfPmivKQ"
+    token = getattr(secrets, "upstox_access_token", None) or _read_env("UPSTOX_ACCESS_TOKEN")
     if not token:
         raise CredentialError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     sandbox = str(os.getenv("UPSTOX_SANDBOX", "false")).lower() in {"1", "true", "yes"}
@@ -95,8 +94,8 @@ def load_upstox_credentials() -> UpstoxConfig:
         access_token=token,
         sandbox=sandbox,
         algo_name=algo_name,
-        api_key=_read_env("UPSTOX_API_KEY"),
-        api_secret=_read_env("UPSTOX_API_SECRET"),
+        api_key=getattr(secrets, "upstox_api_key", None) or _read_env("UPSTOX_API_KEY"),
+        api_secret=getattr(secrets, "upstox_api_secret", None) or _read_env("UPSTOX_API_SECRET"),
     )
 
 
