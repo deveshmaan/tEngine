@@ -25,12 +25,13 @@ from engine.instruments import InstrumentResolver
 from engine.logging_utils import configure_logging, get_logger
 from engine.metrics import EngineMetrics, bind_global_metrics, set_subscription_expiry, start_http_server_if_available
 try:
-    from engine.metrics import set_capital_config, set_exit_config_metrics, set_risk_dials, set_strategy_config_metrics
+    from engine.metrics import set_capital_config, set_exit_config_metrics, set_risk_dials, set_scalping_config_metrics, set_strategy_config_metrics
 except Exception:  # pragma: no cover
     def set_risk_dials(**kwargs): ...
     def set_strategy_config_metrics(*args, **kwargs): ...
     def set_capital_config(*args, **kwargs): ...
     def set_exit_config_metrics(*args, **kwargs): ...
+    def set_scalping_config_metrics(*args, **kwargs): ...
 from engine.oms import OMS
 from engine.pnl import Execution as PnLExecution, PnLCalculator
 from engine.recovery import RecoveryManager, enforce_intraday_clean_start
@@ -40,7 +41,7 @@ from engine.exit import ExitEngine
 from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 from market.instrument_cache import InstrumentCache
-from strategy import AdvancedBuyStrategy, IntradayBuyStrategy
+from strategy import AdvancedBuyStrategy, IntradayBuyStrategy, ScalpingBuyStrategy
 
 try:  # pragma: no cover - optional acceleration
     import uvloop
@@ -83,6 +84,15 @@ class EngineApp:
                 getattr(config.exit, "partial_tp_mult", 0.0),
                 getattr(config.exit, "at_pct", 0.0),
             )
+            set_scalping_config_metrics(
+                getattr(config.strategy, "breakout_window", 0),
+                getattr(config.strategy, "breakout_margin", 0.0),
+                getattr(config.strategy, "volume_mult", 0.0),
+                getattr(config.strategy, "pcr_range", (0.0, 0.0))[0] if getattr(config.strategy, "pcr_range", None) else 0.0,
+                getattr(config.strategy, "pcr_range", (0.0, 0.0))[1] if getattr(config.strategy, "pcr_range", None) else 0.0,
+                getattr(config.strategy, "spread_max_pct", 0.0),
+                getattr(config.risk, "scalping_risk_pct", 0.0),
+            )
         except Exception:
             pass
         self.risk = RiskManager(config.risk, self.store, capital_base=config.capital_base)
@@ -120,7 +130,13 @@ class EngineApp:
             metrics=self.metrics,
             iv_exit_threshold=getattr(config.strategy, "iv_exit_percentile", 0.0),
         )
-        strategy_cls = AdvancedBuyStrategy if getattr(config, "strategy_tag", "").lower() == "advanced-buy" else IntradayBuyStrategy
+        tag = getattr(config, "strategy_tag", "").lower()
+        if tag == "advanced-buy":
+            strategy_cls = AdvancedBuyStrategy
+        elif tag == "scalping-buy":
+            strategy_cls = ScalpingBuyStrategy
+        else:
+            strategy_cls = IntradayBuyStrategy
         self.strategy = strategy_cls(
             config,
             self.risk,

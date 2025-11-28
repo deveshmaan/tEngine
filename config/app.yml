@@ -44,6 +44,11 @@ strategy:
   gamma_threshold: 0.0
   min_minutes_to_expiry: 30
   event_halt_minutes: 30
+  breakout_window: 5
+  breakout_margin: 5
+  volume_mult: 1.5
+  pcr_range: [0.7, 1.3]
+  spread_max_pct: 0.05
 
 banknifty:
   vol_breakout_mult: 1.2
@@ -57,6 +62,8 @@ risk:
   square_off_by: "15:25:00"
   max_order_rate: 5
   risk_percent_per_trade: 1.0
+  scalping_risk_pct: 0.5
+  scalping_trades_per_hour: 30
 
 broker:
   max_order_rate: 15
@@ -104,6 +111,9 @@ exit:
   time_buffer_minutes: 20
   partial_tp_mult: 2.0
   at_pct: 1.0
+  scalping_profit_target_pct: 0.12
+  scalping_stop_loss_pct: 0.06
+  scalping_time_limit_minutes: 5
 
 alerts:
   throttle_seconds: 30

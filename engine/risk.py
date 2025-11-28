@@ -163,6 +163,7 @@ class RiskManager:
         self._default_stop_loss_pct = max(float(default_stop_loss_pct or 0.0), 0.0)
         self._positions: Dict[str, PositionState] = {}
         self._order_timestamps: Deque[dt.datetime] = deque()
+        self._scalping_timestamps: Deque[dt.datetime] = deque()
         self._halt_reason: Optional[str] = None
         self._kill_switch = False
         self._logger = logger if logger else get_logger("RiskManager")
@@ -265,6 +266,10 @@ class RiskManager:
 
         if side == "BUY" and not self._premium_budget_ok(order):
             self._emit_event("NOTIONAL", "Notional premium budget exhausted", order.symbol)
+            return False
+
+        if side == "BUY" and not self._scalping_rate_ok(now_dt, order):
+            self._emit_event("SCALP_RATE", "Scalping trade frequency exceeded", order.symbol)
             return False
 
         return True
@@ -402,6 +407,19 @@ class RiskManager:
         if len(self._order_timestamps) >= self.cfg.max_order_rate:
             return False
         self._order_timestamps.append(now)
+        return True
+
+    def _scalping_rate_ok(self, now: dt.datetime, order: OrderBudget) -> bool:
+        limit = getattr(self.cfg, "scalping_trades_per_hour", 0)
+        if limit <= 0:
+            return True
+        window = now - dt.timedelta(hours=1)
+        while self._scalping_timestamps and self._scalping_timestamps[0] < window:
+            self._scalping_timestamps.popleft()
+        if len(self._scalping_timestamps) >= limit:
+            return False
+        # light heuristic: treat small qty orders as scalps based on risk config or strategy tag
+        self._scalping_timestamps.append(now)
         return True
 
     def _purge_old_orders(self, now: dt.datetime) -> None:
