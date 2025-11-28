@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any, Dict, Optional
+from collections import deque
+from typing import Any, Deque, Dict, Optional
 
 from engine.config import ExitConfig, IST
 from engine.logging_utils import get_logger
@@ -27,6 +28,7 @@ class ExitEngine:
         store: SQLiteStore,
         tick_size: float,
         metrics: Optional["EngineMetrics"] = None,
+        iv_exit_threshold: float = 0.0,
     ) -> None:
         self.cfg = config
         self.risk = risk
@@ -36,6 +38,11 @@ class ExitEngine:
         self._metrics = metrics
         self._logger = get_logger("ExitEngine")
         self._risk_halt_executed = False
+        self._iv_exit_threshold = max(float(iv_exit_threshold or 0.0), 0.0)
+        self._iv_history: Dict[str, Deque[float]] = {}
+        self._price_history: Dict[str, Deque[float]] = {}
+        self._oi_history: Dict[str, Deque[float]] = {}
+        self._atr_period = 14
 
     # ----------------------------------------------------------------- lifecycle
     def on_fill(self, *, symbol: str, side: str, qty: int, price: float, ts: dt.datetime) -> None:
@@ -78,7 +85,7 @@ class ExitEngine:
         plan["pending_exit_ts"] = None
         self.store.upsert_exit_plan(symbol, plan, ts=ts)
 
-    async def on_tick(self, instrument_key: str, ltp: float, ts: dt.datetime) -> None:
+    async def on_tick(self, instrument_key: str, ltp: float, ts: dt.datetime, oi: Optional[float] = None, iv: Optional[float] = None) -> None:
         """Evaluate exit rules on each tick for instruments with open positions."""
 
         if not self._exits_enabled() or self._risk_halt_executed:
@@ -99,6 +106,11 @@ class ExitEngine:
         highest_price = float(plan.get("highest_price") or entry_price)
         highest_price = max(highest_price, float(ltp))
         plan["highest_price"] = highest_price
+        self._update_price_history(instrument_key, ltp)
+        if oi is not None:
+            self._update_oi_history(instrument_key, oi)
+        if iv is not None:
+            self._update_iv_history(instrument_key, float(iv))
         stop_price = float(plan["stop_price"]) if plan.get("stop_price") else None
         target1_price = float(plan["target1_price"]) if plan.get("target1_price") else None
         trailing_stop = float(plan["trailing_stop"]) if plan.get("trailing_stop") else None
@@ -114,6 +126,22 @@ class ExitEngine:
 
         reason: Optional[str] = None
         exit_qty = qty
+
+        # 0) IV reversion exit
+        if self._iv_exit_threshold > 0:
+            iv_pct = self._iv_percentile(instrument_key)
+            if iv_pct is not None and iv_pct >= self._iv_exit_threshold:
+                reason = "IV_REVERSION"
+
+        # ATR-based trailing stop
+        if not reason and getattr(self.cfg, "at_pct", 0.0) > 0:
+            atr_val = self._atr(instrument_key)
+            if atr_val is not None:
+                atr_stop = highest_price - float(self.cfg.at_pct) * atr_val
+                if atr_stop > 0 and ltp <= atr_stop:
+                    trailing_stop = atr_stop
+                    plan["trailing_stop"] = atr_stop
+                    reason = "ATR_TRAIL"
 
         premium_trailing = self._premium_trailing_enabled()
         if premium_trailing:
@@ -172,6 +200,10 @@ class ExitEngine:
         if not reason:
             self.store.upsert_exit_plan(instrument_key, plan, ts=ts_dt)
             return
+
+        # OI reversal exit (secondary guard)
+        if not reason and self._oi_reversal(instrument_key, ltp):
+            reason = "OI_REVERSAL"
 
         await self._submit_exit_order(instrument_key, exit_qty, ltp, ts_dt, reason)
         plan["pending_exit_reason"] = reason
@@ -392,6 +424,46 @@ class ExitEngine:
             ]
         )
 
+    def _update_iv_history(self, instrument: str, iv: float) -> None:
+        hist = self._iv_history.setdefault(instrument, deque(maxlen=60))
+        hist.append(float(iv))
+
+    def _iv_percentile(self, instrument: str) -> Optional[float]:
+        hist = self._iv_history.get(instrument)
+        if not hist:
+            return None
+        current = hist[-1]
+        below = sum(1 for v in hist if v <= current)
+        return below / len(hist)
+
+    def _update_price_history(self, instrument: str, price: float) -> None:
+        hist = self._price_history.setdefault(instrument, deque(maxlen=50))
+        hist.append(float(price))
+
+    def _atr(self, instrument: str) -> Optional[float]:
+        hist = self._price_history.get(instrument)
+        if not hist or len(hist) < 2:
+            return None
+        diffs = [abs(hist[i] - hist[i - 1]) for i in range(1, len(hist))]
+        window = diffs[-self._atr_period :]
+        if not window:
+            return None
+        return sum(window) / len(window)
+
+    def _update_oi_history(self, instrument: str, oi: float) -> None:
+        hist = self._oi_history.setdefault(instrument, deque(maxlen=5))
+        try:
+            hist.append(float(oi))
+        except Exception:
+            return
+
+    def _oi_reversal(self, instrument: str, price: float) -> bool:
+        hist = self._oi_history.get(instrument)
+        prices = self._price_history.get(instrument)
+        if not hist or len(hist) < 2 or not prices or len(prices) < 2:
+            return False
+        return hist[-1] > hist[-2] and prices[-1] < prices[-2]
+
     def _expiry_deadline(self, symbol: str, plan: Dict[str, Any], now: dt.datetime) -> Optional[dt.datetime]:
         buffer_minutes = getattr(self.cfg, "time_buffer_minutes", 0)
         if buffer_minutes <= 0:
@@ -432,6 +504,7 @@ class ExitEngine:
                 getattr(self.cfg, "trailing_step", 0.0) > 0,
                 getattr(self.cfg, "partial_tp_mult", 0.0) > 0,
                 getattr(self.cfg, "time_buffer_minutes", 0) > 0,
+                getattr(self.cfg, "at_pct", 0.0) > 0,
             ]
         )
 

@@ -113,6 +113,12 @@ class EngineMetrics:
             self.strategy_position_size = _NoOpMetric()
             self.strategy_short_ema = _NoOpMetric()
             self.strategy_long_ema = _NoOpMetric()
+            self.strategy_imi = _NoOpMetric()
+            self.strategy_pcr = _NoOpMetric()
+            self.strategy_iv_percentile = _NoOpMetric()
+            self.strategy_oi_trend = _NoOpMetric()
+            self.strategy_selected_strike = _NoOpMetric()
+            self.exit_at_pct_config = _NoOpMetric()
             return
         registry_kwargs = {"registry": self._registry} if self._registry is not None else {}
         self.engine_up = Gauge("engine_up", "Engine up status", **registry_kwargs)
@@ -267,6 +273,12 @@ class EngineMetrics:
             self.strategy_position_size = strategy_position_size
             self.strategy_short_ema = strategy_short_ema
             self.strategy_long_ema = strategy_long_ema
+            self.strategy_imi = strategy_imi
+            self.strategy_pcr = strategy_pcr
+            self.strategy_iv_percentile = strategy_iv_percentile
+            self.strategy_oi_trend = strategy_oi_trend
+            self.strategy_selected_strike = strategy_selected_strike
+            self.exit_at_pct_config = exit_at_pct_config
         except Exception:
             pass
 
@@ -810,6 +822,7 @@ exit_trailing_pct_config = _gauge("exit_trailing_pct_config", "Config: premium t
 exit_trailing_step_config = _gauge("exit_trailing_step_config", "Config: premium trailing giveback percent of gains.")
 exit_time_buffer_minutes_config = _gauge("exit_time_buffer_minutes_config", "Config: minutes before expiry to force exit.")
 exit_partial_tp_mult_config = _gauge("exit_partial_tp_mult_config", "Config: premium multiple to take partial profit.")
+exit_at_pct_config = _gauge("exit_at_pct_config", "Config: ATR multiple for trailing stop.")
 strategy_realized_vol = _gauge("strategy_realized_vol", "Realized 1m return volatility", labelnames=("symbol",))
 strategy_realized_vol_avg = _gauge("strategy_realized_vol_avg", "Average realized volatility", labelnames=("symbol",))
 strategy_vol_breakout_state = _gauge("strategy_vol_breakout_state", "1 when realized vol is in breakout", labelnames=("symbol",))
@@ -817,6 +830,11 @@ strategy_ma_crossover_state = _gauge("strategy_ma_crossover_state", "1 when shor
 strategy_position_size = _gauge("strategy_position_size", "Last computed position size (qty)", labelnames=("instrument",))
 strategy_short_ema = _gauge("strategy_short_ema", "Short EMA value", labelnames=("symbol",))
 strategy_long_ema = _gauge("strategy_long_ema", "Long EMA value", labelnames=("symbol",))
+strategy_imi = _gauge("strategy_imi", "Intraday Momentum Index (IMI)", labelnames=("symbol",))
+strategy_pcr = _gauge("strategy_pcr", "Put/Call volume ratio", labelnames=("symbol",))
+strategy_iv_percentile = _gauge("strategy_iv_percentile", "IV percentile (0-1)", labelnames=("symbol",))
+strategy_oi_trend = _gauge("strategy_oi_trend", "OI trend score (-1 to 1)", labelnames=("instrument",))
+strategy_selected_strike = _gauge("strategy_selected_strike", "Selected strike marker", labelnames=("instrument", "symbol", "expiry", "opt", "reason"))
 
 
 # --- Convenience publishers (safe no-ops if unused) ---
@@ -919,11 +937,12 @@ def set_capital_config(capital_base: float, risk_pct: float) -> None:
     risk_percent_per_trade.set(float(risk_pct))
 
 
-def set_exit_config_metrics(trailing_pct: float, trailing_step: float, time_buffer_minutes: float, partial_tp_mult: float) -> None:
+def set_exit_config_metrics(trailing_pct: float, trailing_step: float, time_buffer_minutes: float, partial_tp_mult: float, at_pct: float = 0.0) -> None:
     exit_trailing_pct_config.set(float(trailing_pct))
     exit_trailing_step_config.set(float(trailing_step))
     exit_time_buffer_minutes_config.set(float(time_buffer_minutes))
     exit_partial_tp_mult_config.set(float(partial_tp_mult))
+    exit_at_pct_config.set(float(at_pct))
 
 
 __all__ += [
@@ -958,6 +977,7 @@ __all__ += [
     "exit_trailing_step_config",
     "exit_time_buffer_minutes_config",
     "exit_partial_tp_mult_config",
+    "exit_at_pct_config",
     "strategy_realized_vol",
     "strategy_realized_vol_avg",
     "strategy_vol_breakout_state",
@@ -965,6 +985,11 @@ __all__ += [
     "strategy_position_size",
     "strategy_short_ema",
     "strategy_long_ema",
+    "strategy_imi",
+    "strategy_pcr",
+    "strategy_iv_percentile",
+    "strategy_oi_trend",
+    "strategy_selected_strike",
     "strategy_entry_signals_total",
     "record_md_frame",
     "publish_spread",

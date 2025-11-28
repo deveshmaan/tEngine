@@ -1,0 +1,6 @@
+- start: "2025-11-28T11:00:00+05:30"
+  end: "2025-11-28T12:00:00+05:30"
+  name: "Sample RBI policy window"
+- start: "2025-11-30T14:00:00+05:30"
+  end: "2025-11-30T15:00:00+05:30"
+  name: "Earnings blackout"

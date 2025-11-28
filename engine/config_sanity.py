@@ -72,6 +72,24 @@ def sanity_check_config(cfg: EngineConfig) -> None:
     bn_vol_mult = getattr(cfg.banknifty, "vol_breakout_mult", 0.0)
     if bn_vol_mult <= 0:
         _err("banknifty_vol_breakout_mult", "banknifty.vol_breakout_mult must be > 0.")
+    if getattr(cfg.strategy, "imi_period", 0) <= 0:
+        _err("strategy_imi_period", "strategy.imi_period must be > 0.")
+    if getattr(cfg.strategy, "pcr_extreme_high", 0.0) <= 0:
+        _err("strategy_pcr_extreme_high", "strategy.pcr_extreme_high must be > 0.")
+    if getattr(cfg.strategy, "pcr_extreme_low", 0.0) <= 0:
+        _err("strategy_pcr_extreme_low", "strategy.pcr_extreme_low must be > 0.")
+    if getattr(cfg.strategy, "iv_percentile_threshold", 0.0) < 0:
+        _err("strategy_iv_percentile_threshold", "strategy.iv_percentile_threshold must be >= 0.")
+    if getattr(cfg.strategy, "iv_exit_percentile", 0.0) < 0:
+        _err("strategy_iv_exit_percentile", "strategy.iv_exit_percentile must be >= 0.")
+    if getattr(cfg.strategy, "oi_volume_min_threshold", 0.0) < 0:
+        _err("strategy_oi_volume_min_threshold", "strategy.oi_volume_min_threshold must be >= 0.")
+    if getattr(cfg.strategy, "gamma_threshold", 0.0) < 0:
+        _err("strategy_gamma_threshold", "strategy.gamma_threshold must be >= 0.")
+    if getattr(cfg.strategy, "min_minutes_to_expiry", 0) < 0:
+        _err("strategy_min_minutes_to_expiry", "strategy.min_minutes_to_expiry must be >= 0.")
+    if getattr(cfg.strategy, "event_halt_minutes", 0) < 0:
+        _err("strategy_event_halt_minutes", "strategy.event_halt_minutes must be >= 0.")
 
     for ip in getattr(cfg, "allowed_ips", ()):
         try:
@@ -99,6 +117,8 @@ def sanity_check_config(cfg: EngineConfig) -> None:
         _err("exit_time_buffer_minutes", "exit.time_buffer_minutes must be >= 0.")
     if getattr(cfg.exit, "partial_tp_mult", 0.0) < 0:
         _err("exit_partial_tp_mult", "exit.partial_tp_mult must be >= 0.")
+    if getattr(cfg.exit, "at_pct", 0.0) < 0:
+        _err("exit_at_pct", "exit.at_pct must be >= 0.")
 
     rate_limits = cfg.broker.rate_limits
     rates = (

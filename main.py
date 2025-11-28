@@ -40,7 +40,7 @@ from engine.exit import ExitEngine
 from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 from market.instrument_cache import InstrumentCache
-from strategy import IntradayBuyStrategy
+from strategy import AdvancedBuyStrategy, IntradayBuyStrategy
 
 try:  # pragma: no cover - optional acceleration
     import uvloop
@@ -81,6 +81,7 @@ class EngineApp:
                 getattr(config.exit, "trailing_step", 0.0),
                 getattr(config.exit, "time_buffer_minutes", 0),
                 getattr(config.exit, "partial_tp_mult", 0.0),
+                getattr(config.exit, "at_pct", 0.0),
             )
         except Exception:
             pass
@@ -117,8 +118,10 @@ class EngineApp:
             store=self.store,
             tick_size=config.data.tick_size,
             metrics=self.metrics,
+            iv_exit_threshold=getattr(config.strategy, "iv_exit_percentile", 0.0),
         )
-        self.strategy = IntradayBuyStrategy(
+        strategy_cls = AdvancedBuyStrategy if getattr(config, "strategy_tag", "").lower() == "advanced-buy" else IntradayBuyStrategy
+        self.strategy = strategy_cls(
             config,
             self.risk,
             self.oms,
