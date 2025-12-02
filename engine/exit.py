@@ -69,6 +69,9 @@ class ExitEngine:
                 "risk_per_unit": self._risk_per_unit(float(price), stop_price),
                 "partial_trigger_price": self._partial_trigger_price(float(price)),
                 "expiry": self._parse_expiry_from_symbol(symbol),
+                "scalp_stop": self._scalping_stop(float(price)),
+                "scalp_target": self._scalping_target(float(price)),
+                "scalp_time_limit": getattr(self.cfg, "scalping_time_limit_minutes", 0),
             }
             self.store.upsert_exit_plan(symbol, plan, ts=ts)
             return
@@ -143,6 +146,19 @@ class ExitEngine:
                     plan["trailing_stop"] = atr_stop
                     reason = "ATR_TRAIL"
 
+        # Scalping stop/target/time
+        scalp_stop = plan.get("scalp_stop")
+        scalp_target = plan.get("scalp_target")
+        scalp_time_limit = plan.get("scalp_time_limit") or 0
+        if not reason and scalp_stop and ltp <= scalp_stop:
+            reason = "SCALP_STOP"
+        if not reason and scalp_target and ltp >= scalp_target:
+            reason = "SCALP_TARGET"
+        if not reason and scalp_time_limit > 0:
+            age_minutes = (ts_dt - entry_ts).total_seconds() / 60.0
+            if age_minutes >= scalp_time_limit:
+                reason = "SCALP_TIME"
+
         premium_trailing = self._premium_trailing_enabled()
         if premium_trailing:
             reason, exit_qty = self._evaluate_premium_trailing(
@@ -193,6 +209,10 @@ class ExitEngine:
                     if above_stop and below_target:
                         reason = "TIME"
 
+        # OI reversal: lower priority than price/vol-based exits, higher than pure expiry/time buffer
+        if not reason and self._oi_reversal(instrument_key, ltp):
+            reason = "OI_REVERSAL"
+
         expiry_deadline = self._expiry_deadline(instrument_key, plan, ts_dt)
         if not reason and expiry_deadline and ts_dt >= expiry_deadline:
             reason = "EXPIRY_BUFFER"
@@ -201,9 +221,14 @@ class ExitEngine:
             self.store.upsert_exit_plan(instrument_key, plan, ts=ts_dt)
             return
 
-        # OI reversal exit (secondary guard)
-        if not reason and self._oi_reversal(instrument_key, ltp):
-            reason = "OI_REVERSAL"
+        if reason.startswith("SCALP"):
+            try:
+                entry_ts_val = self._parse_ts(plan.get("entry_ts"))
+                age = max((ts_dt - entry_ts_val).total_seconds(), 0.0)
+                if self._metrics and hasattr(self._metrics, "scalping_avg_duration_seconds"):
+                    self._metrics.scalping_avg_duration_seconds.set(age)
+            except Exception:
+                pass
 
         await self._submit_exit_order(instrument_key, exit_qty, ltp, ts_dt, reason)
         plan["pending_exit_reason"] = reason
@@ -314,6 +339,18 @@ class ExitEngine:
         if multiplier and multiplier > 0:
             return max(entry * multiplier, 0.0)
         return None
+
+    def _scalping_stop(self, entry: float) -> Optional[float]:
+        pct = getattr(self.cfg, "scalping_stop_loss_pct", 0.0)
+        if pct <= 0:
+            return None
+        return max(entry * (1 - pct), 0.0)
+
+    def _scalping_target(self, entry: float) -> Optional[float]:
+        pct = getattr(self.cfg, "scalping_profit_target_pct", 0.0)
+        if pct <= 0:
+            return None
+        return max(entry * (1 + pct), 0.0)
 
     def _compute_trailing_stop(
         self,

@@ -59,6 +59,8 @@ class AdvancedBuyStrategy(BaseStrategy):
         event_path = getattr(config.strategy, "event_file_path", None)
         self._event_path = Path(event_path) if event_path else None
         self._event_windows: list[tuple[dt.datetime, dt.datetime]] = []
+        self.enable_call_entries = bool(getattr(config.strategy, "enable_call_entries", True))
+        self.enable_put_entries = bool(getattr(config.strategy, "enable_put_entries", False))
 
         self._ema_short: dict[str, float] = {}
         self._ema_long: dict[str, float] = {}
@@ -120,32 +122,29 @@ class AdvancedBuyStrategy(BaseStrategy):
             self._update_imi(symbol)
         self._update_emas(symbol, price)
         breakout = self._vol_breakout(symbol)
-        crossover = self._crossed_up(symbol)
+        crossover_up = self._crossed_up(symbol)
+        crossover_down = self._crossed_down(symbol)
         imi = self._current_imi(symbol)
         iv_pct = self._iv_percentile(symbol)
         pcr = await self._maybe_refresh_chain(symbol, ts)
         event_block = self._event_guard(ts)
 
-        self._publish_metrics(symbol, imi=imi, pcr=pcr, iv_pct=iv_pct, breakout=breakout, crossover=crossover)
+        self._publish_metrics(symbol, imi=imi, pcr=pcr, iv_pct=iv_pct, breakout=breakout, crossover=crossover_up)
 
         if self.risk.has_open_positions():
             return
         if event_block:
             return
-        if imi is None or imi >= 30:
-            return
-        if iv_pct is None or iv_pct >= self.iv_entry_threshold:
-            return
-        if pcr is None or pcr <= 0:
-            return
-        if pcr < self.pcr_lo or pcr > self.pcr_hi:
-            return
-        if not breakout or not crossover:
-            return
 
-        await self._enter(symbol, price, ts, iv_pct, pcr)
+        if self.enable_call_entries:
+            if imi is not None and imi < 30 and iv_pct is not None and iv_pct < self.iv_entry_threshold and pcr is not None and self.pcr_lo <= pcr <= self.pcr_hi and breakout and crossover_up:
+                await self._enter(symbol, price, ts, iv_pct, pcr, opt_type="CE")
 
-    async def _enter(self, symbol: str, spot: float, ts: dt.datetime, iv_pct: float, pcr: float) -> None:
+        if self.enable_put_entries and not self.risk.has_open_positions():
+            if imi is not None and imi > 70 and iv_pct is not None and iv_pct < self.iv_entry_threshold and pcr is not None and self.pcr_lo <= pcr <= self.pcr_hi and breakout and crossover_down:
+                await self._enter(symbol, price, ts, iv_pct, pcr, opt_type="PE")
+
+    async def _enter(self, symbol: str, spot: float, ts: dt.datetime, iv_pct: float, pcr: float, opt_type: str = "CE") -> None:
         if self.risk.should_halt():
             await self.exit_engine.handle_risk_halt()
             return
@@ -157,12 +156,12 @@ class AdvancedBuyStrategy(BaseStrategy):
         expiry = self._resolve_expiry(symbol, ts)
         step = self._strike_step(symbol)
         atm = pick_strike_from_spot(spot, step=step)
-        otm = atm + step
+        otm = atm + step if opt_type == "CE" else atm - step
         chain = self._chain_cache.get(symbol, {})
         candidates = [atm, otm]
         best = None
         for strike in candidates:
-            entry = chain.get(strike)
+            entry = chain.get(opt_type, {}).get(strike)
             if not entry:
                 continue
             oi = float(entry.get("oi") or 0.0)
@@ -171,21 +170,24 @@ class AdvancedBuyStrategy(BaseStrategy):
                 continue
             prev_price = self._prev_underlying_price.get(symbol)
             prev_chain = self._chain_oi_prev.get(symbol, {})
-            prev_oi = prev_chain.get(strike)
-            if prev_price is not None and spot > prev_price and prev_oi is not None and oi < prev_oi:
+            prev_oi = {}
+            if isinstance(prev_chain, dict):
+                prev_oi = prev_chain.get(opt_type, {}) if opt_type in prev_chain else {}
+            prev_val = prev_oi.get(strike) if isinstance(prev_oi, dict) else None
+            if prev_price is not None and spot > prev_price and prev_val is not None and oi < prev_val:
                 continue  # weakening OI trend on rising price
             score = oi + vol
             if best is None or score > best["score"]:
                 trend = 0
-                if prev_oi is not None:
-                    trend = 1 if oi > prev_oi else -1
+                if prev_val is not None:
+                    trend = 1 if oi > prev_val else -1
                 best = {"strike": strike, "entry": entry, "score": score, "trend": trend}
         if best is None:
             return
         strike = best["strike"]
         entry = best["entry"]
         instrument_key = entry.get("instrument_key") or entry.get("token") or ""
-        instrument = f"{symbol}-{expiry}-{int(strike)}CE"
+        instrument = f"{symbol}-{expiry}-{int(strike)}{opt_type}"
         try:
             trend = float(best.get("trend", 0))
             self.metrics.strategy_oi_trend.labels(instrument=instrument).set(trend)
@@ -194,6 +196,10 @@ class AdvancedBuyStrategy(BaseStrategy):
         premium = self._option_price_for(instrument, entry, ts) or spot * 0.01
         if premium <= 0:
             return
+        try:
+            self.risk.record_expected_price(instrument, premium, best.get("spread_pct"))
+        except Exception:
+            pass
         lot_size = self._resolve_lot_size(expiry, symbol)
         risk_pct = getattr(self.cfg.risk, "risk_percent_per_trade", 0.0)
         risk_pct_norm = risk_pct if risk_pct <= 1 else risk_pct / 100.0
@@ -328,6 +334,15 @@ class AdvancedBuyStrategy(BaseStrategy):
             return False
         return prev_s <= prev_l and curr_s > curr_l
 
+    def _crossed_down(self, symbol: str) -> bool:
+        curr_s = self._ema_short.get(symbol)
+        curr_l = self._ema_long.get(symbol)
+        prev_s = self._prev_ema_short.get(symbol)
+        prev_l = self._prev_ema_long.get(symbol)
+        if None in (curr_s, curr_l, prev_s, prev_l):
+            return False
+        return prev_s >= prev_l and curr_s < curr_l
+
     def _vol_breakout(self, symbol: str) -> bool:
         if symbol not in self._vol_returns or len(self._vol_returns[symbol]) < 5:
             return False
@@ -375,25 +390,28 @@ class AdvancedBuyStrategy(BaseStrategy):
         entries = data or []
         # capture previous OI snapshot for trend detection
         prev_chain = self._chain_cache.get(symbol, {})
-        prev_snapshot: dict[int, float] = {}
-        for k, v in prev_chain.items():
-            if isinstance(k, int) and isinstance(v, dict) and "oi" in v:
-                try:
-                    prev_snapshot[k] = float(v.get("oi") or 0.0)
-                except Exception:
-                    continue
+        prev_snapshot: dict[str, dict[int, float]] = {}
+        for opt_key in ("CE", "PE"):
+            prev_snapshot[opt_key] = {}
+            prev_opt = prev_chain.get(opt_key, {}) if isinstance(prev_chain, dict) else {}
+            for k, v in prev_opt.items():
+                if isinstance(k, int) and isinstance(v, dict) and "oi" in v:
+                    try:
+                        prev_snapshot[opt_key][k] = float(v.get("oi") or 0.0)
+                    except Exception:
+                        continue
         self._chain_oi_prev[symbol] = prev_snapshot
-        chain: dict[int, dict[str, Any]] = {}
+        chain: dict[str, dict[int, dict[str, Any]]] = {"CE": {}, "PE": {}}
         for row in entries:
             strike = row.get("strike") or row.get("strike_price") or row.get("strikePrice")
             opt_type = str(row.get("option_type") or row.get("optionType") or row.get("type") or "").upper()
-            if strike is None or opt_type != "CE":
+            if strike is None or opt_type not in {"CE", "PE"}:
                 continue
             try:
                 strike_val = int(float(strike))
             except (TypeError, ValueError):
                 continue
-            chain[strike_val] = {
+            chain.setdefault(opt_type, {})[strike_val] = {
                 "instrument_key": row.get("instrument_key") or row.get("instrumentKey"),
                 "oi": row.get("oi") or row.get("open_interest"),
                 "volume": row.get("volume") or row.get("vol_traded_today") or row.get("volume_traded"),

@@ -111,3 +111,21 @@ async def test_exit_engine_time_stop(tmp_path):
     assert len(oms.orders) == 1
     plan = store.load_exit_plan(symbol)
     assert plan and plan.get("pending_exit_reason") == "TIME"
+
+
+@pytest.mark.asyncio
+async def test_exit_engine_oi_reversal_triggers(tmp_path):
+    cfg = ExitConfig(stop_pct=0.0, target1_pct=0.0, partial_fraction=0.5, trail_lock_pct=0.4, trail_giveback_pct=0.5, min_trail_ticks=1, max_holding_minutes=60, trailing_stop_pct=0.0)
+    engine, store, oms = _engine(tmp_path, cfg)
+    ts = dt.datetime(2024, 7, 1, 9, 30, tzinfo=IST)
+    symbol = "TEST-OI"
+    _seed_position(store, symbol, qty=10, price=100.0, ts=ts)
+    engine.on_fill(symbol=symbol, side="BUY", qty=10, price=100.0, ts=ts)
+
+    # two ticks: price falling, OI rising -> should trigger OI_REVERSAL
+    await engine.on_tick(symbol, 105.0, ts + dt.timedelta(minutes=1))
+    await engine.on_tick(symbol, 99.0, ts + dt.timedelta(minutes=2), oi=120.0)
+
+    assert len(oms.orders) == 1
+    plan = store.load_exit_plan(symbol)
+    assert plan and plan.get("pending_exit_reason") == "OI_REVERSAL"

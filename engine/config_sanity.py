@@ -90,6 +90,19 @@ def sanity_check_config(cfg: EngineConfig) -> None:
         _err("strategy_min_minutes_to_expiry", "strategy.min_minutes_to_expiry must be >= 0.")
     if getattr(cfg.strategy, "event_halt_minutes", 0) < 0:
         _err("strategy_event_halt_minutes", "strategy.event_halt_minutes must be >= 0.")
+    if getattr(cfg.strategy, "breakout_window", 0) <= 0:
+        _err("strategy_breakout_window", "strategy.breakout_window must be > 0.")
+    if getattr(cfg.strategy, "volume_mult", 0.0) < 0:
+        _err("strategy_volume_mult", "strategy.volume_mult must be >= 0.")
+    if getattr(cfg.strategy, "spread_max_pct", 0.0) < 0:
+        _err("strategy_spread_max_pct", "strategy.spread_max_pct must be >= 0.")
+    pcr_range = getattr(cfg.strategy, "pcr_range", (0.0, 0.0))
+    try:
+        pcr_low, pcr_high = pcr_range
+        if pcr_low < 0 or pcr_high < 0:
+            _err("strategy_pcr_range", "strategy.pcr_range must be non-negative.")
+    except Exception:
+        _err("strategy_pcr_range", "strategy.pcr_range must be a 2-tuple.")
 
     for ip in getattr(cfg, "allowed_ips", ()):
         try:
@@ -119,6 +132,32 @@ def sanity_check_config(cfg: EngineConfig) -> None:
         _err("exit_partial_tp_mult", "exit.partial_tp_mult must be >= 0.")
     if getattr(cfg.exit, "at_pct", 0.0) < 0:
         _err("exit_at_pct", "exit.at_pct must be >= 0.")
+    if getattr(cfg.exit, "scalping_profit_target_pct", 0.0) < 0:
+        _err("exit_scalping_profit_target_pct", "exit.scalping_profit_target_pct must be >= 0.")
+    if getattr(cfg.exit, "scalping_stop_loss_pct", 0.0) < 0:
+        _err("exit_scalping_stop_loss_pct", "exit.scalping_stop_loss_pct must be >= 0.")
+    if getattr(cfg.exit, "scalping_time_limit_minutes", 0) < 0:
+        _err("exit_scalping_time_limit_minutes", "exit.scalping_time_limit_minutes must be >= 0.")
+    if getattr(cfg.risk, "scalping_risk_pct", 0.0) < 0:
+        _err("risk_scalping_risk_pct", "risk.scalping_risk_pct must be >= 0.")
+    if getattr(cfg.risk, "scalping_trades_per_hour", 0) < 0:
+        _err("risk_scalping_trades_per_hour", "risk.scalping_trades_per_hour must be >= 0.")
+    if getattr(cfg.risk, "max_slippage_pct_per_trade", 0.0) < 0:
+        _err("risk_max_slippage_pct_per_trade", "risk.max_slippage_pct_per_trade must be >= 0.")
+    if getattr(cfg.risk, "max_avg_slippage_pct_per_day", 0.0) < 0:
+        _err("risk_max_avg_slippage_pct_per_day", "risk.max_avg_slippage_pct_per_day must be >= 0.")
+    if getattr(cfg.risk, "max_slippage_trades", 0) < 0:
+        _err("risk_max_slippage_trades", "risk.max_slippage_trades must be >= 0.")
+    if getattr(cfg.risk, "max_entry_spread_pct", 0.0) < 0:
+        _err("risk_max_entry_spread_pct", "risk.max_entry_spread_pct must be >= 0.")
+    if getattr(cfg.risk, "max_trades_per_day", 0) < 0:
+        _err("risk_max_trades_per_day", "risk.max_trades_per_day must be >= 0.")
+    if getattr(cfg.risk, "max_consecutive_losses", 0) < 0:
+        _err("risk_max_consecutive_losses", "risk.max_consecutive_losses must be >= 0.")
+    if getattr(cfg.risk, "max_intraday_index_move_pct_window", 0.0) < 0:
+        _err("risk_max_intraday_index_move_pct_window", "risk.max_intraday_index_move_pct_window must be >= 0.")
+    if getattr(cfg.risk, "extreme_move_window_seconds", 0) < 0:
+        _err("risk_extreme_move_window_seconds", "risk.extreme_move_window_seconds must be >= 0.")
 
     rate_limits = cfg.broker.rate_limits
     rates = (

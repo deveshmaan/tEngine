@@ -163,6 +163,15 @@ class RiskManager:
         self._default_stop_loss_pct = max(float(default_stop_loss_pct or 0.0), 0.0)
         self._positions: Dict[str, PositionState] = {}
         self._order_timestamps: Deque[dt.datetime] = deque()
+        self._scalping_timestamps: Deque[dt.datetime] = deque()
+        self._expected_price: Dict[str, float] = {}
+        self._expected_spread: Dict[str, float] = {}
+        self._slippage_sum_pct: float = 0.0
+        self._slippage_count: int = 0
+        self._slippage_bad: int = 0
+        self._trades_executed_today: int = 0
+        self._consecutive_losses: int = 0
+        self._underlying_prices: Dict[str, Deque[tuple[dt.datetime, float]]] = {}
         self._halt_reason: Optional[str] = None
         self._kill_switch = False
         self._logger = logger if logger else get_logger("RiskManager")
@@ -171,6 +180,7 @@ class RiskManager:
 
     # ----------------------------------------------------------------- updates
     def on_fill(self, *, symbol: str, side: str, qty: int, price: float, lot_size: int) -> None:
+        prev_state = self._positions.get(symbol)
         state = self._positions.setdefault(symbol, PositionState(lot_size=max(lot_size, 1)))
         signed_qty = qty if side.upper() == "BUY" else -qty
         prev_qty = state.net_qty
@@ -199,6 +209,29 @@ class RiskManager:
                 state.avg_price = price
 
         self._positions[symbol] = state
+
+        if prev_state and prev_state.net_qty > 0 and state.net_qty == 0:
+            trade_pnl = state.realized_pnl
+            self._trades_executed_today += 1
+            if trade_pnl < 0:
+                self._consecutive_losses += 1
+            else:
+                self._consecutive_losses = 0
+            self._check_trade_frequency_limits()
+            self._check_loss_streak()
+
+        expected = self._expected_price.get(symbol)
+        if expected and expected > 0:
+            try:
+                slippage_pct = (price - expected) / expected
+                self._slippage_sum_pct += slippage_pct
+                self._slippage_count += 1
+                if abs(slippage_pct) >= max(self.cfg.max_slippage_pct_per_trade, 0.0) > 0:
+                    self._slippage_bad += 1
+                self._check_slippage_limits()
+            except Exception:
+                pass
+
         self._evaluate_limits(symbol)
         self._update_risk_metrics()
 
@@ -265,6 +298,26 @@ class RiskManager:
 
         if side == "BUY" and not self._premium_budget_ok(order):
             self._emit_event("NOTIONAL", "Notional premium budget exhausted", order.symbol)
+            return False
+
+        if side == "BUY" and not self._scalping_rate_ok(now_dt, order):
+            self._emit_event("SCALP_RATE", "Scalping trade frequency exceeded", order.symbol)
+            return False
+
+        if side == "BUY" and not self._entry_spread_ok(order):
+            self._emit_event("ENTRY_SPREAD", "Entry spread too wide", order.symbol)
+            return False
+
+        if side == "BUY" and not self._trade_count_ok():
+            self._emit_event("MAX_TRADES_REACHED", "Max trades per day reached", order.symbol)
+            return False
+
+        if side == "BUY" and not self._loss_streak_ok():
+            self._emit_event("CONSECUTIVE_LOSSES", "Consecutive loss limit reached", order.symbol)
+            return False
+
+        if side == "BUY" and not self._extreme_move_ok():
+            self._emit_event("EXTREME_MOVE", "Extreme move detected on underlying", order.symbol)
             return False
 
         return True
@@ -402,6 +455,90 @@ class RiskManager:
         if len(self._order_timestamps) >= self.cfg.max_order_rate:
             return False
         self._order_timestamps.append(now)
+        return True
+
+    def _scalping_rate_ok(self, now: dt.datetime, order: OrderBudget) -> bool:
+        limit = getattr(self.cfg, "scalping_trades_per_hour", 0)
+        if limit <= 0:
+            return True
+        window = now - dt.timedelta(hours=1)
+        while self._scalping_timestamps and self._scalping_timestamps[0] < window:
+            self._scalping_timestamps.popleft()
+        if len(self._scalping_timestamps) >= limit:
+            return False
+        # light heuristic: treat small qty orders as scalps based on risk config or strategy tag
+        self._scalping_timestamps.append(now)
+        return True
+
+    def _entry_spread_ok(self, order: OrderBudget) -> bool:
+        threshold = getattr(self.cfg, "max_entry_spread_pct", 0.0)
+        if threshold <= 0:
+            return True
+        spread = self._expected_spread.get(order.symbol)
+        if spread is None:
+            return True
+        try:
+            return float(spread) <= threshold
+        except Exception:
+            return True
+
+    def record_expected_price(self, symbol: str, expected_price: float, spread_pct: Optional[float] = None) -> None:
+        try:
+            self._expected_price[symbol] = float(expected_price)
+            if spread_pct is not None:
+                self._expected_spread[symbol] = float(spread_pct)
+        except Exception:
+            return
+
+    def _trade_count_ok(self) -> bool:
+        limit = getattr(self.cfg, "max_trades_per_day", 0)
+        if limit <= 0:
+            return True
+        return self._trades_executed_today < limit
+
+    def _loss_streak_ok(self) -> bool:
+        limit = getattr(self.cfg, "max_consecutive_losses", 0)
+        if limit <= 0:
+            return True
+        return self._consecutive_losses < limit
+
+    def _check_trade_frequency_limits(self) -> None:
+        if getattr(self.cfg, "max_trades_per_day", 0) > 0 and self._trades_executed_today >= self.cfg.max_trades_per_day:
+            self.halt_new_entries("MAX_TRADES_REACHED")
+
+    def _check_loss_streak(self) -> None:
+        if getattr(self.cfg, "max_consecutive_losses", 0) > 0 and self._consecutive_losses >= self.cfg.max_consecutive_losses:
+            self.halt_new_entries("CONSECUTIVE_LOSSES")
+
+    def _check_slippage_limits(self) -> None:
+        per_trade_limit = getattr(self.cfg, "max_slippage_pct_per_trade", 0.0)
+        avg_limit = getattr(self.cfg, "max_avg_slippage_pct_per_day", 0.0)
+        bad_limit = getattr(self.cfg, "max_slippage_trades", 0)
+        avg_slip = (self._slippage_sum_pct / self._slippage_count) if self._slippage_count else 0.0
+        if bad_limit > 0 and self._slippage_bad >= bad_limit:
+            self.halt_new_entries("EXCESSIVE_SLIPPAGE")
+        if avg_limit > 0 and abs(avg_slip) >= avg_limit:
+            self.halt_new_entries("EXCESSIVE_SLIPPAGE")
+
+    def record_underlying_tick(self, symbol: str, price: float, ts: dt.datetime) -> None:
+        window_sec = getattr(self.cfg, "extreme_move_window_seconds", 0)
+        if window_sec <= 0 or getattr(self.cfg, "max_intraday_index_move_pct_window", 0.0) <= 0:
+            return
+        hist = self._underlying_prices.setdefault(symbol, deque())
+        hist.append((ts, float(price)))
+        cutoff = ts - dt.timedelta(seconds=window_sec)
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
+        if len(hist) >= 2:
+            start_price = hist[0][1]
+            if start_price > 0:
+                ret = (price / start_price) - 1.0
+                if abs(ret) >= self.cfg.max_intraday_index_move_pct_window:
+                    self.halt_new_entries("EXTREME_MOVE")
+
+    def _extreme_move_ok(self) -> bool:
+        if self._halt_reason == "EXTREME_MOVE":
+            return False
         return True
 
     def _purge_old_orders(self, now: dt.datetime) -> None:
