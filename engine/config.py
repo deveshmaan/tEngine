@@ -145,6 +145,14 @@ class RiskLimits:
     post_close_behavior: str = "halt_if_flat"
     scalping_risk_pct: float = 0.5
     scalping_trades_per_hour: int = 30
+    max_slippage_pct_per_trade: float = 0.0
+    max_avg_slippage_pct_per_day: float = 0.0
+    max_slippage_trades: int = 0
+    max_entry_spread_pct: float = 0.0
+    max_trades_per_day: int = 0
+    max_consecutive_losses: int = 0
+    max_intraday_index_move_pct_window: float = 0.0
+    extreme_move_window_seconds: int = 0
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "RiskLimits":
@@ -163,6 +171,14 @@ class RiskLimits:
             post_close_behavior=behavior,
             scalping_risk_pct=float(payload.get("scalping_risk_pct", 0.5)),
             scalping_trades_per_hour=int(payload.get("scalping_trades_per_hour", 30)),
+            max_slippage_pct_per_trade=float(payload.get("max_slippage_pct_per_trade", 0.0)),
+            max_avg_slippage_pct_per_day=float(payload.get("max_avg_slippage_pct_per_day", 0.0)),
+            max_slippage_trades=int(payload.get("max_slippage_trades", 0)),
+            max_entry_spread_pct=float(payload.get("max_entry_spread_pct", 0.0)),
+            max_trades_per_day=int(payload.get("max_trades_per_day", 0)),
+            max_consecutive_losses=int(payload.get("max_consecutive_losses", 0)),
+            max_intraday_index_move_pct_window=float(payload.get("max_intraday_index_move_pct_window", 0.0)),
+            extreme_move_window_seconds=int(payload.get("extreme_move_window_seconds", 0)),
         )
 
 

@@ -196,6 +196,10 @@ class AdvancedBuyStrategy(BaseStrategy):
         premium = self._option_price_for(instrument, entry, ts) or spot * 0.01
         if premium <= 0:
             return
+        try:
+            self.risk.record_expected_price(instrument, premium, best.get("spread_pct"))
+        except Exception:
+            pass
         lot_size = self._resolve_lot_size(expiry, symbol)
         risk_pct = getattr(self.cfg.risk, "risk_percent_per_trade", 0.0)
         risk_pct_norm = risk_pct if risk_pct <= 1 else risk_pct / 100.0

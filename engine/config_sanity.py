@@ -142,6 +142,22 @@ def sanity_check_config(cfg: EngineConfig) -> None:
         _err("risk_scalping_risk_pct", "risk.scalping_risk_pct must be >= 0.")
     if getattr(cfg.risk, "scalping_trades_per_hour", 0) < 0:
         _err("risk_scalping_trades_per_hour", "risk.scalping_trades_per_hour must be >= 0.")
+    if getattr(cfg.risk, "max_slippage_pct_per_trade", 0.0) < 0:
+        _err("risk_max_slippage_pct_per_trade", "risk.max_slippage_pct_per_trade must be >= 0.")
+    if getattr(cfg.risk, "max_avg_slippage_pct_per_day", 0.0) < 0:
+        _err("risk_max_avg_slippage_pct_per_day", "risk.max_avg_slippage_pct_per_day must be >= 0.")
+    if getattr(cfg.risk, "max_slippage_trades", 0) < 0:
+        _err("risk_max_slippage_trades", "risk.max_slippage_trades must be >= 0.")
+    if getattr(cfg.risk, "max_entry_spread_pct", 0.0) < 0:
+        _err("risk_max_entry_spread_pct", "risk.max_entry_spread_pct must be >= 0.")
+    if getattr(cfg.risk, "max_trades_per_day", 0) < 0:
+        _err("risk_max_trades_per_day", "risk.max_trades_per_day must be >= 0.")
+    if getattr(cfg.risk, "max_consecutive_losses", 0) < 0:
+        _err("risk_max_consecutive_losses", "risk.max_consecutive_losses must be >= 0.")
+    if getattr(cfg.risk, "max_intraday_index_move_pct_window", 0.0) < 0:
+        _err("risk_max_intraday_index_move_pct_window", "risk.max_intraday_index_move_pct_window must be >= 0.")
+    if getattr(cfg.risk, "extreme_move_window_seconds", 0) < 0:
+        _err("risk_extreme_move_window_seconds", "risk.extreme_move_window_seconds must be >= 0.")
 
     rate_limits = cfg.broker.rate_limits
     rates = (

@@ -66,6 +66,14 @@ risk:
   risk_percent_per_trade: 1.0
   scalping_risk_pct: 0.5
   scalping_trades_per_hour: 30
+  max_slippage_pct_per_trade: 0.0   # 0 disables slippage halt
+  max_avg_slippage_pct_per_day: 0.0 # 0 disables
+  max_slippage_trades: 0            # 0 disables
+  max_entry_spread_pct: 0.0         # 0 disables
+  max_trades_per_day: 0             # 0 disables
+  max_consecutive_losses: 0         # 0 disables
+  max_intraday_index_move_pct_window: 0.0 # 0 disables
+  extreme_move_window_seconds: 0            # 0 disables
 
 broker:
   max_order_rate: 15

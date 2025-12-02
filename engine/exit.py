@@ -209,6 +209,10 @@ class ExitEngine:
                     if above_stop and below_target:
                         reason = "TIME"
 
+        # OI reversal: lower priority than price/vol-based exits, higher than pure expiry/time buffer
+        if not reason and self._oi_reversal(instrument_key, ltp):
+            reason = "OI_REVERSAL"
+
         expiry_deadline = self._expiry_deadline(instrument_key, plan, ts_dt)
         if not reason and expiry_deadline and ts_dt >= expiry_deadline:
             reason = "EXPIRY_BUFFER"
@@ -225,10 +229,6 @@ class ExitEngine:
                     self._metrics.scalping_avg_duration_seconds.set(age)
             except Exception:
                 pass
-
-        # OI reversal exit (secondary guard)
-        if not reason and self._oi_reversal(instrument_key, ltp):
-            reason = "OI_REVERSAL"
 
         await self._submit_exit_order(instrument_key, exit_qty, ltp, ts_dt, reason)
         plan["pending_exit_reason"] = reason

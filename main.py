@@ -351,6 +351,11 @@ class EngineApp:
                 )
             except Exception:
                 self.logger.log_event(30, "exit_plan_seed_failed", symbol=exec_obj.symbol)
+            try:
+                lot_guess = getattr(self.cfg.data, "lot_step", 1)
+                self.risk.on_fill(symbol=exec_obj.symbol, side=exec_obj.side, qty=exec_obj.qty, price=exec_obj.price, lot_size=lot_guess)
+            except Exception:
+                pass
 
     async def _consume_market_marks(self) -> None:
         queue = await self.bus.subscribe("market/events", maxsize=500)
@@ -369,6 +374,10 @@ class EngineApp:
                     self.pnl.mark_to_market({symbol: float(price)})
                 except (TypeError, ValueError):
                     continue
+                try:
+                    self.risk.record_underlying_tick(symbol, float(price), _parse_ts(event.get("ts"), IST))
+                except Exception:
+                    pass
 
     async def _pnl_snapshot_loop(self) -> None:
         while not self._stop.is_set():
