@@ -384,6 +384,8 @@ class StrategyConfig:
     gamma_threshold: float = 0.0
     min_minutes_to_expiry: int = 0
     event_halt_minutes: int = 0
+    enable_call_entries: bool = True
+    enable_put_entries: bool = False
     # Scalping-specific
     breakout_window: int = 5
     breakout_margin: float = 0.0
@@ -469,6 +471,8 @@ class StrategyConfig:
             spread_max_pct = float(payload.get("spread_max_pct", 0.05))
         except (TypeError, ValueError):
             spread_max_pct = 0.05
+        enable_call = bool(payload.get("enable_call_entries", True))
+        enable_put = bool(payload.get("enable_put_entries", False))
         event_path = str(payload.get("event_file_path") or "").strip() or None
         short = max(short_val, 1)
         long = max(long_val, short + 1)
@@ -492,6 +496,8 @@ class StrategyConfig:
             volume_mult=max(volume_mult, 0.0),
             pcr_range=(max(pcr_low, 0.0), max(pcr_high, 0.0)),
             spread_max_pct=max(spread_max_pct, 0.0),
+            enable_call_entries=enable_call,
+            enable_put_entries=enable_put,
         )
 
 

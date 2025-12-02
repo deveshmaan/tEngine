@@ -44,6 +44,8 @@ strategy:
   gamma_threshold: 0.0
   min_minutes_to_expiry: 30
   event_halt_minutes: 30
+  enable_call_entries: true
+  enable_put_entries: false
   breakout_window: 5
   breakout_margin: 5
   volume_mult: 1.5
