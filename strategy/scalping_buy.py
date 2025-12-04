@@ -323,34 +323,80 @@ class ScalpingBuyStrategy(BaseStrategy):
 
         payload = await asyncio.to_thread(_call)
         data = getattr(payload, "data", None) or (payload.get("data") if isinstance(payload, dict) else None) or []
+        raw_entries = data
+        if isinstance(raw_entries, dict):
+            flattened: list[dict[str, Any]] = []
+
+            def _collect(seq: Any, opt: str) -> None:
+                rows = seq.get("data") if isinstance(seq, dict) else seq
+                if not isinstance(rows, list):
+                    return
+                for item in rows:
+                    if isinstance(item, dict):
+                        merged = dict(item)
+                        merged["option_type"] = opt
+                        flattened.append(merged)
+
+            _collect(raw_entries.get("call") or raw_entries.get("CALL") or raw_entries.get("ce") or raw_entries.get("CE"), "CE")
+            _collect(raw_entries.get("put") or raw_entries.get("PUT") or raw_entries.get("pe") or raw_entries.get("PE"), "PE")
+            raw_entries = flattened
+
         chain: dict[int, dict[str, Any]] = {}
         call_vol = 0.0
         put_vol = 0.0
-        for row in data:
-            opt_type = str(row.get("option_type") or row.get("optionType") or row.get("type") or "").upper()
-            strike = row.get("strike") or row.get("strike_price") or row.get("strikePrice")
-            if strike is None:
-                continue
+
+        def _ingest(opt_type: str, strike_raw: Any, node: Any, expiry_hint: str) -> None:
+            nonlocal call_vol, put_vol
+            if opt_type not in {"CE", "PE"} or not isinstance(node, dict):
+                return
+            if strike_raw is None:
+                return
             try:
-                strike_val = int(float(strike))
+                strike_val = int(float(strike_raw))
             except Exception:
-                continue
-            vol = float(row.get("volume") or row.get("vol_traded_today") or row.get("volume_traded") or 0.0)
+                return
+            market = node.get("market_data") or node.get("marketData") or node
+            try:
+                vol = float(market.get("volume") or market.get("vol_traded_today") or market.get("volume_traded") or 0.0)
+            except Exception:
+                vol = 0.0
             if opt_type == "CE":
                 call_vol += vol
-            elif opt_type == "PE":
+            else:
                 put_vol += vol
             if opt_type != "CE":
-                continue
+                return
             chain[strike_val] = {
-                "instrument_key": row.get("instrument_key") or row.get("instrumentKey"),
-                "oi": row.get("oi") or row.get("open_interest"),
+                "instrument_key": node.get("instrument_key") or node.get("instrumentKey"),
+                "oi": market.get("oi") or node.get("oi") or node.get("open_interest"),
                 "volume": vol,
-                "ltp": row.get("ltp") or row.get("last_price"),
-                "bid": row.get("bid") or row.get("best_bid_price"),
-                "ask": row.get("ask") or row.get("best_ask_price"),
-                "expiry": expiry,
+                "ltp": market.get("ltp") or market.get("close_price") or node.get("ltp") or node.get("last_price"),
+                "bid": market.get("bid_price") or node.get("bid") or node.get("best_bid_price"),
+                "ask": market.get("ask_price") or node.get("ask") or node.get("best_ask_price"),
+                "expiry": node.get("expiry") or expiry_hint or expiry,
             }
+
+        is_strike_shape = isinstance(raw_entries, list) and raw_entries and isinstance(raw_entries[0], dict) and (
+            "call_options" in raw_entries[0] or "put_options" in raw_entries[0] or "callOptions" in raw_entries[0] or "putOptions" in raw_entries[0]
+        )
+        if is_strike_shape:
+            for row in raw_entries:
+                if not isinstance(row, dict):
+                    continue
+                strike_val = row.get("strike_price") or row.get("strike") or row.get("strikePrice")
+                exp_val = row.get("expiry") or expiry
+                call_node = row.get("call_options") or row.get("callOptions") or row.get("call")
+                put_node = row.get("put_options") or row.get("putOptions") or row.get("put")
+                _ingest("CE", strike_val, call_node, exp_val)
+                _ingest("PE", strike_val, put_node, exp_val)
+        else:
+            for row in raw_entries if isinstance(raw_entries, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                strike = row.get("strike") or row.get("strike_price") or row.get("strikePrice")
+                opt_type = str(row.get("option_type") or row.get("optionType") or row.get("type") or "").upper()
+                _ingest(opt_type, strike, row, expiry)
+
         self._chain_cache[symbol] = chain
         self._chain_ts[symbol] = ts.timestamp()
         if call_vol > 0:

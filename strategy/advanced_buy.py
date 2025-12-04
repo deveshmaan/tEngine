@@ -130,6 +130,8 @@ class AdvancedBuyStrategy(BaseStrategy):
         event_block = self._event_guard(ts)
 
         self._publish_metrics(symbol, imi=imi, pcr=pcr, iv_pct=iv_pct, breakout=breakout, crossover=crossover_up)
+        # Always push latest OI trend based on chain snapshots, independent of entry signals.
+        self._update_oi_trend_metric(symbol, price, ts)
 
         if self.risk.has_open_positions():
             return
@@ -166,7 +168,8 @@ class AdvancedBuyStrategy(BaseStrategy):
                 continue
             oi = float(entry.get("oi") or 0.0)
             vol = float(entry.get("volume") or 0.0)
-            if self.oi_volume_min > 0 and (oi < self.oi_volume_min or vol < self.oi_volume_min):
+            # allow either OI or volume to clear the bar; skip only if both are thin
+            if self.oi_volume_min > 0 and (oi < self.oi_volume_min and vol < self.oi_volume_min):
                 continue
             prev_price = self._prev_underlying_price.get(symbol)
             prev_chain = self._chain_oi_prev.get(symbol, {})
@@ -386,8 +389,24 @@ class AdvancedBuyStrategy(BaseStrategy):
             return session.get_option_chain(key, expiry)
 
         payload = await asyncio.to_thread(_call)
-        data = getattr(payload, "data", None) or payload.get("data") if isinstance(payload, dict) else None
-        entries = data or []
+        data = getattr(payload, "data", None) or (payload.get("data") if isinstance(payload, dict) else None)
+        raw_entries = data or []
+        if isinstance(raw_entries, dict):
+            flat_entries: list[dict[str, Any]] = []
+
+            def _collect(seq: Any, opt: str) -> None:
+                rows = seq.get("data") if isinstance(seq, dict) else seq
+                if not isinstance(rows, list):
+                    return
+                for item in rows:
+                    if isinstance(item, dict):
+                        merged = dict(item)
+                        merged["option_type"] = opt
+                        flat_entries.append(merged)
+
+            _collect(raw_entries.get("call") or raw_entries.get("CALL") or raw_entries.get("ce") or raw_entries.get("CE"), "CE")
+            _collect(raw_entries.get("put") or raw_entries.get("PUT") or raw_entries.get("pe") or raw_entries.get("PE"), "PE")
+            raw_entries = flat_entries
         # capture previous OI snapshot for trend detection
         prev_chain = self._chain_cache.get(symbol, {})
         prev_snapshot: dict[str, dict[int, float]] = {}
@@ -402,47 +421,77 @@ class AdvancedBuyStrategy(BaseStrategy):
                         continue
         self._chain_oi_prev[symbol] = prev_snapshot
         chain: dict[str, dict[int, dict[str, Any]]] = {"CE": {}, "PE": {}}
-        for row in entries:
-            strike = row.get("strike") or row.get("strike_price") or row.get("strikePrice")
-            opt_type = str(row.get("option_type") or row.get("optionType") or row.get("type") or "").upper()
-            if strike is None or opt_type not in {"CE", "PE"}:
-                continue
-            try:
-                strike_val = int(float(strike))
-            except (TypeError, ValueError):
-                continue
-            chain.setdefault(opt_type, {})[strike_val] = {
-                "instrument_key": row.get("instrument_key") or row.get("instrumentKey"),
-                "oi": row.get("oi") or row.get("open_interest"),
-                "volume": row.get("volume") or row.get("vol_traded_today") or row.get("volume_traded"),
-                "ltp": row.get("ltp") or row.get("last_price"),
-                "iv": row.get("iv") or row.get("implied_volatility"),
-                "gamma": row.get("gamma"),
-                "expiry": expiry,
-            }
-        # derive PCR from puts if available
         call_vol = 0.0
         put_vol = 0.0
-        for row in entries:
+        iv_samples: list[float] = []
+
+        def _ingest(opt_type: str, strike_raw: Any, node: Any, expiry_hint: str) -> None:
+            nonlocal call_vol, put_vol
+            if opt_type not in {"CE", "PE"} or not isinstance(node, dict):
+                return
+            if strike_raw is None:
+                return
             try:
-                vol = float(row.get("volume") or row.get("vol_traded_today") or row.get("volume_traded") or 0.0)
+                strike_val = int(float(strike_raw))
+            except (TypeError, ValueError):
+                return
+            market = node.get("market_data") or node.get("marketData") or node
+            greeks = node.get("option_greeks") or node.get("optionGreeks") or {}
+            try:
+                vol = float(market.get("volume") or market.get("vol_traded_today") or market.get("volume_traded") or 0.0)
             except Exception:
                 vol = 0.0
-            opt_type = str(row.get("option_type") or row.get("optionType") or row.get("type") or "").upper()
+            try:
+                oi_val = float(market.get("oi") or node.get("oi") or node.get("open_interest") or 0.0)
+            except Exception:
+                oi_val = market.get("oi") or node.get("oi") or node.get("open_interest")
+            entry = {
+                "instrument_key": node.get("instrument_key") or node.get("instrumentKey"),
+                "oi": oi_val,
+                "volume": vol,
+                "ltp": market.get("ltp") or market.get("close_price") or node.get("ltp") or node.get("last_price"),
+                "iv": greeks.get("iv") or node.get("iv") or node.get("implied_volatility"),
+                "gamma": greeks.get("gamma") or node.get("gamma"),
+                "expiry": node.get("expiry") or expiry_hint or expiry,
+            }
+            chain.setdefault(opt_type, {})[strike_val] = entry
             if opt_type == "CE":
                 call_vol += vol
-            elif opt_type == "PE":
+            else:
                 put_vol += vol
-        if chain:
+            if entry.get("iv") is not None:
+                iv_samples.append(entry["iv"])
+
+        is_strike_shape = isinstance(raw_entries, list) and raw_entries and isinstance(raw_entries[0], dict) and (
+            "call_options" in raw_entries[0] or "put_options" in raw_entries[0] or "callOptions" in raw_entries[0] or "putOptions" in raw_entries[0]
+        )
+        if is_strike_shape:
+            for row in raw_entries:
+                if not isinstance(row, dict):
+                    continue
+                strike_val = row.get("strike_price") or row.get("strike") or row.get("strikePrice")
+                exp_val = row.get("expiry") or expiry
+                call_node = row.get("call_options") or row.get("callOptions") or row.get("call")
+                put_node = row.get("put_options") or row.get("putOptions") or row.get("put")
+                _ingest("CE", strike_val, call_node, exp_val)
+                _ingest("PE", strike_val, put_node, exp_val)
+        else:
+            for row in raw_entries if isinstance(raw_entries, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                strike = row.get("strike") or row.get("strike_price") or row.get("strikePrice")
+                opt_type = str(row.get("option_type") or row.get("optionType") or row.get("type") or "").upper()
+                _ingest(opt_type, strike, row, expiry)
+
+        # derive PCR from puts if available
+        if any(chain.get(k) for k in ("CE", "PE")):
             self._chain_cache[symbol] = chain
             if call_vol > 0:
                 self._chain_cache[symbol]["__pcr__"] = put_vol / call_vol if call_vol else None
-        if self.iv_entry_threshold > 0 and entries:
-            for row in entries:
-                iv_val = row.get("iv") or row.get("implied_volatility")
+        if self.iv_entry_threshold > 0 and iv_samples:
+            for iv_val in iv_samples:
                 try:
-                    if iv_val:
-                        self._iv_history[symbol].append(float(iv_val))
+                    self._iv_history[symbol].append(float(iv_val))
                 except Exception:
                     continue
 
@@ -617,6 +666,54 @@ class AdvancedBuyStrategy(BaseStrategy):
             self.metrics.strategy_oi_trend.labels(instrument=f"{symbol}-NA").set(0)
         except Exception:
             pass
+
+    def _update_oi_trend_metric(self, symbol: str, spot: float, ts: dt.datetime) -> None:
+        """
+        Compute and publish OI trend for both legs using the latest chain snapshot.
+        Picks the top 3 strikes per side by (oi+vol) within the current chain.
+        This runs even when no entry signal is fired so the dashboard reflects changes.
+        """
+        expiry = self._resolve_expiry(symbol, ts)
+        step = self._strike_step(symbol)
+        chain = self._chain_cache.get(symbol, {})
+        for opt_type in ("CE", "PE"):
+            entries = []
+            bucket = chain.get(opt_type, {}) if isinstance(chain, dict) else {}
+            for strike, entry in bucket.items():
+                if not isinstance(strike, (int, float)):
+                    continue
+                oi = float(entry.get("oi") or 0.0)
+                vol = float(entry.get("volume") or 0.0)
+                if self.oi_volume_min > 0 and (oi < self.oi_volume_min and vol < self.oi_volume_min):
+                    continue
+                prev_chain = self._chain_oi_prev.get(symbol, {})
+                prev_oi = prev_chain.get(opt_type, {}) if isinstance(prev_chain, dict) else {}
+                prev_val = prev_oi.get(strike) if isinstance(prev_oi, dict) else None
+                trend = 0
+                if prev_val is not None:
+                    try:
+                        trend = 1 if oi > float(prev_val) else -1 if oi < float(prev_val) else 0
+                    except Exception:
+                        trend = 0
+                score = oi + vol
+                entries.append(
+                    {
+                        "strike": strike,
+                        "entry": entry,
+                        "trend": trend,
+                        "score": score,
+                    }
+                )
+            if not entries:
+                continue
+            top = sorted(entries, key=lambda x: x["score"], reverse=True)[:3]
+            for item in top:
+                instrument_key = item["entry"].get("instrument_key") or item["entry"].get("token") or ""
+                instrument = f"{symbol}-{expiry}-{int(item['strike'])}{opt_type}"
+                try:
+                    self.metrics.strategy_oi_trend.labels(instrument=instrument).set(float(item.get("trend", 0)))
+                except Exception:
+                    continue
 
     async def _publish_signal(self, instrument: str, qty: int, price: float, ts: dt.datetime) -> None:
         signal = OrderSignal(
