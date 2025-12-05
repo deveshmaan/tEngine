@@ -61,7 +61,7 @@ class ExitEngine:
                 "target1_price": self._target_price(float(price)),
                 "trailing_stop": None,
                 "trail_anchor_price": None,
-                "trailing_active": False,
+                "trailing_active": True,
                 "partial_filled_qty": 0,
                 "pending_exit_reason": None,
                 "pending_exit_ts": None,
