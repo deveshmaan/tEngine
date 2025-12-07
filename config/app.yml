@@ -1,6 +1,6 @@
 run_id: "dev-run"
 persistence_path: "engine_state.sqlite"
-strategy_tag: "advanced-buy"
+strategy_tag: "scalping-buy"
 capital_base: 100000
 # Secrets (Upstox tokens/API keys) must be set via environment variables, not committed here.
 allowed_ips: [] # Optional static IP allowlist; can also be set via ALLOWED_IPS env var (comma-separated)
@@ -9,7 +9,7 @@ data:
   index_symbol: "NIFTY"
   lot_step: 75
   tick_size: 0.05
-  price_band_low: 10
+  price_band_low: 3.0
   price_band_high: 99999.0
   expiry_ttl_minutes: 5
   weekly_expiry_weekday: 1 # 0=Monday … 6=Sunday; 1 == Tuesday for NIFTY weekly expiry
@@ -37,7 +37,7 @@ strategy:
   imi_period: 14
   pcr_extreme_high: 5.0
   pcr_extreme_low: 0.3
-  iv_percentile_threshold: 0.0
+  iv_percentile_threshold: 0.3
   iv_exit_percentile: 0.9
   oi_volume_min_threshold: 50
   event_file_path: "config/events.yml"
@@ -135,9 +135,9 @@ replay:
   default_speed: 1.0
 
 smoke_test:
-  enabled: false # turn on for the day
+  enabled: true # turn on for the day
   underlying: "NIFTY" # or "BANKNIFTY" later
   side: "CE" # start with CALL, you can test PE on another day
   hold_seconds: 60 # start with 60s, you can bump to 120 later
   lots: 1
-  max_notional_rupees: 7000
+  max_notional_rupees: 35000
