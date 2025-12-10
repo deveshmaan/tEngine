@@ -95,6 +95,11 @@ class EngineApp:
             )
         except Exception:
             pass
+        # Ensure critical capital/risk gauges are populated even if an earlier metrics call failed.
+        try:
+            set_capital_config(config.capital_base, config.risk.risk_percent_per_trade)
+        except Exception:
+            self.logger.log_event(30, "metrics_capital_config_failed")
         self.risk = RiskManager(config.risk, self.store, capital_base=config.capital_base)
         self.subscription_expiries: dict[str, str] = {}
         self.broker = UpstoxBroker(

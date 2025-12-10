@@ -1,7 +1,7 @@
 run_id: "dev-run"
 persistence_path: "engine_state.sqlite"
-strategy_tag: "scalping-buy"
-capital_base: 100000
+strategy_tag: "advanced-buy"
+capital_base: 43000
 # Secrets (Upstox tokens/API keys) must be set via environment variables, not committed here.
 allowed_ips: [] # Optional static IP allowlist; can also be set via ALLOWED_IPS env var (comma-separated)
 
@@ -59,11 +59,11 @@ risk:
   daily_pnl_stop: -5000 # max you are willing to lose in a day
   per_symbol_loss_stop: -1000
   max_open_lots: 1
-  notional_premium_cap: 35000
+  notional_premium_cap: 40000
   no_new_entries_after: "15:20:00"
   square_off_by: "15:25:00"
   max_order_rate: 5
-  risk_percent_per_trade: 1.0
+  risk_percent_per_trade: 0.12 # 12% of capital per trade; ~1 lot at current NIFTY option premiums
   scalping_risk_pct: 0.5
   scalping_trades_per_hour: 30
   max_slippage_pct_per_trade: 0.0 # 0 disables slippage halt
@@ -106,18 +106,18 @@ oms:
     depth_threshold: 10
 
 exit:
-  stop_pct: 0.0
-  target1_pct: 0.0
-  partial_fraction: 0.5
-  trail_lock_pct: 0.4
-  trail_giveback_pct: 0.5
+  stop_pct: 0.2            # 20% hard stop from entry
+  target1_pct: 0.25        # take partial profit at +25% from entry
+  partial_fraction: 0.5    # sell 50% at target1
+  trail_lock_pct: 0.4      # lock 40% of gains when trailing engages
+  trail_giveback_pct: 0.5  # give back up to 50% of locked gains before exit
   min_trail_ticks: 3
   max_holding_minutes: 20
-  trailing_stop_pct: 0.0
+  trailing_stop_pct: 0.1    # 10% trailing stop on remaining position after partial
   time_stop_minutes: 30
   partial_target_multiplier: 0.0
-  trailing_pct: 0.2
-  trailing_step: 0.1
+  trailing_pct: 0.2        # start trailing after +20% move
+  trailing_step: 0.1       # trail in 10% increments of gains
   time_buffer_minutes: 20
   partial_tp_mult: 2.0
   at_pct: 1.0
@@ -135,7 +135,7 @@ replay:
   default_speed: 1.0
 
 smoke_test:
-  enabled: true # turn on for the day
+  enabled: false # turn on for the day
   underlying: "NIFTY" # or "BANKNIFTY" later
   side: "CE" # start with CALL, you can test PE on another day
   hold_seconds: 60 # start with 60s, you can bump to 120 later
