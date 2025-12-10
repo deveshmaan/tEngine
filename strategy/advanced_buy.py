@@ -216,6 +216,15 @@ class AdvancedBuyStrategy(BaseStrategy):
         if qty <= 0:
             return
 
+        # Clamp position size to respect max_open_lots to avoid RiskManager rejections.
+        max_lots = getattr(self.cfg.risk, "max_open_lots", None)
+        if max_lots is not None and max_lots > 0:
+            max_qty = int(max_lots) * lot_size
+            if qty > max_qty:
+                qty = max_qty
+                if qty <= 0:
+                    return
+
         if not self._gamma_ok(entry, expiry, ts):
             return
 
