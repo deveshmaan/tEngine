@@ -203,7 +203,7 @@ class ScalpingBuyStrategy(BaseStrategy):
                 continue
             score = oi + vol
             if best is None or score > best["score"]:
-                best = {"strike": strike, "row": row, "spread_pct": spread_pct}
+                best = {"strike": strike, "row": row, "spread_pct": spread_pct, "score": score}
         if not best:
             return
         strike = best["strike"]
@@ -251,6 +251,12 @@ class ScalpingBuyStrategy(BaseStrategy):
             lots = math.floor((self.cfg.capital_base * pct) / (premium * lot_size))
             lots = max(lots, 0)
             qty = lots * lot_size
+
+            max_lots = getattr(self.cfg.risk, "max_open_lots", None)
+            if max_lots is not None and max_lots > 0:
+                max_qty = int(max_lots) * lot_size
+                qty = min(qty, max_qty)
+
             return qty
         except Exception:
             return 0

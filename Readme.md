@@ -15,6 +15,12 @@ Start the engine/notebook and point your monitoring stack to `http://<engine-hos
 streamlit run streamlit_app.py
 ```
 
+If `streamlit` is not on your `PATH`, run:
+
+```bash
+python -m streamlit run streamlit_app.py
+```
+
 Set `PROM_URL` if the Prometheus endpoint is not running on `127.0.0.1:9103`.
 
 ### Grafana

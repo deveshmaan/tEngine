@@ -17,7 +17,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from engine import data as engine_data
 from engine.config import CONFIG, read_config
 from market.instrument_cache import InstrumentCache
-from brokerage.upstox_client import UpstoxSession
+from brokerage.upstox_client import CredentialError, UpstoxSession
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 DEFAULT_DB = Path(os.getenv("ENGINE_DB_PATH", "engine_state.sqlite"))
@@ -115,6 +115,110 @@ def resolve_next_weekly_expiry(now: Optional[dt.datetime] = None) -> str:
     while expiry.weekday() >= 5 or expiry in holidays:
         expiry -= dt.timedelta(days=1)
     return expiry.isoformat()
+
+def _render_backtesting_ui() -> None:
+    from datetime import date, timedelta
+
+    from engine.backtesting import BacktestingEngine
+    from strategy_registry import list_strategies
+
+    st.sidebar.header("Backtesting")
+    strategies = list_strategies()
+    if not strategies:
+        st.error("No strategies discovered.")
+        return
+    selected_strategy = st.sidebar.selectbox("Strategy", strategies)
+
+    today = date.today()
+    default_end = today - timedelta(days=1)
+    default_start = default_end - timedelta(days=7)
+    date_range = st.sidebar.date_input("Date Range", value=(default_start, default_end))
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date = date_range
+        end_date = date_range
+
+    interval = st.sidebar.selectbox("Interval", ["1minute", "5minute", "15minute", "30minute", "1day"], index=1)
+
+    run_clicked = st.sidebar.button("Start Backtest")
+    stop_clicked = st.sidebar.button("Stop Backtest")
+    if stop_clicked:
+        st.session_state["stop_backtest"] = True
+
+    if run_clicked:
+        if start_date > end_date:
+            st.error("End date must be on/after start date.")
+        else:
+            st.session_state.pop("backtest_results", None)
+            st.session_state["stop_backtest"] = False
+            engine = BacktestingEngine()
+            try:
+                progress_slot = st.empty()
+                progress = progress_slot.progress(0, text="Preparing backtest…")
+
+                def _on_progress(done: int, total: int) -> None:
+                    if total <= 0:
+                        return
+                    pct = int((done / total) * 100)
+                    progress.progress(min(max(pct, 0), 100), text=f"Processed {done}/{total} candles")
+
+                with st.spinner(f"Running {selected_strategy} from {start_date} to {end_date}..."):
+                    results = engine.run_backtest(
+                        selected_strategy,
+                        start_date,
+                        end_date,
+                        interval=interval,
+                        progress_callback=_on_progress,
+                    )
+                progress_slot.empty()
+                st.session_state["backtest_results"] = results
+            except CredentialError as exc:
+                try:
+                    progress_slot.empty()
+                except Exception:
+                    pass
+                st.error(f"{exc}\n\nSet `UPSTOX_ACCESS_TOKEN` in `.env` (or your shell env), then rerun the backtest.")
+            except Exception as exc:
+                try:
+                    progress_slot.empty()
+                except Exception:
+                    pass
+                st.error(f"Backtest failed: {exc}")
+            finally:
+                engine.close()
+
+    results = st.session_state.get("backtest_results")
+    if not results:
+        st.info("Select a strategy and date range, then click Start Backtest.")
+        return
+
+    st.subheader("Backtest Results")
+    st.caption(
+        f"Strategy: `{results.get('strategy')}` • Period: `{results.get('period')}` • Interval: `{results.get('interval')}` • "
+        f"Candles: `{int(results.get('candles') or 0)}` • Run: `{results.get('run_id')}`"
+    )
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Net P&L", f"{float(results.get('net_pnl') or 0.0):.2f}")
+    col2.metric("Trades", int(results.get("trades") or 0))
+    col3.metric("Win Rate", f"{float(results.get('win_rate') or 0.0) * 100.0:.1f}%")
+
+    errors = results.get("errors") or []
+    if errors:
+        st.warning(f"Notes: {errors[:5]}{' ...' if len(errors) > 5 else ''}")
+
+    curve = results.get("equity_curve") or []
+    if curve:
+        df = pd.DataFrame(curve)
+        if not df.empty and "ts" in df and "net" in df:
+            df["ts"] = pd.to_datetime(df["ts"])
+            df = df.sort_values("ts").set_index("ts")
+            st.line_chart(df["net"])
+
+    trades = results.get("trade_log") or []
+    if trades:
+        with st.expander("Trade Log", expanded=False):
+            st.dataframe(pd.DataFrame(trades), use_container_width=True)
 
 
 
@@ -575,6 +679,11 @@ def get_live_rows(symbol: str, engine_expiry: str):
 
 st.set_page_config(page_title="Trading Engine Console", layout="wide")
 st.title("Trading Engine Console")
+
+mode = st.sidebar.radio("Mode", ["Live Trading", "Backtesting"], index=0)
+if mode == "Backtesting":
+    _render_backtesting_ui()
+    st.stop()
 
 db_path = Path(st.sidebar.text_input("State DB", value=str(DEFAULT_DB)))
 run_id = st.sidebar.text_input("Run ID", value="dev-run")

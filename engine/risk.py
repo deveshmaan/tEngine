@@ -55,12 +55,17 @@ def compute_position_size(
         return 0
     if capital <= 0 or pct <= 0 or premium_val <= 0 or lot <= 0:
         return 0
-    risk_fraction = pct / 100.0
-    budget = capital * risk_fraction
-    per_lot_cost = premium_val * lot
-    if budget <= 0 or per_lot_cost <= 0:
+    # Historical configs and strategies may provide risk as either:
+    # - fraction (0.12 == 12%), or
+    # - percentage (12 == 12%).
+    risk_fraction = pct if pct <= 1.0 else (pct / 100.0)
+    risk_amount = capital * risk_fraction
+    # Approximate max loss per lot using a stop-loss percentage.
+    stop_pct = max(stop_pct, 0.0)
+    per_lot_risk = premium_val * lot * (stop_pct if stop_pct > 0 else 1.0)
+    if risk_amount <= 0 or per_lot_risk <= 0:
         return 0
-    lots = int(budget // per_lot_cost)
+    lots = int(risk_amount // per_lot_risk)
     if max_open_lots is not None:
         try:
             remaining = max(float(max_open_lots) - float(open_lots), 0.0)
