@@ -364,7 +364,15 @@ class OMS:
             except Exception:  # pragma: no cover - best effort
                 continue
 
-    async def record_fill(self, client_order_id: str, *, qty: int, price: float, broker_order_id: Optional[str] = None) -> None:
+    async def record_fill(
+        self,
+        client_order_id: str,
+        *,
+        qty: int,
+        price: float,
+        raw_price: Optional[float] = None,
+        broker_order_id: Optional[str] = None,
+    ) -> None:
         async with self._lock:
             order = self._orders[client_order_id]
         order.filled_qty += qty
@@ -380,12 +388,17 @@ class OMS:
                 observe_ack_to_fill_ms(max(0.0, now_ms - (order.ack_ts * 1000.0)))
         except Exception:
             pass
+        ts_micros = int(order.updated_at.timestamp() * 1_000_000)
+        exec_id = f"{order.client_order_id}:{ts_micros}:{order.filled_qty}"
         self._store.record_execution(
             order.client_order_id,
+            exec_id=exec_id,
             symbol=order.symbol,
             side=order.side,
             qty=qty,
             price=price,
+            raw_price=raw_price,
+            effective_price=price,
             venue=getattr(self._broker, "venue", "SIM"),
             idempotency_key=order.idempotency_key,
             ts=order.updated_at,
@@ -395,12 +408,14 @@ class OMS:
                 "orders/fill",
                 {
                     "order_id": order.client_order_id,
+                    "exec_id": exec_id,
                     "symbol": order.symbol,
                     "side": order.side,
                     "qty": qty,
                     "price": price,
+                    "raw_price": raw_price,
+                    "effective_price": price,
                     "ts": order.updated_at.isoformat(),
-                    "exec_id": order.client_order_id,
                 },
             )
         if self._metrics:

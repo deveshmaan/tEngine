@@ -17,7 +17,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from engine import data as engine_data
 from engine.config import CONFIG, read_config
 from market.instrument_cache import InstrumentCache
-from brokerage.upstox_client import CredentialError, UpstoxSession
+from brokerage.upstox_client import INDEX_INSTRUMENT_KEYS, CredentialError, UpstoxSession
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 DEFAULT_DB = Path(os.getenv("ENGINE_DB_PATH", "engine_state.sqlite"))
@@ -116,109 +116,850 @@ def resolve_next_weekly_expiry(now: Optional[dt.datetime] = None) -> str:
         expiry -= dt.timedelta(days=1)
     return expiry.isoformat()
 
+
+def _render_backtest_results(results: Dict[str, Any]) -> None:
+    tabs = st.tabs(["Summary", "Equity", "Trades", "Orders", "Diagnostics"])
+
+    exec_meta = results.get("execution") or {}
+    cost_meta = results.get("costs") or {}
+    diagnostics = results.get("diagnostics") or {}
+    errors = results.get("errors") or []
+
+    with tabs[0]:
+        st.subheader("Backtest Summary")
+        st.caption(
+            f"Strategy: `{results.get('strategy')}` • Period: `{results.get('period')}` • Interval: `{results.get('interval')}` • "
+            f"Underlying: `{results.get('underlying')}` • "
+            f"Fill: `{exec_meta.get('fill_model', 'n/a')}` • Latency: `{int(exec_meta.get('latency_ms') or 0)}ms` • "
+            f"Partials: `{bool(exec_meta.get('allow_partial_fills'))}` • "
+            f"Spread: `{float(cost_meta.get('spread_bps') or 0.0):g}bps` • "
+            f"Slippage: `{cost_meta.get('slippage_model', 'none')}` • "
+            f"Candles: `{int(results.get('candles') or 0)}` • Run: `{results.get('run_id')}`"
+        )
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric(
+            "Gross P&L",
+            f"{float(results.get('gross_pnl') or (float(results.get('realized_pnl') or 0.0) + float(results.get('unrealized_pnl') or 0.0))):.2f}",
+        )
+        col2.metric("Fees", f"{float(results.get('total_fees') or results.get('fees') or 0.0):.2f}")
+        col3.metric("Net P&L", f"{float(results.get('net_pnl') or 0.0):.2f}")
+        col4.metric("Trades", int(results.get("trades") or 0))
+        col5.metric("Win Rate", f"{float(results.get('win_rate') or 0.0) * 100.0:.1f}%")
+
+        if errors:
+            st.warning(f"Notes: {errors[:5]}{' ...' if len(errors) > 5 else ''}")
+
+        with st.expander("Export", expanded=False):
+            try:
+                st.download_button(
+                    "Download summary.json",
+                    json.dumps(dict(results), indent=2, default=str).encode("utf-8"),
+                    file_name=f"summary_{results.get('run_id')}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
+            try:
+                df_eq = pd.DataFrame(results.get("equity_curve") or [])
+                if not df_eq.empty:
+                    st.download_button(
+                        "Download equity.csv",
+                        df_eq.to_csv(index=False).encode("utf-8"),
+                        file_name=f"equity_{results.get('run_id')}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+            try:
+                df_trades = pd.DataFrame(results.get("trade_log") or [])
+                if not df_trades.empty:
+                    st.download_button(
+                        "Download trades.csv",
+                        df_trades.to_csv(index=False).encode("utf-8"),
+                        file_name=f"trades_{results.get('run_id')}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+            try:
+                df_orders = pd.DataFrame(results.get("orders") or [])
+                if not df_orders.empty:
+                    st.download_button(
+                        "Download orders.csv",
+                        df_orders.to_csv(index=False).encode("utf-8"),
+                        file_name=f"orders_{results.get('run_id')}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+
+    with tabs[1]:
+        curve = results.get("equity_curve") or []
+        if not curve:
+            st.info("No equity curve snapshots recorded.")
+        else:
+            df = pd.DataFrame(curve)
+            if df.empty or "ts" not in df or "net" not in df:
+                st.info("Equity curve unavailable.")
+            else:
+                df["ts"] = pd.to_datetime(df["ts"])
+                df = df.sort_values("ts").set_index("ts")
+                df["peak"] = df["net"].cummax()
+                df["drawdown"] = df["net"] - df["peak"]
+                st.line_chart(df[["net"]])
+                st.line_chart(df[["drawdown"]])
+
+    with tabs[2]:
+        trades = results.get("trade_log") or []
+        if not trades:
+            st.info("No trades recorded.")
+        else:
+            df_trades = pd.DataFrame(trades)
+            symbols = sorted(set(str(s) for s in df_trades.get("symbol", []).dropna().tolist()))
+            selected = st.multiselect("Symbols", options=symbols, default=symbols)
+            if selected:
+                df_trades = df_trades[df_trades["symbol"].isin(selected)]
+            st.dataframe(df_trades, use_container_width=True)
+
+    with tabs[3]:
+        orders = results.get("orders") or []
+        if orders:
+            st.dataframe(pd.DataFrame(orders), use_container_width=True)
+        else:
+            st.info("No orders recorded.")
+
+        executions = results.get("executions") or []
+        if executions:
+            with st.expander("Executions (fills)", expanded=False):
+                st.dataframe(pd.DataFrame(executions), use_container_width=True)
+
+    with tabs[4]:
+        diag_rows = []
+        for key in (
+            "history_cache_path",
+            "first_candle_ts",
+            "last_candle_ts",
+            "cache_ensure_calls",
+            "cache_missing_segments",
+            "cache_fetched_rows",
+            "series_loaded",
+        ):
+            if key in diagnostics:
+                diag_rows.append({"key": key, "value": diagnostics.get(key)})
+        if diag_rows:
+            st.subheader("Diagnostics")
+            st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+
+        data_warnings = results.get("data_warnings") or []
+        if data_warnings:
+            st.warning("Data quality warnings")
+            st.code("\n".join(str(w) for w in data_warnings[:200]))
+        else:
+            st.success("No data-quality warnings.")
+
+        if errors:
+            st.warning("Engine/strategy notes")
+            st.code("\n".join(str(e) for e in errors[:200]))
+
+
 def _render_backtesting_ui() -> None:
+    import queue
+    import threading
+    import uuid
     from datetime import date, timedelta
 
     from engine.backtesting import BacktestingEngine
-    from strategy_registry import list_strategies
-
-    st.sidebar.header("Backtesting")
-    strategies = list_strategies()
-    if not strategies:
-        st.error("No strategies discovered.")
-        return
-    selected_strategy = st.sidebar.selectbox("Strategy", strategies)
-
-    today = date.today()
-    default_end = today - timedelta(days=1)
-    default_start = default_end - timedelta(days=7)
-    date_range = st.sidebar.date_input("Date Range", value=(default_start, default_end))
-    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        start_date, end_date = date_range
-    else:
-        start_date = date_range
-        end_date = date_range
-
-    interval = st.sidebar.selectbox("Interval", ["1minute", "5minute", "15minute", "30minute", "1day"], index=1)
-
-    run_clicked = st.sidebar.button("Start Backtest")
-    stop_clicked = st.sidebar.button("Stop Backtest")
-    if stop_clicked:
-        st.session_state["stop_backtest"] = True
-
-    if run_clicked:
-        if start_date > end_date:
-            st.error("End date must be on/after start date.")
-        else:
-            st.session_state.pop("backtest_results", None)
-            st.session_state["stop_backtest"] = False
-            engine = BacktestingEngine()
-            try:
-                progress_slot = st.empty()
-                progress = progress_slot.progress(0, text="Preparing backtest…")
-
-                def _on_progress(done: int, total: int) -> None:
-                    if total <= 0:
-                        return
-                    pct = int((done / total) * 100)
-                    progress.progress(min(max(pct, 0), 100), text=f"Processed {done}/{total} candles")
-
-                with st.spinner(f"Running {selected_strategy} from {start_date} to {end_date}..."):
-                    results = engine.run_backtest(
-                        selected_strategy,
-                        start_date,
-                        end_date,
-                        interval=interval,
-                        progress_callback=_on_progress,
-                    )
-                progress_slot.empty()
-                st.session_state["backtest_results"] = results
-            except CredentialError as exc:
-                try:
-                    progress_slot.empty()
-                except Exception:
-                    pass
-                st.error(f"{exc}\n\nSet `UPSTOX_ACCESS_TOKEN` in `.env` (or your shell env), then rerun the backtest.")
-            except Exception as exc:
-                try:
-                    progress_slot.empty()
-                except Exception:
-                    pass
-                st.error(f"Backtest failed: {exc}")
-            finally:
-                engine.close()
-
-    results = st.session_state.get("backtest_results")
-    if not results:
-        st.info("Select a strategy and date range, then click Start Backtest.")
-        return
-
-    st.subheader("Backtest Results")
-    st.caption(
-        f"Strategy: `{results.get('strategy')}` • Period: `{results.get('period')}` • Interval: `{results.get('interval')}` • "
-        f"Candles: `{int(results.get('candles') or 0)}` • Run: `{results.get('run_id')}`"
+    from engine.backtest.execution_config import ExecutionConfig
+    from engine.backtest.strategy_spec import (
+        ALLOWED_CANDLE_INTERVALS,
+        ALLOWED_EXPIRY_MODES,
+        ALLOWED_OPT_TYPES,
+        ALLOWED_SIDES,
+        ALLOWED_STRIKE_MODES,
+        LegSpec,
+        StrategySpec,
     )
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Net P&L", f"{float(results.get('net_pnl') or 0.0):.2f}")
-    col2.metric("Trades", int(results.get("trades") or 0))
-    col3.metric("Win Rate", f"{float(results.get('win_rate') or 0.0) * 100.0:.1f}%")
 
-    errors = results.get("errors") or []
-    if errors:
-        st.warning(f"Notes: {errors[:5]}{' ...' if len(errors) > 5 else ''}")
+    store_path = str(DEFAULT_DB)
+    st.subheader("Backtesting")
 
-    curve = results.get("equity_curve") or []
-    if curve:
-        df = pd.DataFrame(curve)
-        if not df.empty and "ts" in df and "net" in df:
-            df["ts"] = pd.to_datetime(df["ts"])
-            df = df.sort_values("ts").set_index("ts")
-            st.line_chart(df["net"])
+    # -------------------------------------------------------------- run history
+    runs = []
+    try:
+        from persistence.backtest_store import BacktestStore
 
-    trades = results.get("trade_log") or []
-    if trades:
-        with st.expander("Trade Log", expanded=False):
-            st.dataframe(pd.DataFrame(trades), use_container_width=True)
+        with BacktestStore(store_path) as bt_store:
+            runs = bt_store.list_runs(limit=250)
+    except Exception:
+        runs = []
+
+    run_by_id = {r.run_id: r for r in runs}
+    run_ids = list(run_by_id.keys())
+
+    def _fmt_run(rid: str) -> str:
+        r = run_by_id.get(rid)
+        if r is None:
+            return str(rid)
+        try:
+            ts_dt = dt.datetime.fromtimestamp(int(r.created_ts), tz=dt.timezone.utc).astimezone(IST)
+            ts_str = ts_dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ts_str = str(r.created_ts)
+        parts = [ts_str]
+        if r.strategy:
+            parts.append(str(r.strategy))
+        parts.append(str(r.run_id))
+        return " • ".join(parts)
+
+    mode = st.radio("Mode", ["New run", "Load past run", "Compare runs"], horizontal=True, key="bt_mode")
+
+    if mode == "Load past run":
+        if not run_ids:
+            st.info("No saved runs yet.")
+            return
+        selected_run = st.selectbox("Run", run_ids, format_func=_fmt_run, key="bt_load_run_id")
+        if st.button("Load Run", use_container_width=True):
+            try:
+                from persistence.backtest_store import BacktestStore
+
+                with BacktestStore(store_path) as bt_store:
+                    st.session_state["backtest_results"] = bt_store.load_run(str(selected_run))
+            except Exception as exc:
+                st.error(f"Failed loading run: {exc}")
+        results = st.session_state.get("backtest_results")
+        if results:
+            _render_backtest_results(results)
+        return
+
+    if mode == "Compare runs":
+        if len(run_ids) < 2:
+            st.info("Need at least 2 saved runs to compare.")
+            return
+        run_a = st.selectbox("Run A", run_ids, format_func=_fmt_run, key="bt_cmp_run_a")
+        default_b_idx = 1 if len(run_ids) > 1 else 0
+        run_b = st.selectbox("Run B", run_ids, format_func=_fmt_run, index=default_b_idx, key="bt_cmp_run_b")
+        try:
+            from persistence.backtest_store import BacktestStore
+
+            with BacktestStore(store_path) as bt_store:
+                a = bt_store.load_run(str(run_a))
+                b = bt_store.load_run(str(run_b))
+        except Exception as exc:
+            st.error(f"Failed loading runs: {exc}")
+            return
+
+        st.subheader("Run Comparison")
+        df_a = pd.DataFrame(a.get("equity_curve") or [])
+        df_b = pd.DataFrame(b.get("equity_curve") or [])
+        try:
+            if not df_a.empty:
+                df_a["ts"] = pd.to_datetime(df_a["ts"])
+                df_a = df_a.sort_values("ts").set_index("ts")[["net"]].rename(columns={"net": str(run_a)})
+            if not df_b.empty:
+                df_b["ts"] = pd.to_datetime(df_b["ts"])
+                df_b = df_b.sort_values("ts").set_index("ts")[["net"]].rename(columns={"net": str(run_b)})
+            if not df_a.empty or not df_b.empty:
+                st.line_chart(df_a.join(df_b, how="outer"))
+        except Exception:
+            pass
+
+        rows = []
+        for key in ("period", "interval", "gross_pnl", "total_fees", "net_pnl", "trades", "win_rate"):
+            rows.append({"metric": key, "run_a": a.get(key), "run_b": b.get(key)})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Run A summary.json",
+                json.dumps(dict(a), indent=2, default=str).encode("utf-8"),
+                file_name=f"summary_{run_a}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            try:
+                eq = pd.DataFrame(a.get("equity_curve") or [])
+                if not eq.empty:
+                    st.download_button(
+                        "Run A equity.csv",
+                        eq.to_csv(index=False).encode("utf-8"),
+                        file_name=f"equity_{run_a}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+            try:
+                trades = pd.DataFrame(a.get("trade_log") or [])
+                if not trades.empty:
+                    st.download_button(
+                        "Run A trades.csv",
+                        trades.to_csv(index=False).encode("utf-8"),
+                        file_name=f"trades_{run_a}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+            try:
+                orders = pd.DataFrame(a.get("orders") or [])
+                if not orders.empty:
+                    st.download_button(
+                        "Run A orders.csv",
+                        orders.to_csv(index=False).encode("utf-8"),
+                        file_name=f"orders_{run_a}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+        with col2:
+            st.download_button(
+                "Run B summary.json",
+                json.dumps(dict(b), indent=2, default=str).encode("utf-8"),
+                file_name=f"summary_{run_b}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            try:
+                eq = pd.DataFrame(b.get("equity_curve") or [])
+                if not eq.empty:
+                    st.download_button(
+                        "Run B equity.csv",
+                        eq.to_csv(index=False).encode("utf-8"),
+                        file_name=f"equity_{run_b}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+            try:
+                trades = pd.DataFrame(b.get("trade_log") or [])
+                if not trades.empty:
+                    st.download_button(
+                        "Run B trades.csv",
+                        trades.to_csv(index=False).encode("utf-8"),
+                        file_name=f"trades_{run_b}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+            try:
+                orders = pd.DataFrame(b.get("orders") or [])
+                if not orders.empty:
+                    st.download_button(
+                        "Run B orders.csv",
+                        orders.to_csv(index=False).encode("utf-8"),
+                        file_name=f"orders_{run_b}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+        return
+
+    # ---------------------------------------------------------- builder helpers
+    def _symbol_from_underlying_key(key: str) -> str:
+        for sym, ik in INDEX_INSTRUMENT_KEYS.items():
+            if str(ik) == str(key):
+                return str(sym)
+        return _data_index_symbol()
+
+    def _leg_field_key(leg_id: str, field: str) -> str:
+        return f"bt_leg_{leg_id}_{field}"
+
+    def _clear_leg_keys(leg_id: str) -> None:
+        for field in (
+            "side",
+            "opt_type",
+            "qty_lots",
+            "expiry_mode",
+            "strike_mode",
+            "strike_offset_points",
+            "target_premium",
+            "stoploss_pct",
+            "profit_lock_trigger_pct",
+            "profit_lock_lock_to_pct",
+            "reentry_enabled",
+            "max_reentries",
+        ):
+            st.session_state.pop(_leg_field_key(leg_id, field), None)
+
+    def _add_leg(*, leg: Optional[LegSpec] = None) -> None:
+        counter = int(st.session_state.get("bt_leg_counter") or 0) + 1
+        st.session_state["bt_leg_counter"] = counter
+        leg_id = str(counter)
+        st.session_state.setdefault("bt_leg_ids", []).append(leg_id)
+        st.session_state[_leg_field_key(leg_id, "side")] = (leg.side if leg else "SELL")
+        st.session_state[_leg_field_key(leg_id, "opt_type")] = (leg.opt_type if leg else "CE")
+        st.session_state[_leg_field_key(leg_id, "qty_lots")] = int(leg.qty_lots if leg else 1)
+        st.session_state[_leg_field_key(leg_id, "expiry_mode")] = (leg.expiry_mode if leg else "WEEKLY_CURRENT")
+        st.session_state[_leg_field_key(leg_id, "strike_mode")] = (leg.strike_mode if leg else "ATM")
+        st.session_state[_leg_field_key(leg_id, "strike_offset_points")] = int(leg.strike_offset_points or 0) if leg else 0
+        st.session_state[_leg_field_key(leg_id, "target_premium")] = float(leg.target_premium or 0.0) if leg else 0.0
+        st.session_state[_leg_field_key(leg_id, "stoploss_pct")] = (
+            (f"{float(leg.stoploss_pct) * 100.0:g}" if leg.stoploss_pct is not None else "") if leg else ""
+        )
+        st.session_state[_leg_field_key(leg_id, "profit_lock_trigger_pct")] = (
+            (f"{float(leg.profit_lock.trigger_pct) * 100.0:g}" if leg.profit_lock is not None else "") if leg else ""
+        )
+        st.session_state[_leg_field_key(leg_id, "profit_lock_lock_to_pct")] = (
+            (f"{float(leg.profit_lock.lock_to_pct) * 100.0:g}" if leg.profit_lock is not None else "") if leg else ""
+        )
+        st.session_state[_leg_field_key(leg_id, "reentry_enabled")] = bool(leg.reentry_enabled) if leg else False
+        st.session_state[_leg_field_key(leg_id, "max_reentries")] = int(leg.max_reentries or 0) if leg else 0
+
+    def _reset_builder_from_spec(spec: StrategySpec) -> None:
+        for leg_id in list(st.session_state.get("bt_leg_ids") or []):
+            _clear_leg_keys(str(leg_id))
+        st.session_state["bt_leg_ids"] = []
+        st.session_state["bt_leg_counter"] = 0
+
+        st.session_state["bt_spec_name"] = spec.name
+        st.session_state["bt_underlying_symbol"] = _symbol_from_underlying_key(spec.underlying_instrument_key)
+        st.session_state["bt_start_date"] = spec.start_date
+        st.session_state["bt_end_date"] = spec.end_date
+        st.session_state["bt_interval"] = spec.candle_interval
+        st.session_state["bt_entry_time"] = spec.entry_time
+        st.session_state["bt_exit_time"] = spec.exit_time
+        st.session_state["bt_fill_model"] = spec.fill_model
+        st.session_state["bt_allow_partial_fills"] = bool(spec.allow_partial_fills)
+        st.session_state["bt_latency_ms"] = int(spec.latency_ms)
+        st.session_state["bt_slippage_model"] = spec.slippage_model
+        st.session_state["bt_slippage_bps"] = float(spec.slippage_bps)
+        st.session_state["bt_slippage_ticks"] = int(spec.slippage_ticks)
+        st.session_state["bt_spread_bps"] = float(spec.spread_bps)
+        st.session_state["bt_starting_capital"] = float(spec.starting_capital)
+        st.session_state["bt_brokerage_profile"] = str(spec.brokerage_profile)
+
+        for leg in spec.legs:
+            _add_leg(leg=leg)
+
+    def _ensure_builder_defaults() -> None:
+        if st.session_state.get("bt_builder_initialized"):
+            return
+        today = date.today()
+        default_end = today - timedelta(days=1)
+        default_start = default_end - timedelta(days=7)
+        underlying_symbol = _data_index_symbol()
+        underlying_key = INDEX_INSTRUMENT_KEYS.get(underlying_symbol, underlying_symbol)
+        try:
+            from engine.backtest import templates as bt_templates
+
+            spec = bt_templates.ShortStraddle(
+                underlying_instrument_key=underlying_key,
+                start_date=default_start,
+                end_date=default_end,
+                candle_interval="5minute",
+                qty_lots=1,
+            )
+        except Exception:
+            spec = StrategySpec(
+                name="StrategySpec",
+                underlying_instrument_key=underlying_key,
+                start_date=default_start,
+                end_date=default_end,
+                candle_interval="5minute",
+                entry_time=dt.time(9, 30),
+                exit_time=dt.time(15, 20),
+                fill_model="next_tick",
+                allow_partial_fills=False,
+                latency_ms=0,
+                slippage_model="none",
+                slippage_bps=0.0,
+                slippage_ticks=0,
+                spread_bps=0.0,
+                brokerage_profile="india_options_default",
+                starting_capital=100000.0,
+                legs=(),
+            )
+        _reset_builder_from_spec(spec)
+        st.session_state["bt_builder_initialized"] = True
+
+    def _build_spec_from_state() -> StrategySpec:
+        underlying_symbol = str(st.session_state.get("bt_underlying_symbol") or _data_index_symbol()).upper()
+        underlying_key = INDEX_INSTRUMENT_KEYS.get(underlying_symbol, underlying_symbol)
+        start_date = st.session_state.get("bt_start_date")
+        end_date = st.session_state.get("bt_end_date")
+        interval = str(st.session_state.get("bt_interval") or "5minute")
+        entry_time = st.session_state.get("bt_entry_time") or dt.time(9, 30)
+        exit_time = st.session_state.get("bt_exit_time") or dt.time(15, 20)
+        entry_time = entry_time.replace(second=0, microsecond=0)
+        exit_time = exit_time.replace(second=0, microsecond=0)
+
+        def _opt_float(raw: object) -> Optional[float]:
+            text = str(raw).strip()
+            if not text:
+                return None
+            return float(text)
+
+        legs: list[LegSpec] = []
+        for leg_id in list(st.session_state.get("bt_leg_ids") or []):
+            strike_mode = str(st.session_state.get(_leg_field_key(leg_id, "strike_mode")) or "ATM").upper()
+            strike_offset_points = None
+            target_premium = None
+            if strike_mode == "ATM_OFFSET":
+                strike_offset_points = int(st.session_state.get(_leg_field_key(leg_id, "strike_offset_points")) or 0)
+            elif strike_mode == "TARGET_PREMIUM":
+                target_premium = float(st.session_state.get(_leg_field_key(leg_id, "target_premium")) or 0.0)
+
+            stoploss_pct = _opt_float(st.session_state.get(_leg_field_key(leg_id, "stoploss_pct")))
+            pl_trigger = _opt_float(st.session_state.get(_leg_field_key(leg_id, "profit_lock_trigger_pct")))
+            pl_lock_to = _opt_float(st.session_state.get(_leg_field_key(leg_id, "profit_lock_lock_to_pct")))
+            profit_lock = None
+            if pl_trigger is not None and pl_lock_to is not None:
+                profit_lock = {"trigger_pct": pl_trigger, "lock_to_pct": pl_lock_to}
+            reentry_enabled = bool(st.session_state.get(_leg_field_key(leg_id, "reentry_enabled")) or False)
+            max_reentries = int(st.session_state.get(_leg_field_key(leg_id, "max_reentries")) or 0)
+
+            legs.append(
+                LegSpec(
+                    side=st.session_state.get(_leg_field_key(leg_id, "side")),
+                    opt_type=st.session_state.get(_leg_field_key(leg_id, "opt_type")),
+                    qty_lots=st.session_state.get(_leg_field_key(leg_id, "qty_lots")),
+                    expiry_mode=st.session_state.get(_leg_field_key(leg_id, "expiry_mode")),
+                    strike_mode=strike_mode,
+                    strike_offset_points=strike_offset_points,
+                    target_premium=target_premium,
+                    stoploss_pct=stoploss_pct,
+                    profit_lock=profit_lock,
+                    reentry_enabled=reentry_enabled,
+                    max_reentries=max_reentries,
+                )
+            )
+
+        return StrategySpec(
+            name=st.session_state.get("bt_spec_name") or "StrategySpec",
+            underlying_instrument_key=underlying_key,
+            start_date=start_date,
+            end_date=end_date,
+            candle_interval=interval,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            fill_model=st.session_state.get("bt_fill_model") or "next_tick",
+            allow_partial_fills=bool(st.session_state.get("bt_allow_partial_fills") or False),
+            latency_ms=int(st.session_state.get("bt_latency_ms") or 0),
+            slippage_model=st.session_state.get("bt_slippage_model") or "none",
+            slippage_bps=float(st.session_state.get("bt_slippage_bps") or 0.0),
+            slippage_ticks=int(st.session_state.get("bt_slippage_ticks") or 0),
+            spread_bps=float(st.session_state.get("bt_spread_bps") or 0.0),
+            brokerage_profile=str(st.session_state.get("bt_brokerage_profile") or "india_options_default"),
+            starting_capital=float(st.session_state.get("bt_starting_capital") or 100000.0),
+            legs=tuple(legs),
+        )
+
+    _ensure_builder_defaults()
+
+    # -------------------------------------------------------------- worker poll
+    worker = st.session_state.get("bt_worker")
+    if isinstance(worker, dict):
+        prog_q = worker.get("progress_q")
+        if prog_q is not None:
+            try:
+                while True:
+                    done, total = prog_q.get_nowait()
+                    st.session_state["bt_progress_done"] = int(done)
+                    st.session_state["bt_progress_total"] = int(total)
+            except queue.Empty:
+                pass
+        result_q = worker.get("result_q")
+        if result_q is not None:
+            try:
+                kind, payload = result_q.get_nowait()
+            except queue.Empty:
+                kind, payload = None, None
+            if kind == "done":
+                st.session_state["backtest_results"] = payload
+                st.session_state.pop("bt_worker", None)
+            elif kind == "error":
+                st.session_state["bt_run_error"] = str(payload)
+                st.session_state.pop("bt_worker", None)
+
+    # -------------------------------------------------------------- two columns
+    left, right = st.columns([1.05, 1.55], gap="large")
+
+    spec_obj: Optional[StrategySpec] = None
+    spec_error: Optional[str] = None
+    try:
+        spec_obj = _build_spec_from_state()
+    except Exception as exc:
+        spec_error = str(exc)
+        spec_obj = None
+
+    with left:
+        st.subheader("Strategy Builder")
+
+        underlying_options = sorted(INDEX_INSTRUMENT_KEYS.keys())
+        st.selectbox("Underlying", underlying_options, key="bt_underlying_symbol")
+        underlying_symbol = str(st.session_state.get("bt_underlying_symbol") or _data_index_symbol()).upper()
+        underlying_key = INDEX_INSTRUMENT_KEYS.get(underlying_symbol, underlying_symbol)
+        st.caption(f"Instrument key: `{underlying_key}`")
+
+        today = date.today()
+        default_end = today - timedelta(days=1)
+        default_start = default_end - timedelta(days=7)
+        date_range = st.date_input(
+            "Date range",
+            value=(st.session_state.get("bt_start_date") or default_start, st.session_state.get("bt_end_date") or default_end),
+            key="bt_date_range",
+        )
+        if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+            st.session_state["bt_start_date"], st.session_state["bt_end_date"] = date_range
+        else:
+            st.session_state["bt_start_date"] = date_range
+            st.session_state["bt_end_date"] = date_range
+        st.selectbox("Interval", sorted(ALLOWED_CANDLE_INTERVALS), key="bt_interval")
+
+        t1, t2 = st.columns(2)
+        t1.time_input("Entry time", key="bt_entry_time")
+        t2.time_input("Exit time", key="bt_exit_time")
+
+        st.text_input("Name", key="bt_spec_name")
+
+        try:
+            from engine.backtest import templates as bt_templates
+
+            template_options = bt_templates.list_templates()
+        except Exception:
+            bt_templates = None  # type: ignore[assignment]
+            template_options = []
+
+        st.subheader("Template")
+        if template_options:
+            st.selectbox("Template", ["(none)"] + template_options, key="bt_template_name")
+            if st.button("Apply Template", use_container_width=True):
+                selected = st.session_state.get("bt_template_name")
+                if selected and selected != "(none)" and bt_templates is not None:
+                    tmpl = bt_templates.build_template(
+                        str(selected),
+                        underlying_instrument_key=underlying_key,
+                        start_date=st.session_state.get("bt_start_date"),
+                        end_date=st.session_state.get("bt_end_date"),
+                        candle_interval=str(st.session_state.get("bt_interval") or "5minute"),
+                    )
+                    _reset_builder_from_spec(tmpl)
+                    st.rerun()
+        else:
+            st.info("Templates unavailable.")
+
+        st.subheader("Legs")
+        add_col, hint_col = st.columns([0.35, 0.65])
+        with add_col:
+            if st.button("Add leg", use_container_width=True):
+                _add_leg()
+                st.rerun()
+        with hint_col:
+            st.caption("Stoploss / profit-lock / re-entry: not implemented yet (disabled).")
+
+        leg_ids = list(st.session_state.get("bt_leg_ids") or [])
+        if not leg_ids:
+            st.warning("Add at least one leg.")
+        for leg_id in leg_ids:
+            row = st.columns([1.1, 0.9, 0.8, 1.3, 1.3, 1.6, 0.8])
+            row[0].selectbox("Side", sorted(ALLOWED_SIDES), key=_leg_field_key(leg_id, "side"), label_visibility="collapsed")
+            row[1].selectbox("CE/PE", sorted(ALLOWED_OPT_TYPES), key=_leg_field_key(leg_id, "opt_type"), label_visibility="collapsed")
+            row[2].number_input("Lots", min_value=1, step=1, key=_leg_field_key(leg_id, "qty_lots"), label_visibility="collapsed")
+            row[3].selectbox("Expiry", sorted(ALLOWED_EXPIRY_MODES), key=_leg_field_key(leg_id, "expiry_mode"), label_visibility="collapsed")
+            row[4].selectbox("Strike", sorted(ALLOWED_STRIKE_MODES), key=_leg_field_key(leg_id, "strike_mode"), label_visibility="collapsed")
+
+            strike_mode = str(st.session_state.get(_leg_field_key(leg_id, "strike_mode")) or "ATM").upper()
+            if strike_mode == "ATM_OFFSET":
+                row[5].number_input("Offset (pts)", step=50, key=_leg_field_key(leg_id, "strike_offset_points"), label_visibility="collapsed")
+            elif strike_mode == "TARGET_PREMIUM":
+                row[5].number_input("Target premium", min_value=0.0, step=1.0, key=_leg_field_key(leg_id, "target_premium"), label_visibility="collapsed")
+            else:
+                row[5].text_input("—", value="ATM", disabled=True, label_visibility="collapsed")
+
+            if row[6].button("Remove", key=f"bt_remove_leg_{leg_id}", use_container_width=True):
+                st.session_state["bt_leg_ids"] = [x for x in st.session_state.get("bt_leg_ids") or [] if str(x) != str(leg_id)]
+                _clear_leg_keys(str(leg_id))
+                st.rerun()
+
+            with st.expander(f"Leg {leg_id} risk (not implemented yet)", expanded=False):
+                r1, r2, r3 = st.columns(3)
+                r1.text_input("Stoploss %", key=_leg_field_key(leg_id, "stoploss_pct"), disabled=True)
+                r2.text_input("Profit lock trigger %", key=_leg_field_key(leg_id, "profit_lock_trigger_pct"), disabled=True)
+                r3.text_input("Profit lock lock-to %", key=_leg_field_key(leg_id, "profit_lock_lock_to_pct"), disabled=True)
+                rr1, rr2 = st.columns(2)
+                rr1.checkbox("Re-entry enabled", key=_leg_field_key(leg_id, "reentry_enabled"), disabled=True)
+                rr2.number_input("Max re-entries", min_value=0, step=1, key=_leg_field_key(leg_id, "max_reentries"), disabled=True)
+
+        st.subheader("Execution (Simulated)")
+        st.selectbox("Fill model", ["same_tick", "next_tick"], key="bt_fill_model")
+        st.number_input("Latency (ms)", min_value=0, max_value=600_000, value=int(st.session_state.get("bt_latency_ms") or 0), step=50, key="bt_latency_ms")
+        st.checkbox("Allow partial fills (volume-limited)", value=bool(st.session_state.get("bt_allow_partial_fills") or False), key="bt_allow_partial_fills")
+
+        st.subheader("Costs (Simulated)")
+        slippage_model = st.selectbox("Slippage model", ["none", "bps", "ticks"], key="bt_slippage_model")
+        if slippage_model == "bps":
+            st.number_input("Slippage (bps)", min_value=0.0, max_value=500.0, value=float(st.session_state.get("bt_slippage_bps") or 0.0), step=0.5, key="bt_slippage_bps")
+            st.session_state["bt_slippage_ticks"] = 0
+        elif slippage_model == "ticks":
+            st.number_input("Slippage (ticks)", min_value=0, max_value=500, value=int(st.session_state.get("bt_slippage_ticks") or 0), step=1, key="bt_slippage_ticks")
+            st.session_state["bt_slippage_bps"] = 0.0
+        else:
+            st.session_state["bt_slippage_bps"] = 0.0
+            st.session_state["bt_slippage_ticks"] = 0
+        st.number_input("Spread (bps)", min_value=0.0, max_value=500.0, value=float(st.session_state.get("bt_spread_bps") or 0.0), step=0.5, key="bt_spread_bps")
+
+        st.subheader("Capital")
+        st.number_input("Starting capital", min_value=1.0, value=float(st.session_state.get("bt_starting_capital") or 100000.0), step=1000.0, key="bt_starting_capital")
+        st.selectbox("Brokerage profile", ["india_options_default"], disabled=True, key="bt_brokerage_profile")
+
+        # -------------------------------------------------------------- start/stop
+        worker = st.session_state.get("bt_worker")
+        running = bool(isinstance(worker, dict) and worker.get("thread") and worker["thread"].is_alive())
+        if spec_error:
+            st.error(f"Spec invalid: {spec_error}")
+
+        start_disabled = running or spec_obj is None
+        start_col, stop_col = st.columns(2)
+        start_clicked = start_col.button("Start Backtest", use_container_width=True, disabled=start_disabled)
+        stop_clicked = stop_col.button("Stop Backtest", use_container_width=True, disabled=not running)
+
+        if start_clicked and spec_obj is not None:
+            st.session_state.pop("backtest_results", None)
+            st.session_state.pop("bt_run_error", None)
+            st.session_state["bt_progress_done"] = 0
+            st.session_state["bt_progress_total"] = 0
+
+            progress_q: queue.Queue = queue.Queue(maxsize=50)
+            result_q: queue.Queue = queue.Queue(maxsize=2)
+
+            exec_cfg = ExecutionConfig(
+                fill_model=str(spec_obj.fill_model),
+                latency_ms=int(spec_obj.latency_ms),
+                allow_partial_fills=bool(spec_obj.allow_partial_fills),
+            )
+            engine = BacktestingEngine(
+                store_path=store_path,
+                execution_config=exec_cfg,
+                slippage_model=str(spec_obj.slippage_model),
+                slippage_bps=float(spec_obj.slippage_bps),
+                slippage_ticks=int(spec_obj.slippage_ticks),
+                spread_bps=float(spec_obj.spread_bps),
+                starting_capital=float(spec_obj.starting_capital),
+            )
+            engine.strategy_spec = spec_obj
+            engine.strategy_spec_json = spec_obj.to_json()
+
+            def _on_progress(done: int, total: int) -> None:
+                try:
+                    progress_q.put_nowait((int(done), int(total)))
+                except Exception:
+                    return
+
+            def _run() -> None:
+                try:
+                    results = engine.run_backtest(
+                        "MultiLegSpecStrategy",
+                        spec_obj.start_date,
+                        spec_obj.end_date,
+                        interval=str(spec_obj.candle_interval),
+                        progress_callback=_on_progress,
+                        underlying_symbol=underlying_symbol,
+                    )
+                    try:
+                        from persistence.backtest_store import BacktestStore
+
+                        with BacktestStore(store_path) as bt_store:
+                            bt_store.save_run(
+                                run_id=str(results.get("run_id") or ""),
+                                results=dict(results),
+                                spec_json=spec_obj.to_json(),
+                                start_date=str(spec_obj.start_date),
+                                end_date=str(spec_obj.end_date),
+                                interval=str(spec_obj.candle_interval),
+                                underlying_key=str(results.get("underlying_key") or underlying_key),
+                                strategy="MultiLegSpecStrategy",
+                            )
+                    except Exception:
+                        pass
+                    result_q.put(("done", results))
+                except Exception as exc:
+                    result_q.put(("error", str(exc)))
+                finally:
+                    try:
+                        engine.close()
+                    except Exception:
+                        pass
+
+            thread = threading.Thread(target=_run, name=f"bt-{uuid.uuid4().hex[:6]}", daemon=True)
+            st.session_state["bt_worker"] = {
+                "thread": thread,
+                "engine": engine,
+                "progress_q": progress_q,
+                "result_q": result_q,
+            }
+            thread.start()
+            st.rerun()
+
+        if stop_clicked:
+            worker = st.session_state.get("bt_worker")
+            try:
+                if isinstance(worker, dict):
+                    eng = worker.get("engine")
+                    if eng is not None:
+                        eng.request_stop()
+            except Exception:
+                pass
+            st.info("Stop requested…")
+
+        if spec_obj is not None:
+            with st.expander("Spec JSON", expanded=False):
+                st.code(spec_obj.to_json())
+                st.download_button(
+                    "Save Spec JSON",
+                    spec_obj.to_json().encode("utf-8"),
+                    file_name=f"{spec_obj.name}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+                uploaded = st.file_uploader("Upload Spec JSON", type=["json"], key="bt_spec_upload")
+                if uploaded is not None and st.button("Load uploaded spec", use_container_width=True, key="bt_load_spec_upload"):
+                    try:
+                        loaded = StrategySpec.from_json(uploaded.getvalue().decode("utf-8"))
+                        _reset_builder_from_spec(loaded)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Invalid uploaded spec: {exc}")
+                raw = st.text_area("Paste Spec JSON", value="", height=140, key="bt_spec_paste")
+                if st.button("Load pasted spec", use_container_width=True, key="bt_load_spec_paste"):
+                    try:
+                        loaded = StrategySpec.from_json(str(raw))
+                        _reset_builder_from_spec(loaded)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Invalid spec JSON: {exc}")
+
+    with right:
+        st.subheader("Results")
+        worker = st.session_state.get("bt_worker")
+        running = bool(isinstance(worker, dict) and worker.get("thread") and worker["thread"].is_alive())
+        if running:
+            done = int(st.session_state.get("bt_progress_done") or 0)
+            total = int(st.session_state.get("bt_progress_total") or 0)
+            pct = int((done / total) * 100) if total > 0 else 0
+            st.progress(min(max(pct, 0), 100), text=f"Processed {done}/{total} candles")
+        err = st.session_state.get("bt_run_error")
+        if err:
+            st.error(f"Backtest failed: {err}")
+        results = st.session_state.get("backtest_results")
+        if results:
+            _render_backtest_results(results)
+        elif not running:
+            st.info("Build a strategy on the left, then click Start Backtest.")
+
+    # Keep the UI responsive while the background thread runs.
+    worker = st.session_state.get("bt_worker")
+    if isinstance(worker, dict) and worker.get("thread") and worker["thread"].is_alive():
+        time.sleep(0.5)
+        st.rerun()
 
 
 

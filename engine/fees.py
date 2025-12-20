@@ -35,10 +35,10 @@ class FeeConfig:
     other_fees: Dict[str, float] = field(default_factory=dict)
 
 
-def fees_for_execution(exec: ExecutionLike, cfg: FeeConfig) -> List[FeeRow]:
+def fees_for_execution(exec: ExecutionLike, cfg: FeeConfig, *, include_brokerage: bool = True) -> List[FeeRow]:
     turnover = abs(exec.qty) * exec.price
     rows: List[FeeRow] = []
-    if cfg.brokerage_per_order:
+    if include_brokerage and cfg.brokerage_per_order:
         rows.append(FeeRow("brokerage", cfg.brokerage_per_order))
     exchange_fee = turnover * cfg.exchange_txn_rate_per_turnover
     if exchange_fee:

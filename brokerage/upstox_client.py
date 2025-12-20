@@ -132,8 +132,8 @@ def load_upstox_credentials(secrets: Optional[object] = None) -> UpstoxConfig:
         - UPSTOX_API_KEY
         - UPSTOX_API_SECRET
     """
-    token = 'eyJ0eXAiOiJKV1QiLCJrZXlfWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTQxMzEyMDgwNjQ5ZTI0ZjAzNmFmY2UiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY1ODgwMDk2LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjU5MjI0MDB9.0b-xswADIX8OGzsXcqMRprGxqIXTGp0-BD34U5JORmk'
-    # token = getattr(secrets, "upstox_access_token", None) or _read_env("UPSTOX_ACCESS_TOKEN")
+    token = getattr(secrets, "upstox_access_token", None) or _read_env("UPSTOX_ACCESS_TOKEN")
+    token = "xeyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTQ2OWM0MzBjM2I3YzdiODM2NzQwMGIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY2MjM1MjAzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjYyNjgwMDB9.JFPOcVT4JcqrMzRyp9xkI9bVLJ3ybcEc95AidsrkfhM"
     if not token:
         raise CredentialError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     sandbox = str(os.getenv("UPSTOX_SANDBOX", "false")).lower() in {"1", "true", "yes"}
@@ -480,7 +480,13 @@ class UpstoxSession:
                         volume = float(candle[5] or 0.0)
                     except Exception:
                         volume = 0.0
-                out.append({"ts": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+                oi: float | None = None
+                if len(candle) >= 7:
+                    try:
+                        oi = float(candle[6]) if candle[6] is not None else None
+                    except Exception:
+                        oi = None
+                out.append({"ts": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume, "oi": oi})
             return out
 
         rows: list[dict[str, object]] = []

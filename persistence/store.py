@@ -121,22 +121,27 @@ class SQLiteStore:
         self,
         order_id: str,
         *,
+        exec_id: Optional[str] = None,
         symbol: str,
         side: str,
         qty: int,
         price: float,
+        raw_price: Optional[float] = None,
+        effective_price: Optional[float] = None,
         venue: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         ts: Optional[dt.datetime] = None,
     ) -> None:
         with self._lock:
             stamp = self._ts(ts)
+            exec_id = str(exec_id or order_id)
+            eff = float(effective_price if effective_price is not None else price)
             self._conn.execute(
                 """
-                INSERT INTO executions(run_id, order_id, symbol, side, qty, price, ts, venue, idempotency_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO executions(run_id, order_id, exec_id, symbol, side, qty, price, raw_price, effective_price, ts, venue, idempotency_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (self.run_id, order_id, symbol, side, qty, price, stamp, venue, idempotency_key),
+                (self.run_id, order_id, exec_id, symbol, side, qty, eff, raw_price, eff, stamp, venue, idempotency_key),
             )
             self._conn.commit()
 

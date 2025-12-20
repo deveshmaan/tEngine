@@ -68,6 +68,7 @@ class PnLCalculator:
         self._positions: Dict[Tuple[str, Optional[str], Optional[float], Optional[str]], PositionState] = {}
         self._total_fees = 0.0
         self._total_realized = 0.0
+        self._brokerage_charged_orders: set[str] = set()
 
     def on_execution(self, exec: Execution) -> None:
         key = (exec.symbol, exec.expiry, exec.strike, exec.opt_type)
@@ -76,7 +77,10 @@ class PnLCalculator:
             PositionState(symbol=exec.symbol, expiry=exec.expiry, strike=exec.strike, opt_type=exec.opt_type),
         )
         state.opened_at = state.opened_at or exec.ts
-        fees = fees_for_execution(exec, self.fee_config)
+        include_brokerage = exec.order_id not in self._brokerage_charged_orders
+        fees = fees_for_execution(exec, self.fee_config, include_brokerage=include_brokerage)
+        if include_brokerage:
+            self._brokerage_charged_orders.add(exec.order_id)
         fee_total = sum(row.amount for row in fees)
         for row in fees:
             self.store.record_cost(exec.exec_id, category=row.category, amount=row.amount, currency=row.currency, note=row.note, ts=exec.ts)
