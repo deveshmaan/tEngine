@@ -27,8 +27,8 @@ class MultiLegSpecStrategy(BaseStrategy):
     - Enters all legs once per trading day at/after `entry_time`
     - Exits all open positions at/after `exit_time`
 
-    Not implemented yet (UI must disable):
-    - per-leg stoploss/profit-lock/re-entry automation
+    Not implemented yet:
+    - per-leg stoploss/profit-target/trailing/re-entry automation (values are stored in `StrategySpec` but not enforced)
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -215,7 +215,12 @@ class MultiLegSpecStrategy(BaseStrategy):
         symbol = f"{underlying.upper()}-{expiry}-{int(strike)}{str(opt_type).upper()}"
         try:
             key = getattr(app, "_resolve_option_instrument_key")(underlying=underlying, expiry=expiry, strike=int(strike), opt_type=str(opt_type).upper())  # type: ignore[misc]
-            series = getattr(app, "_load_series")(key, getattr(app, "_bt_interval") or self.spec.candle_interval, is_option=True)  # type: ignore[misc]
+            series = getattr(app, "_load_series")(  # type: ignore[misc]
+                key,
+                getattr(app, "_bt_interval") or self.spec.candle_interval,
+                is_option=True,
+                expiry=expiry,
+            )
             bar = getattr(app, "_bar_for_ts")(series, entry_ts)  # type: ignore[misc]
         except Exception:
             return None
@@ -237,4 +242,3 @@ def payload_symbol_from_key(underlying_instrument_key: str) -> Optional[str]:
 
 
 __all__ = ["MultiLegSpecStrategy"]
-

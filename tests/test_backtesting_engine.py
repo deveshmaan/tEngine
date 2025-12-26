@@ -81,3 +81,88 @@ async def test_backtesting_engine_executes_and_computes_pnl(monkeypatch: pytest.
         assert res["trade_log"][0]["net_pnl"] == pytest.approx(10.0 * int(engine.cfg.data.lot_step))
     finally:
         engine.close()
+
+
+def test_run_backtest_spec_json_dispatches(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.backtest.strategy_spec import (
+        BacktestConfig,
+        BacktestRunSpec,
+        ExecutionModelSpec,
+        ExpirySelectorSpec,
+        OptionLegSpec,
+        StrikeSelectorSpec,
+        StrategySpec,
+    )
+
+    engine = BacktestingEngine(
+        store_path=tmp_path / "engine_state.sqlite",
+        history_cache_path=tmp_path / "history.sqlite",
+        instrument_master_path=tmp_path / "instrument_master.json.gz",
+    )
+    try:
+        calls: dict[str, str] = {}
+
+        def fake_run_backtest_run_spec(*args, **kwargs):  # type: ignore[no-untyped-def]
+            calls["method"] = "run_spec"
+            return {"ok": True}
+
+        def fake_run_backtest_strategy_spec(*args, **kwargs):  # type: ignore[no-untyped-def]
+            calls["method"] = "strategy_spec"
+            return {"ok": True}
+
+        monkeypatch.setattr(engine, "run_backtest_run_spec", fake_run_backtest_run_spec)
+        monkeypatch.setattr(engine, "run_backtest_strategy_spec", fake_run_backtest_strategy_spec)
+
+        run_spec = BacktestRunSpec(
+            name="Dispatch",
+            config=BacktestConfig(
+                underlying_instrument_key="NSE_INDEX|Nifty 50",
+                start_date=dt.date(2024, 1, 2),
+                end_date=dt.date(2024, 1, 2),
+                interval="1minute",
+                entry_time="09:15",
+                exit_time="15:20",
+                timezone="Asia/Kolkata",
+                starting_capital=100000.0,
+                brokerage_profile="india_options_default",
+            ),
+            legs=(
+                OptionLegSpec(
+                    leg_id="leg_1",
+                    side="BUY",
+                    option_type="CE",
+                    qty=1,
+                    expiry_selector=ExpirySelectorSpec(mode="WEEKLY_CURRENT"),
+                    strike_selector=StrikeSelectorSpec(mode="ATM"),
+                ),
+            ),
+            execution_model=ExecutionModelSpec(fill_model="next_tick", latency_ms=0, allow_partial_fills=False, spread_bps=0.0),
+        )
+
+        engine.run_backtest_spec_json(run_spec.to_json())
+        assert calls.get("method") == "run_spec"
+
+        calls.clear()
+        legacy = StrategySpec(
+            name="Legacy",
+            underlying_instrument_key="NSE_INDEX|Nifty 50",
+            start_date=dt.date(2024, 1, 2),
+            end_date=dt.date(2024, 1, 2),
+            candle_interval="1minute",
+            entry_time="09:15",
+            exit_time="15:20",
+            fill_model="next_tick",
+            allow_partial_fills=False,
+            latency_ms=0,
+            slippage_model="none",
+            slippage_bps=0.0,
+            slippage_ticks=0,
+            spread_bps=0.0,
+            brokerage_profile="india_options_default",
+            starting_capital=100000.0,
+            legs=(),
+        )
+        engine.run_backtest_spec_json(legacy.to_json())
+        assert calls.get("method") == "strategy_spec"
+    finally:
+        engine.close()

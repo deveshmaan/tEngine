@@ -1,0 +1,31 @@
+template_id: ShortStrangle
+display_name: Short Strangle
+description: Sell OTM Call + Sell OTM Put (±200pts from ATM; weekly current expiry)
+default_underlying: NSE_INDEX|Nifty 50
+candle_interval: 5minute
+entry_time: "09:30"
+exit_time: "15:20"
+legs:
+  - side: SELL
+    opt_type: CE
+    qty_lots: 1
+    expiry_mode: WEEKLY_CURRENT
+    strike_mode: ATM_OFFSET
+    strike_offset_points: 200
+    stoploss_pct: 25
+    profit_lock:
+      trigger_pct: 15
+      lock_to_pct: 7
+  - side: SELL
+    opt_type: PE
+    qty_lots: 1
+    expiry_mode: WEEKLY_CURRENT
+    strike_mode: ATM_OFFSET
+    strike_offset_points: 200
+    stoploss_pct: 25
+    profit_lock:
+      trigger_pct: 15
+      lock_to_pct: 7
+risk_rules:
+  strategy:
+    notes: "Per-leg stoploss/profit-lock are stored in spec; automation not implemented yet."

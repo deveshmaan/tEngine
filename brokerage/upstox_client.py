@@ -133,7 +133,7 @@ def load_upstox_credentials(secrets: Optional[object] = None) -> UpstoxConfig:
         - UPSTOX_API_SECRET
     """
     token = getattr(secrets, "upstox_access_token", None) or _read_env("UPSTOX_ACCESS_TOKEN")
-    token = "xeyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTQ2OWM0MzBjM2I3YzdiODM2NzQwMGIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY2MjM1MjAzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjYyNjgwMDB9.JFPOcVT4JcqrMzRyp9xkI9bVLJ3ybcEc95AidsrkfhM"
+    token = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTRlNDIzOGQ0OWM4NDA1NDQyMWY5YjQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY2NzM2NDQwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjY3ODY0MDB9.0M8eJuu4xEgTJtnokFXnQ639brQUqoKa2Mp7uBYAcRA"
     if not token:
         raise CredentialError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     sandbox = str(os.getenv("UPSTOX_SANDBOX", "false")).lower() in {"1", "true", "yes"}
@@ -373,35 +373,6 @@ class UpstoxSession:
                 return value.date()
             return value
 
-        def _to_date_str(value: dt.date) -> str:
-            return value.isoformat()
-
-        def _parse_interval(value: str) -> tuple[str, int]:
-            text = str(value or "").strip().lower()
-            if not text:
-                return "minutes", 1
-            if text in {"day", "1day", "d", "1d"}:
-                return "days", 1
-            if text in {"week", "1week", "w", "1w"}:
-                return "weeks", 1
-            if text in {"month", "1month", "mo", "1mo"}:
-                return "months", 1
-            match = re.fullmatch(r"(\d+)\s*(minute|min|m|day|d|week|w|month|mo)s?", text)
-            if not match:
-                raise ValueError(f"Unsupported interval: {value!r}")
-            count = int(match.group(1))
-            unit_raw = match.group(2)
-            unit = unit_raw
-            if unit in {"min", "m", "minute"}:
-                unit = "minutes"
-            elif unit in {"d", "day"}:
-                unit = "days"
-            elif unit in {"w", "week"}:
-                unit = "weeks"
-            elif unit in {"mo", "month"}:
-                unit = "months"
-            return unit, max(count, 1)
-
         def _resolve_key(value: str) -> str:
             text = str(value or "").strip()
             if not text:
@@ -411,100 +382,24 @@ class UpstoxSession:
                 return INDEX_INSTRUMENT_KEYS[upper]
             return text
 
-        def _parse_ts(raw: object) -> dt.datetime:
-            if raw is None:
-                raise ValueError("Missing candle timestamp")
-            if isinstance(raw, (int, float)):
-                ts_num = float(raw)
-                if ts_num > 1_000_000_000_000:
-                    ts_num /= 1000.0
-                return dt.datetime.fromtimestamp(ts_num, tz=dt.timezone.utc).astimezone(tz)
-            text = str(raw).strip()
-            if not text:
-                raise ValueError("Missing candle timestamp")
-            try:
-                ts = dt.datetime.fromisoformat(text)
-            except ValueError:
-                # Fallback: epoch seconds encoded as string.
-                try:
-                    ts_num = float(text)
-                except ValueError as exc:
-                    raise ValueError(f"Invalid candle timestamp: {raw!r}") from exc
-                if ts_num > 1_000_000_000_000:
-                    ts_num /= 1000.0
-                ts = dt.datetime.fromtimestamp(ts_num, tz=dt.timezone.utc)
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=tz)
-            return ts.astimezone(tz)
-
         instrument_key = _resolve_key(symbol)
-        unit, interval_n = _parse_interval(interval)
         start_d = _as_date(start_date)
         end_d = _as_date(end_date)
         if end_d < start_d:
             raise ValueError(f"Invalid date range: start_date={start_d.isoformat()} end_date={end_d.isoformat()}")
 
-        def _call(from_date: str, to_date: str) -> dict:
-            resp = self.history_api_v3.get_historical_candle_data1(
-                instrument_key=instrument_key,
-                unit=unit,
-                interval=interval_n,
-                to_date=to_date,
-                from_date=from_date,
-            )
-            return resp.to_dict() if hasattr(resp, "to_dict") else resp
+        from engine.data.upstox_history import UpstoxHistoryClient
 
-        def _parse_payload(payload: dict) -> list[dict[str, object]]:
-            data = payload.get("data") if isinstance(payload, dict) else None
-            candles = (data or {}).get("candles") if isinstance(data, dict) else None
-            if candles is None and isinstance(payload, dict):
-                candles = payload.get("candles")
-            out: list[dict[str, object]] = []
-            for candle in candles or []:
-                if not isinstance(candle, (list, tuple)) or len(candle) < 5:
-                    continue
-                try:
-                    ts = _parse_ts(candle[0])
-                except Exception:
-                    continue
-                try:
-                    open_ = float(candle[1])
-                    high = float(candle[2])
-                    low = float(candle[3])
-                    close = float(candle[4])
-                except Exception:
-                    continue
-                volume = 0.0
-                if len(candle) >= 6:
-                    try:
-                        volume = float(candle[5] or 0.0)
-                    except Exception:
-                        volume = 0.0
-                oi: float | None = None
-                if len(candle) >= 7:
-                    try:
-                        oi = float(candle[6]) if candle[6] is not None else None
-                    except Exception:
-                        oi = None
-                out.append({"ts": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume, "oi": oi})
-            return out
-
-        rows: list[dict[str, object]] = []
-
-        # Upstox enforces a strict max date span for minute candles (≤ 30 days).
-        if unit == "minutes":
-            max_span_days = int(os.getenv("UPSTOX_HISTORY_MAX_SPAN_DAYS_MINUTES", "30"))
-            chunk_start = start_d
-            while chunk_start <= end_d:
-                chunk_end = min(end_d, chunk_start + dt.timedelta(days=max_span_days))
-                payload = with_retry(lambda: _call(_to_date_str(chunk_start), _to_date_str(chunk_end)))
-                rows.extend(_parse_payload(payload))
-                chunk_start = chunk_end + dt.timedelta(days=1)
-        else:
-            payload = with_retry(lambda: _call(_to_date_str(start_d), _to_date_str(end_d)))
-            rows = _parse_payload(payload)
-
-        rows.sort(key=lambda r: r["ts"])  # type: ignore[index]
+        client = UpstoxHistoryClient.from_env(self.history_api_v3, tz=tz)
+        try:
+            rows = client.fetch_candles(instrument_key, interval, start_d, end_d)
+        except ApiException as exc:  # pragma: no cover - network dependent
+            status = getattr(exc, "status", None)
+            body = getattr(exc, "body", "") or ""
+            text = body.decode("utf-8", errors="ignore") if isinstance(body, (bytes, bytearray)) else str(body)
+            if status == 401 or "UDAPI100050" in text or "invalid token" in text.lower():
+                raise CredentialError("Upstox access token is invalid/expired; update UPSTOX_ACCESS_TOKEN and retry.") from exc
+            raise
 
         if not as_dataframe:
             return rows

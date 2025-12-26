@@ -9,11 +9,14 @@ from engine.fees import FeeConfig, fees_for_execution, load_fee_config
 
 def apply_spread(fill_price: float, side: str, spread_bps: float) -> float:
     """
-    Worsen the given price by `spread_bps`.
+    Apply half-spread around a mid/mark price.
 
     Notes:
-    - `fill_price` is treated as a mid/mark proxy; the function applies a one-sided
-      worsening in the trade direction.
+    - `fill_price` is treated as a mid/mark proxy.
+    - `spread_bps` is treated as a full bid-ask spread in bps; fills are moved by
+      half the spread in the trade direction:
+        - BUY: mid * (1 + spread_bps/2)
+        - SELL: mid * (1 - spread_bps/2)
     """
 
     price = float(fill_price)
@@ -23,7 +26,8 @@ def apply_spread(fill_price: float, side: str, spread_bps: float) -> float:
     if bps <= 0:
         return price
     side_u = str(side or "").strip().upper()
-    mult = 1.0 + (bps / 10_000.0) if side_u == "BUY" else 1.0 - (bps / 10_000.0)
+    half = bps / 2.0
+    mult = 1.0 + (half / 10_000.0) if side_u == "BUY" else 1.0 - (half / 10_000.0)
     return float(price * mult)
 
 
@@ -144,4 +148,3 @@ def india_options_charges(
 
 
 __all__ = ["apply_slippage", "apply_spread", "india_options_charges"]
-

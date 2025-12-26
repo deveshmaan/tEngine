@@ -415,6 +415,8 @@ class BacktestStore:
             "period": period or "",
             "interval": run["interval"] or "",
             "underlying": run["underlying_key"] or "",
+            "underlying_key": run["underlying_key"] or "",
+            "spec_json": run["spec_json"],
             "execution": execution,
             "costs": costs,
             "errors": errors if isinstance(errors, list) else [],

@@ -11,3 +11,7 @@ cache/
 prometheus/
 trading_resource/
 .env
+
+# Allow `engine/data` (python package) even though `data/` is ignored above.
+!engine/data/
+!engine/data/**

@@ -197,7 +197,7 @@ async def test_fill_model_next_tick_changes_entry(tmp_path: Path) -> None:
 
     day = dt.date(2024, 1, 1)  # Monday -> weekly expiry resolves to Tuesday (2024-01-02)
     expiry = "2024-01-02"
-    times = [dt.time(9, 15)]
+    times = [dt.time(9, 15), dt.time(9, 16)]
 
     instrument_master_path = tmp_path / "nse_master.json.gz"
     history_cache_path = tmp_path / "history.sqlite"
@@ -212,10 +212,10 @@ async def test_fill_model_next_tick_changes_entry(tmp_path: Path) -> None:
     _write_instrument_master(instrument_master_path, underlying_key=UNDERLYING_KEY, expiry=expiry, instrument_keys=instrument_keys)
 
     option_candles = {
-        instrument_keys[("CE", 20000)]: _option_df(day, times=times, price=100.0, volumes=[1_000]),
-        instrument_keys[("CE", 20050)]: _option_df(day, times=times, price=90.0, volumes=[1_000]),
-        instrument_keys[("PE", 20000)]: _option_df(day, times=times, price=110.0, volumes=[1_000]),
-        instrument_keys[("PE", 19950)]: _option_df(day, times=times, price=95.0, volumes=[1_000]),
+        instrument_keys[("CE", 20000)]: _option_df(day, times=times, price=100.0, volumes=[1_000, 1_000]),
+        instrument_keys[("CE", 20050)]: _option_df(day, times=times, price=90.0, volumes=[1_000, 1_000]),
+        instrument_keys[("PE", 20000)]: _option_df(day, times=times, price=110.0, volumes=[1_000, 1_000]),
+        instrument_keys[("PE", 19950)]: _option_df(day, times=times, price=95.0, volumes=[1_000, 1_000]),
     }
 
     underlying = _underlying_rows(day, times=times, price=20000.0)
@@ -406,7 +406,7 @@ async def test_option_data_not_synthetic(tmp_path: Path) -> None:
 
     with sqlite3.connect(history_cache_path) as conn:
         rows = conn.execute(
-            "SELECT volume, source FROM candles WHERE key=? AND interval=? ORDER BY ts ASC",
+            "SELECT volume, source FROM candles WHERE instrument_key=? AND interval=? ORDER BY ts ASC",
             (opt_key, "1minute"),
         ).fetchall()
     assert rows

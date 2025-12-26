@@ -1,0 +1,43 @@
+template_id: IronCondor
+display_name: Iron Condor
+description: Sell OTM CE/PE with buy wings (weekly current expiry)
+default_underlying: NSE_INDEX|Nifty 50
+candle_interval: 5minute
+entry_time: "09:30"
+exit_time: "15:20"
+legs:
+  - side: SELL
+    opt_type: CE
+    qty_lots: 1
+    expiry_mode: WEEKLY_CURRENT
+    strike_mode: ATM_OFFSET
+    strike_offset_points: 200
+    stoploss_pct: 25
+    profit_lock:
+      trigger_pct: 15
+      lock_to_pct: 7
+  - side: BUY
+    opt_type: CE
+    qty_lots: 1
+    expiry_mode: WEEKLY_CURRENT
+    strike_mode: ATM_OFFSET
+    strike_offset_points: 400
+  - side: SELL
+    opt_type: PE
+    qty_lots: 1
+    expiry_mode: WEEKLY_CURRENT
+    strike_mode: ATM_OFFSET
+    strike_offset_points: 200
+    stoploss_pct: 25
+    profit_lock:
+      trigger_pct: 15
+      lock_to_pct: 7
+  - side: BUY
+    opt_type: PE
+    qty_lots: 1
+    expiry_mode: WEEKLY_CURRENT
+    strike_mode: ATM_OFFSET
+    strike_offset_points: 400
+risk_rules:
+  strategy:
+    notes: "Stoploss/profit-lock only set on short legs; automation not implemented yet."

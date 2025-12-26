@@ -50,15 +50,15 @@ def test_history_cache_migrates_legacy_schema(tmp_path: Path) -> None:
 
     with sqlite3.connect(db_path) as conn:
         cols = [row[1] for row in conn.execute("PRAGMA table_info(candles)").fetchall()]
-        assert "key" in cols
+        assert "instrument_key" in cols
         assert "source" in cols
         cov_cols = [row[1] for row in conn.execute("PRAGMA table_info(coverage)").fetchall()]
-        assert "key" in cov_cols
+        assert "instrument_key" in cov_cols
 
     df = cache.load(key="NSE_INDEX|Nifty 50", interval="1minute", start_ts=1699990000, end_ts=1700010000)
     assert not df.empty
-    assert set(df.columns) >= {"ts", "open", "high", "low", "close", "volume", "oi", "source", "key", "interval"}
-    assert df.iloc[0]["key"] == "NSE_INDEX|Nifty 50"
+    assert set(df.columns) >= {"ts", "open", "high", "low", "close", "volume", "oi", "source", "instrument_key", "key", "interval"}
+    assert df.iloc[0]["instrument_key"] == "NSE_INDEX|Nifty 50"
     assert df.iloc[0]["source"] == "legacy"
 
 
@@ -94,4 +94,3 @@ def test_history_cache_ensure_range_fetches_once(tmp_path: Path) -> None:
 
     loaded = cache.load(key="TEST|KEY", interval="1minute", start_ts=start_ts, end_ts=end_ts)
     assert len(loaded) == 2
-

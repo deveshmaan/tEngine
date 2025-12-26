@@ -182,6 +182,7 @@ class BacktestingEngine:
         slippage_ticks: int = 0,
         spread_bps: float = 0.0,
         starting_capital: Optional[float] = None,
+        participation_rate: float = 1.0,
     ) -> None:
         self.cfg = config or EngineConfig.load()
         if disable_md_stale_gate:
@@ -263,10 +264,18 @@ class BacktestingEngine:
         self._history_cache = HistoryCache(path=history_cache_path)
         self._instrument_master = InstrumentMaster(path=instrument_master_path)
         self.execution = execution_config or ExecutionConfig()
+        self.fill_price_rule: str = "auto"
         self.slippage_model = str(slippage_model or "none").strip().lower()
         self.slippage_bps = float(slippage_bps or 0.0)
         self.slippage_ticks = int(slippage_ticks or 0)
         self.spread_bps = float(spread_bps or 0.0)
+        try:
+            pr = float(participation_rate if participation_rate is not None else 1.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("participation_rate must be a number") from exc
+        if pr <= 0 or pr > 1.0:
+            raise ValueError("participation_rate must be in (0, 1]")
+        self.participation_rate = float(pr)
         self._series_cache: Dict[Tuple[str, str], _CandleSeries] = {}
         self._last_option_price: Dict[str, float] = {}
         self._bt_interval: Optional[str] = None
@@ -275,10 +284,20 @@ class BacktestingEngine:
         self._sim_tick_index: int = 0
         self._order_signal_ts: Dict[str, dt.datetime] = {}
         self._order_signal_tick_idx: Dict[str, int] = {}
+        self._order_signal_bar_open: Dict[str, dt.datetime] = {}
         self._liquidity_remaining: Dict[Tuple[str, int], int] = {}
         self._data_warnings: List[str] = []
         self._warned: set[str] = set()
-        self._cache_stats: Dict[str, int] = {"ensure_calls": 0, "missing_segments": 0, "fetched_rows": 0}
+        self._cache_stats: Dict[str, int] = {
+            "ensure_calls": 0,
+            "missing_segments": 0,
+            "fetched_rows": 0,
+            "expected_bars": 0,
+            "missing_bars": 0,
+            "option_bars_total": 0,
+            "option_oi_present_bars": 0,
+            "option_volume_present_bars": 0,
+        }
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -295,6 +314,132 @@ class BacktestingEngine:
                 self._tempdir.cleanup()
 
     # ---------------------------------------------------------------- public API
+    def run_backtest_strategy_spec(
+        self,
+        spec: "StrategySpec",
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        underlying_symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run the backtest for the spec-driven multi-leg strategy without requiring the caller
+        to pass a strategy class name.
+        """
+
+        from engine.backtest.strategy_spec import StrategySpec  # local import
+
+        if not isinstance(spec, StrategySpec):
+            raise TypeError("spec must be a StrategySpec")
+
+        exec_cfg = ExecutionConfig(
+            fill_model=str(spec.fill_model),
+            latency_ms=int(spec.latency_ms),
+            allow_partial_fills=bool(spec.allow_partial_fills),
+        )
+        self.execution = exec_cfg
+        self.fill_price_rule = "auto"
+        self.slippage_model = str(spec.slippage_model or "none").strip().lower()
+        self.slippage_bps = float(spec.slippage_bps or 0.0)
+        self.slippage_ticks = int(spec.slippage_ticks or 0)
+        self.spread_bps = float(spec.spread_bps or 0.0)
+        self.participation_rate = 1.0
+        try:
+            self.risk.capital_base = float(spec.starting_capital or 0.0)
+        except Exception:
+            pass
+
+        self.strategy_spec = spec
+        self.strategy_spec_json = spec.to_json()
+
+        return self.run_backtest(
+            "MultiLegSpecStrategy",
+            spec.start_date,
+            spec.end_date,
+            interval=str(spec.candle_interval),
+            progress_callback=progress_callback,
+            underlying_symbol=underlying_symbol,
+        )
+
+    def run_backtest_run_spec(
+        self,
+        run_spec: "BacktestRunSpec",
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        underlying_symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run a backtest from the builder/persistence-friendly BacktestRunSpec.
+        """
+
+        from engine.backtest.strategy_spec import BacktestRunSpec  # local import
+
+        if not isinstance(run_spec, BacktestRunSpec):
+            raise TypeError("run_spec must be a BacktestRunSpec")
+
+        exec_cfg = ExecutionConfig(
+            fill_model=str(run_spec.execution_model.fill_model),
+            latency_ms=int(run_spec.execution_model.latency_ms),
+            allow_partial_fills=bool(run_spec.execution_model.allow_partial_fills),
+        )
+        self.execution = exec_cfg
+        self.fill_price_rule = str(run_spec.execution_model.fill_price_rule or "auto").strip().lower()
+        self.slippage_model = str(run_spec.execution_model.slippage_model or "none").strip().lower()
+        self.slippage_bps = float(run_spec.execution_model.slippage_bps or 0.0)
+        self.slippage_ticks = int(run_spec.execution_model.slippage_ticks or 0)
+        self.spread_bps = float(run_spec.execution_model.spread_bps or 0.0)
+        try:
+            self.participation_rate = float(run_spec.execution_model.participation_rate)
+        except Exception:
+            self.participation_rate = 1.0
+        try:
+            self.risk.capital_base = float(run_spec.config.starting_capital or 0.0)
+        except Exception:
+            pass
+
+        self.strategy_spec = run_spec
+        self.strategy_spec_json = run_spec.to_json()
+
+        return self.run_backtest(
+            "OptionsBacktestRunner",
+            run_spec.config.start_date,
+            run_spec.config.end_date,
+            interval=str(run_spec.config.interval),
+            progress_callback=progress_callback,
+            underlying_symbol=underlying_symbol,
+        )
+
+    def run_backtest_spec_json(
+        self,
+        raw: str,
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        underlying_symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Auto-detect and run either BacktestRunSpec JSON or legacy StrategySpec JSON.
+        """
+
+        from engine.backtest.strategy_spec import BacktestRunSpec, StrategySpec  # local import
+
+        raw_text = str(raw or "")
+        if not raw_text.strip():
+            raise ValueError("spec JSON is empty")
+
+        try:
+            run_spec = BacktestRunSpec.from_json(raw_text)
+            return self.run_backtest_run_spec(
+                run_spec,
+                progress_callback=progress_callback,
+                underlying_symbol=underlying_symbol,
+            )
+        except Exception:
+            spec = StrategySpec.from_json(raw_text)
+            return self.run_backtest_strategy_spec(
+                spec,
+                progress_callback=progress_callback,
+                underlying_symbol=underlying_symbol,
+            )
+
     def run_backtest(
         self,
         strategy_name: str,
@@ -363,10 +508,20 @@ class BacktestingEngine:
         self._warned = set()
         self._last_option_price = {}
         self._series_cache = {}
-        self._cache_stats = {"ensure_calls": 0, "missing_segments": 0, "fetched_rows": 0}
+        self._cache_stats = {
+            "ensure_calls": 0,
+            "missing_segments": 0,
+            "fetched_rows": 0,
+            "expected_bars": 0,
+            "missing_bars": 0,
+            "option_bars_total": 0,
+            "option_oi_present_bars": 0,
+            "option_volume_present_bars": 0,
+        }
         self._sim_tick_index = 0
         self._order_signal_ts = {}
         self._order_signal_tick_idx = {}
+        self._order_signal_bar_open = {}
         self._liquidity_remaining = {}
         # Reset monotonic store clock so historical backtests can record real timestamps.
         try:
@@ -466,6 +621,8 @@ class BacktestingEngine:
                 "cache_ensure_calls": int(self._cache_stats.get("ensure_calls", 0)),
                 "cache_missing_segments": int(self._cache_stats.get("missing_segments", 0)),
                 "cache_fetched_rows": int(self._cache_stats.get("fetched_rows", 0)),
+                "cache_expected_bars": int(self._cache_stats.get("expected_bars", 0)),
+                "cache_missing_bars": int(self._cache_stats.get("missing_bars", 0)),
                 "series_loaded": int(len(self._series_cache)),
             }
             out["execution"] = {
@@ -621,7 +778,8 @@ class BacktestingEngine:
                         errors.append(f"strategy_tick_error:{exc}")
 
                     # Drive exits for any open positions (covers strategies that don't call ExitEngine).
-                    await self._drive_exit_engine(tick_ts, underlying)
+                    if strategy_name != "OptionsBacktestRunner":
+                        await self._drive_exit_engine(tick_ts, underlying)
 
                     # Fill all pending orders and process resulting executions.
                     await self._fill_pending_orders(tick_ts, underlying)
@@ -686,10 +844,32 @@ class BacktestingEngine:
             "cache_ensure_calls": int(self._cache_stats.get("ensure_calls", 0)),
             "cache_missing_segments": int(self._cache_stats.get("missing_segments", 0)),
             "cache_fetched_rows": int(self._cache_stats.get("fetched_rows", 0)),
+            "cache_expected_bars": int(self._cache_stats.get("expected_bars", 0)),
+            "cache_missing_bars": int(self._cache_stats.get("missing_bars", 0)),
+            "option_bars_total": int(self._cache_stats.get("option_bars_total", 0)),
+            "option_oi_present_bars": int(self._cache_stats.get("option_oi_present_bars", 0)),
+            "option_volume_present_bars": int(self._cache_stats.get("option_volume_present_bars", 0)),
             "series_loaded": int(len(self._series_cache)),
         }
+        try:
+            total_opt = int(out["diagnostics"].get("option_bars_total", 0) or 0)
+            if total_opt > 0:
+                out["diagnostics"]["option_oi_coverage_pct"] = round(
+                    (float(out["diagnostics"].get("option_oi_present_bars", 0) or 0) / float(total_opt)) * 100.0,
+                    2,
+                )
+                out["diagnostics"]["option_volume_coverage_pct"] = round(
+                    (float(out["diagnostics"].get("option_volume_present_bars", 0) or 0) / float(total_opt)) * 100.0,
+                    2,
+                )
+            else:
+                out["diagnostics"]["option_oi_coverage_pct"] = None
+                out["diagnostics"]["option_volume_coverage_pct"] = None
+        except Exception:
+            pass
         out["execution"] = {
             "fill_model": self.execution.fill_model,
+            "fill_price_rule": str(getattr(self, "fill_price_rule", "auto") or "auto"),
             "latency_ms": int(self.execution.latency_ms),
             "allow_partial_fills": bool(self.execution.allow_partial_fills),
         }
@@ -701,6 +881,30 @@ class BacktestingEngine:
         }
         out["orders"] = self._load_orders_table()
         out["executions"] = self._load_executions_table()
+        try:
+            from engine.backtest.analytics import (
+                aggregate_strategy_trades,
+                compute_daily_metrics,
+                compute_leg_breakdown,
+                compute_monthly_heatmap,
+            )
+
+            out["strategy_trade_log"] = aggregate_strategy_trades(trade_log)
+            strategy_level = out.get("strategy_trade_log") or []
+            if not strategy_level:
+                strategy_level = trade_log
+            daily = compute_daily_metrics(strategy_level)
+            monthly = compute_monthly_heatmap(daily.get("daily") or [])
+            legs = compute_leg_breakdown(trade_log)
+            out["analytics"] = {
+                "daily": daily.get("daily") or [],
+                "daily_summary": daily.get("summary") or {},
+                "monthly": monthly.get("monthly") or [],
+                "legs": legs.get("by_leg") or [],
+                "opt_type": legs.get("by_opt_type") or [],
+            }
+        except Exception:
+            out["strategy_trade_log"] = _aggregate_strategy_trades(trade_log)
         if progress_callback:
             try:
                 progress_callback(total_candles, total_candles)
@@ -798,7 +1002,7 @@ class BacktestingEngine:
             df["oi"] = None
         return df[["ts", "open", "high", "low", "close", "volume", "oi", "key", "interval"]]
 
-    def _load_series(self, key: str, interval_key: str, *, is_option: bool) -> _CandleSeries:
+    def _load_series(self, key: str, interval_key: str, *, is_option: bool, expiry: Optional[str] = None) -> _CandleSeries:
         cache_key = (str(key), str(interval_key))
         existing = self._series_cache.get(cache_key)
         if existing is not None:
@@ -812,24 +1016,49 @@ class BacktestingEngine:
                 pass
             return df
 
+        range_start_ts = int(self._bt_range_start_ts)
+        range_end_ts = int(self._bt_range_end_ts)
+        if is_option and expiry:
+            try:
+                exp_date = dt.date.fromisoformat(str(expiry))
+                exp_end = dt.datetime.combine(exp_date, dt.time(23, 59, 59), tzinfo=IST)
+                range_end_ts = min(range_end_ts, int(exp_end.astimezone(dt.timezone.utc).timestamp()))
+            except Exception:
+                pass
+
+        holidays = getattr(self.cfg.data, "holidays", None)
+
         self._cache_stats["ensure_calls"] += 1
         missing = self._history_cache.ensure_range(
-            key,
-            interval_key,
-            self._bt_range_start_ts,
-            self._bt_range_end_ts,
-            _fetch,
+            instrument_key=key,
+            interval=interval_key,
+            start_ts=range_start_ts,
+            end_ts=range_end_ts,
+            fetch_fn=_fetch,
             source="upstox",
+            holiday_calendar=holidays,
         )
         self._cache_stats["missing_segments"] += len(missing or [])
-        df = self._history_cache.load(
-            key=key,
-            interval=interval_key,
-            start_ts=self._bt_range_start_ts,
-            end_ts=self._bt_range_end_ts,
-        )
+        df = self._history_cache.load(instrument_key=key, interval=interval_key, start_ts=range_start_ts, end_ts=range_end_ts)
         series = _df_to_series(key=key, interval=interval_key, df=df)
         self._series_cache[cache_key] = series
+
+        # Cache-level gap stats (after ensure_range). Missing bars should be 0 for complete series.
+        try:
+            gap = self._history_cache.gap_info(
+                instrument_key=key,
+                interval=interval_key,
+                start_ts=range_start_ts,
+                end_ts=range_end_ts,
+                holiday_calendar=holidays,
+            )
+            self._cache_stats["expected_bars"] += int(gap.get("expected_bars", 0) or 0)
+            missing_bars = int(gap.get("missing_bars", 0) or 0)
+            self._cache_stats["missing_bars"] += missing_bars
+            if missing_bars > 0:
+                self._warn_once(f"missing_bars: key={key} interval={interval_key} missing={missing_bars}")
+        except Exception:
+            pass
 
         # ------------------------ data-quality warnings (best-effort, non-fatal)
         try:
@@ -857,11 +1086,34 @@ class BacktestingEngine:
 
         if is_option:
             try:
+                try:
+                    total_bars = int(len(df) if df is not None else 0)
+                except Exception:
+                    total_bars = 0
+                self._cache_stats["option_bars_total"] = int(self._cache_stats.get("option_bars_total", 0)) + int(total_bars)
+
+                vol = df.get("volume") if df is not None else None
+                if vol is not None and not getattr(vol, "empty", True):
+                    try:
+                        vol_present = int((vol.fillna(0.0).astype(float) > 0.0).sum())
+                    except Exception:
+                        vol_present = 0
+                    self._cache_stats["option_volume_present_bars"] = int(self._cache_stats.get("option_volume_present_bars", 0)) + int(
+                        vol_present
+                    )
+
                 oi = df.get("oi")
                 if oi is None or getattr(oi, "empty", True):
                     self._warn_once(f"oi_missing: key={key} interval={interval_key} (no OI column)")
                 else:
                     oi_numeric = oi.fillna(0.0).astype(float)
+                    try:
+                        oi_present = int((oi_numeric != 0.0).sum())
+                    except Exception:
+                        oi_present = 0
+                    self._cache_stats["option_oi_present_bars"] = int(self._cache_stats.get("option_oi_present_bars", 0)) + int(
+                        oi_present
+                    )
                     if (oi_numeric == 0.0).all():
                         self._warn_once(f"oi_missing: key={key} interval={interval_key} (all 0/NULL)")
             except Exception:
@@ -875,6 +1127,82 @@ class BacktestingEngine:
         if idx < 0:
             return None
         return series.bars_by_ts.get(series.ts_list[idx])
+
+    @staticmethod
+    def _bar_open_floor_ist(ts_ist: dt.datetime, bar_secs: int) -> dt.datetime:
+        bar_ms = max(int(bar_secs), 1) * 1000
+        midnight = dt.datetime.combine(ts_ist.date(), dt.time(0, 0), tzinfo=IST)
+        ms_since = int((ts_ist - midnight).total_seconds() * 1000)
+        floor_ms = (ms_since // bar_ms) * bar_ms
+        return midnight + dt.timedelta(milliseconds=int(floor_ms))
+
+    @staticmethod
+    def _bar_open_ceil_ist(ts_ist: dt.datetime, bar_secs: int) -> dt.datetime:
+        bar_ms = max(int(bar_secs), 1) * 1000
+        midnight = dt.datetime.combine(ts_ist.date(), dt.time(0, 0), tzinfo=IST)
+        ms_since = int((ts_ist - midnight).total_seconds() * 1000)
+        floor_ms = (ms_since // bar_ms) * bar_ms
+        ceil_ms = floor_ms if (ms_since % bar_ms) == 0 else (floor_ms + bar_ms)
+        return midnight + dt.timedelta(milliseconds=int(ceil_ms))
+
+    def _bar_price(
+        self,
+        symbol: str,
+        *,
+        bar_open_ist: dt.datetime,
+        underlying: str,
+        kind: str,
+    ) -> Optional[float]:
+        """
+        Resolve a bar-level `open`/`close` price for a given instrument at a specific bar open timestamp.
+        """
+
+        kind_key = str(kind or "").strip().lower()
+        if kind_key not in {"open", "close"}:
+            raise ValueError(f"kind must be 'open' or 'close'; got {kind!r}")
+
+        sym = str(symbol or "").strip()
+        if not sym:
+            return None
+
+        interval_key = str(self._bt_interval or "1minute")
+        bar_ts_epoch = int(bar_open_ist.astimezone(dt.timezone.utc).timestamp())
+
+        # Underlying / index symbols.
+        if sym.upper() in {"NIFTY", "BANKNIFTY"} or sym.upper() == str(underlying or "").upper():
+            instrument_key = INDEX_INSTRUMENT_KEYS.get(sym.upper(), sym)
+            try:
+                series = self._load_series(instrument_key, interval_key, is_option=False)
+                bar = series.bars_by_ts.get(bar_ts_epoch)
+                if bar is None:
+                    bar = self._bar_for_ts(series, bar_open_ist)
+                if bar is None:
+                    return float(self._last_spot.get(sym.upper(), 0.0) or 0.0)
+                return float(bar.open if kind_key == "open" else bar.close)
+            except Exception:
+                return float(self._last_spot.get(sym.upper(), 0.0) or 0.0)
+
+        # Options symbols.
+        try:
+            u, expiry, strike, opt = _parse_option_symbol(sym)
+        except ValueError:
+            return None
+
+        try:
+            instrument_key = self._resolve_option_instrument_key(underlying=u, expiry=expiry, strike=int(strike), opt_type=opt)
+        except Exception:
+            return None
+
+        try:
+            series = self._load_series(instrument_key, interval_key, is_option=True, expiry=expiry)
+            bar = series.bars_by_ts.get(bar_ts_epoch)
+            if bar is None:
+                bar = self._bar_for_ts(series, bar_open_ist)
+            if bar is None:
+                return None
+            return float(bar.open if kind_key == "open" else bar.close)
+        except Exception:
+            return None
 
     def _ltp_from_bar(self, bar: _CandleBar, ts: dt.datetime) -> tuple[float, float, Optional[float]]:
         ts_epoch = int(ts.astimezone(dt.timezone.utc).timestamp())
@@ -918,7 +1246,7 @@ class BacktestingEngine:
                     self._warn_once(f"option_key_missing: {symbol} ({exc})")
                     continue
                 try:
-                    series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True)
+                    series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True, expiry=expiry)
                 except Exception as exc:
                     self._warn_once(f"option_candles_load_failed: key={instrument_key} ({exc})")
                     continue
@@ -977,7 +1305,7 @@ class BacktestingEngine:
                         symbol = f"{underlying}-{expiry}-{int(strike)}CE"
                         try:
                             instrument_key = self._resolve_option_instrument_key(underlying=underlying, expiry=expiry, strike=int(strike), opt_type="CE")
-                            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True)
+                            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True, expiry=expiry)
                             bar = self._bar_for_ts(series, ts)
                             if bar is None:
                                 continue
@@ -997,7 +1325,7 @@ class BacktestingEngine:
                         symbol = f"{underlying}-{expiry}-{int(strike)}PE"
                         try:
                             instrument_key = self._resolve_option_instrument_key(underlying=underlying, expiry=expiry, strike=int(strike), opt_type="PE")
-                            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True)
+                            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True, expiry=expiry)
                             bar = self._bar_for_ts(series, ts)
                             if bar is None:
                                 continue
@@ -1029,7 +1357,7 @@ class BacktestingEngine:
                         symbol = f"{underlying}-{expiry}-{int(strike)}CE"
                         try:
                             instrument_key = self._resolve_option_instrument_key(underlying=underlying, expiry=expiry, strike=int(strike), opt_type="CE")
-                            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True)
+                            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True, expiry=expiry)
                             bar = self._bar_for_ts(series, ts)
                             if bar is None:
                                 continue
@@ -1050,7 +1378,23 @@ class BacktestingEngine:
 
     async def _fill_pending_orders(self, ts: dt.datetime, underlying: str) -> None:
         # Fill any ACK'd orders at the latest available (cached) price.
+        #
+        # We treat candle bars as the execution clock:
+        # - `fill_model="same_tick"`: fills can occur on the same simulated tick after latency.
+        # - `fill_model="next_tick"`: fills occur on the next bar open after latency.
+        # - `fill_price_rule="close"`: fills occur on bar close (bar_open + interval), priced at bar close.
         now = ts.astimezone(IST)
+        interval_key = str(self._bt_interval or "1minute")
+        try:
+            bar_secs = int(interval_seconds(interval_key))
+        except Exception:
+            bar_secs = 60
+        bar_delta = dt.timedelta(seconds=max(int(bar_secs), 1))
+
+        rule = str(getattr(self, "fill_price_rule", "auto") or "auto").strip().lower()
+        close_rule = rule in {"close", "candle_close", "bar_close"}
+        next_open_rule = rule in {"next_tick", "next_open", "next_bar_open"}
+
         for order in list(getattr(self.oms, "_orders", {}).values()):
             if not isinstance(order, Order):
                 continue
@@ -1060,20 +1404,48 @@ class BacktestingEngine:
             if oid and oid not in self._order_signal_ts:
                 self._order_signal_ts[oid] = now
                 self._order_signal_tick_idx[oid] = int(self._sim_tick_index)
+                self._order_signal_bar_open[oid] = self._bar_open_floor_ist(now, bar_secs)
             remaining = max(int(order.qty) - int(order.filled_qty), 0)
             if remaining <= 0:
                 continue
 
+            fill_price: Optional[float] = None
             if oid:
                 signal_ts = self._order_signal_ts.get(oid, now)
-                signal_idx = int(self._order_signal_tick_idx.get(oid, int(self._sim_tick_index)))
-                if self.execution.fill_model == FILL_MODEL_NEXT_TICK and int(self._sim_tick_index) <= signal_idx:
-                    continue
-                if self.execution.latency_ms > 0:
-                    if now < (signal_ts + dt.timedelta(milliseconds=int(self.execution.latency_ms))):
-                        continue
+                latency_ms = int(self.execution.latency_ms or 0)
+                eligible_ts = signal_ts + dt.timedelta(milliseconds=latency_ms) if latency_ms > 0 else signal_ts
 
-            fill_price = self._fill_price(order.symbol, ts, underlying)
+                if close_rule:
+                    eligible_bar_open = self._bar_open_floor_ist(eligible_ts, bar_secs)
+                    fill_at = eligible_bar_open + bar_delta
+                    if now != fill_at:
+                        continue
+                    fill_price = self._bar_price(
+                        order.symbol,
+                        bar_open_ist=eligible_bar_open,
+                        underlying=underlying,
+                        kind="close",
+                    )
+                elif self.execution.fill_model == FILL_MODEL_NEXT_TICK or next_open_rule:
+                    signal_bar_open = self._order_signal_bar_open.get(oid) or self._bar_open_floor_ist(signal_ts, bar_secs)
+                    next_after_signal = signal_bar_open + bar_delta
+                    eligible_open = self._bar_open_ceil_ist(eligible_ts, bar_secs)
+                    fill_at = max(next_after_signal, eligible_open)
+                    if now != fill_at:
+                        continue
+                    fill_price = self._bar_price(
+                        order.symbol,
+                        bar_open_ist=fill_at,
+                        underlying=underlying,
+                        kind="open",
+                    )
+                else:
+                    if now < eligible_ts:
+                        continue
+                    fill_price = self._fill_price(order.symbol, ts, underlying)
+            else:
+                fill_price = self._fill_price(order.symbol, ts, underlying)
+
             if fill_price is None:
                 continue
 
@@ -1110,10 +1482,22 @@ class BacktestingEngine:
             return float(self._last_spot.get(underlying.upper(), 0.0) or 0.0)
         try:
             instrument_key = self._resolve_option_instrument_key(underlying=u, expiry=expiry, strike=int(strike), opt_type=opt)
-            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True)
+            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=True, expiry=expiry)
             bar = self._bar_for_ts(series, ts)
             if bar is None:
                 self._warn_once(f"fill_price_missing: {sym} ts={ts.astimezone(IST).isoformat()}")
+                return None
+            rule = str(getattr(self, "fill_price_rule", "auto") or "auto").strip().lower()
+            if rule in {"close", "candle_close", "bar_close"}:
+                return float(bar.close)
+            if rule in {"open", "candle_open", "bar_open"}:
+                return float(bar.open)
+            if rule in {"next_open", "next_bar_open"}:
+                idx = bisect_right(series.ts_list, int(bar.ts))
+                if 0 <= idx < len(series.ts_list):
+                    next_bar = series.bars_by_ts.get(series.ts_list[idx])
+                    if next_bar is not None:
+                        return float(next_bar.open)
                 return None
             ltp, _, _ = self._ltp_from_bar(bar, ts)
             return float(ltp)
@@ -1150,7 +1534,12 @@ class BacktestingEngine:
             return remaining
 
         try:
-            series = self._load_series(instrument_key, self._bt_interval or "1minute", is_option=is_option)
+            series = self._load_series(
+                instrument_key,
+                self._bt_interval or "1minute",
+                is_option=is_option,
+                expiry=expiry if is_option else None,
+            )
             bar = self._bar_for_ts(series, ts)
         except Exception:
             bar = None
@@ -1163,7 +1552,15 @@ class BacktestingEngine:
         avail = self._liquidity_remaining.get(key)
         if avail is None:
             vol_int = int(float(bar.volume) or 0.0)
-            avail = vol_int if vol_int > 0 else -1
+            if vol_int > 0:
+                try:
+                    pr = float(getattr(self, "participation_rate", 1.0) or 1.0)
+                except Exception:
+                    pr = 1.0
+                pr = max(min(pr, 1.0), 0.0)
+                avail = int(float(vol_int) * pr)
+            else:
+                avail = -1
             self._liquidity_remaining[key] = avail
 
         if avail < 0:
@@ -1208,10 +1605,23 @@ class BacktestingEngine:
 
         if not self._has_pending_orders():
             return
-        if self.execution.fill_model != FILL_MODEL_NEXT_TICK and int(self.execution.latency_ms or 0) <= 0:
+        rule = str(getattr(self, "fill_price_rule", "auto") or "auto").strip().lower()
+        schedule_needs_bar_boundary = rule in {"close", "candle_close", "bar_close", "next_tick", "next_open", "next_bar_open"}
+        if self.execution.fill_model != FILL_MODEL_NEXT_TICK and int(self.execution.latency_ms or 0) <= 0 and not schedule_needs_bar_boundary:
             return
+
+        now = ts.astimezone(IST)
         bump_ms = max(int(self.execution.latency_ms or 0), 1)
-        bump_ts = ts + dt.timedelta(milliseconds=bump_ms)
+        bump_candidate = now + dt.timedelta(milliseconds=bump_ms)
+        bump_ts = bump_candidate
+        if self.execution.fill_model == FILL_MODEL_NEXT_TICK or schedule_needs_bar_boundary:
+            interval_key = str(self._bt_interval or "1minute")
+            try:
+                bar_secs = int(interval_seconds(interval_key))
+            except Exception:
+                bar_secs = 60
+            bump_ts = self._bar_open_ceil_ist(bump_candidate, bar_secs)
+
         self._sim_tick_index += 1
         with travel(bump_ts):
             await self._fill_pending_orders(bump_ts, underlying)
@@ -1273,17 +1683,48 @@ class BacktestingEngine:
             trade_fees = float(state.fees) - prev_fees
             last_realized_by_key[key] = float(state.realized)
             last_fees_by_key[key] = float(state.fees)
-            trade_log.append(
-                {
-                    "symbol": exec_obj.symbol,
-                    "opened_at": state.opened_at,
-                    "closed_at": state.closed_at,
-                    "realized_pnl": trade_realized,
-                    "gross_pnl": trade_realized,
-                    "fees": trade_fees,
-                    "net_pnl": trade_realized - trade_fees,
-                }
-            )
+            trade_row: Dict[str, Any] = {
+                "symbol": exec_obj.symbol,
+                "opened_at": state.opened_at,
+                "closed_at": state.closed_at,
+                "realized_pnl": trade_realized,
+                "gross_pnl": trade_realized,
+                "fees": trade_fees,
+                "net_pnl": trade_realized - trade_fees,
+            }
+
+            # Enrich trades with strategy-level grouping tags when available.
+            try:
+                order = self.store.find_order_by_client_id(str(exec_obj.order_id))
+                strategy_text = str(order.get("strategy") or "") if order else ""
+                if strategy_text:
+                    from engine.backtest.options_runner import parse_strategy_tag  # local import
+
+                    parsed = parse_strategy_tag(strategy_text)
+                    if parsed:
+                        trade_row["strategy_trade_id"] = parsed.get("strategy_trade_id")
+                        trade_row["leg_id"] = parsed.get("leg_id")
+                        trade_row["exit_reason"] = parsed.get("reason")
+                        stid = str(parsed.get("strategy_trade_id") or "").strip()
+                        leg_id = str(parsed.get("leg_id") or "").strip()
+                        if stid and leg_id:
+                            trade_row["trade_id"] = f"{stid}:{leg_id}"
+                        if leg_id:
+                            try:
+                                from engine.backtest.strategy_spec import BacktestRunSpec  # local import
+
+                                spec_obj = getattr(self, "strategy_spec", None)
+                                if isinstance(spec_obj, BacktestRunSpec):
+                                    leg_spec = next((l for l in spec_obj.legs if str(l.leg_id) == leg_id), None)
+                                    if leg_spec is not None:
+                                        trade_row["leg_role"] = str(getattr(leg_spec, "leg_role", "") or "").strip().lower() or "main"
+                            except Exception:
+                                # Keep backward compatible: leg_role is optional for analytics.
+                                pass
+            except Exception:
+                pass
+
+            trade_log.append(trade_row)
 
     def _load_orders_table(self) -> List[Dict[str, Any]]:
         try:
@@ -1582,5 +2023,113 @@ def _execution_from_fill_event(event: Dict[str, Any]) -> PnLExecution:
         strike=strike,
         opt_type=opt_type,
     )
+
+
+def _aggregate_strategy_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Group per-leg `trade_log` rows into StockMock-style strategy trades.
+
+    Each leg trade row may contain:
+      - strategy_trade_id
+      - leg_id
+      - exit_reason
+    """
+
+    def _coerce_ts(value: Any) -> Optional[dt.datetime]:
+        if value is None:
+            return None
+        if isinstance(value, dt.datetime):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            ts = dt.datetime.fromisoformat(text)
+        except Exception:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=IST)
+        return ts
+
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in trades:
+        stid = str(row.get("strategy_trade_id") or "").strip()
+        if not stid:
+            continue
+        opened_at = _coerce_ts(row.get("opened_at"))
+        closed_at = _coerce_ts(row.get("closed_at"))
+        gross = row.get("gross_pnl")
+        if gross is None:
+            gross = row.get("realized_pnl") or 0.0
+        fees = row.get("fees") or 0.0
+        net = row.get("net_pnl")
+        if net is None:
+            net = float(gross or 0.0) - float(fees or 0.0)
+        leg_id = str(row.get("leg_id") or "").strip()
+        symbol = str(row.get("symbol") or "").strip()
+        exit_reason = str(row.get("exit_reason") or "").strip()
+
+        g = groups.get(stid)
+        if g is None:
+            trade_date = None
+            if len(stid) >= 10:
+                maybe_date = stid[:10]
+                try:
+                    dt.date.fromisoformat(maybe_date)
+                    trade_date = maybe_date
+                except Exception:
+                    trade_date = None
+            g = {
+                "strategy_trade_id": stid,
+                "trade_date": trade_date,
+                "opened_at": opened_at,
+                "closed_at": closed_at,
+                "gross_pnl": 0.0,
+                "fees": 0.0,
+                "net_pnl": 0.0,
+                "legs": 0,
+                "_leg_ids": set(),
+                "_symbols": set(),
+                "_exit_reasons": set(),
+            }
+            groups[stid] = g
+
+        if opened_at is not None:
+            if g.get("opened_at") is None or (isinstance(g.get("opened_at"), dt.datetime) and opened_at < g["opened_at"]):
+                g["opened_at"] = opened_at
+        if closed_at is not None:
+            if g.get("closed_at") is None or (isinstance(g.get("closed_at"), dt.datetime) and closed_at > g["closed_at"]):
+                g["closed_at"] = closed_at
+
+        g["gross_pnl"] = float(g.get("gross_pnl") or 0.0) + float(gross or 0.0)
+        g["fees"] = float(g.get("fees") or 0.0) + float(fees or 0.0)
+        g["net_pnl"] = float(g.get("net_pnl") or 0.0) + float(net or 0.0)
+        g["legs"] = int(g.get("legs") or 0) + 1
+        if leg_id:
+            g["_leg_ids"].add(leg_id)
+        if symbol:
+            g["_symbols"].add(symbol)
+        if exit_reason:
+            g["_exit_reasons"].add(exit_reason)
+
+    out: List[Dict[str, Any]] = []
+    for stid, g in groups.items():
+        leg_ids = sorted(list(g.pop("_leg_ids", set())))
+        symbols = sorted(list(g.pop("_symbols", set())))
+        reasons = sorted(list(g.pop("_exit_reasons", set())))
+        g["leg_ids"] = leg_ids
+        g["symbols"] = symbols
+        if reasons:
+            g["exit_reason"] = reasons[0] if len(reasons) == 1 else "MIXED"
+            g["exit_reasons"] = reasons
+        out.append(g)
+
+    def _sort_key(item: Dict[str, Any]) -> tuple:
+        opened = _coerce_ts(item.get("opened_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        return (item.get("trade_date") or "", opened, item.get("strategy_trade_id") or "")
+
+    out.sort(key=_sort_key)
+    return out
+
 
 __all__ = ["BacktestingEngine", "BacktestResult", "SimBroker"]

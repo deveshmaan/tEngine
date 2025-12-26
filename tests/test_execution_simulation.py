@@ -71,12 +71,13 @@ async def test_fill_model_next_tick_delays_fill_ts(monkeypatch: pytest.MonkeyPat
     try:
         data = [
             {"ts": dt.datetime(2024, 1, 2, 9, 15, tzinfo=IST), "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1000},
+            {"ts": dt.datetime(2024, 1, 2, 9, 16, tzinfo=IST), "open": 101, "high": 101, "low": 101, "close": 101, "volume": 1000},
         ]
         res = await engine.run_backtest_async("DummyStrategy", dt.date(2024, 1, 2), dt.date(2024, 1, 2), data=data, interval="1minute")
         executions = res.get("executions") or []
         buy_exec = next(row for row in executions if str(row.get("side")).upper() == "BUY")
         ts = dt.datetime.fromisoformat(str(buy_exec["ts"]))
-        assert ts.astimezone(IST).replace(microsecond=0).time() == dt.time(9, 15, 15)
+        assert ts.astimezone(IST).replace(microsecond=0).time() == dt.time(9, 16, 0)
     finally:
         engine.close()
 

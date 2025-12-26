@@ -15,8 +15,8 @@ from strategy.base import BaseStrategy
 
 
 def test_apply_spread_worsens_in_trade_direction() -> None:
-    assert apply_spread(100.0, "BUY", 10.0) == pytest.approx(100.1)
-    assert apply_spread(100.0, "SELL", 10.0) == pytest.approx(99.9)
+    assert apply_spread(100.0, "BUY", 10.0) == pytest.approx(100.05)
+    assert apply_spread(100.0, "SELL", 10.0) == pytest.approx(99.95)
 
 
 def test_apply_slippage_bps_and_ticks() -> None:
