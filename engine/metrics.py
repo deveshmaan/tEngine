@@ -118,6 +118,7 @@ class EngineMetrics:
             self.strategy_iv_percentile = _NoOpMetric()
             self.strategy_oi_trend = _NoOpMetric()
             self.strategy_selected_strike = _NoOpMetric()
+            self.multi_strategy_intents_total = _NoOpMetric()
             self.exit_at_pct_config = _NoOpMetric()
             self.scalping_signals_total = _NoOpMetric()
             self.scalping_trades_total = _NoOpMetric()
@@ -245,6 +246,12 @@ class EngineMetrics:
         self.strategy_last_eval_ts = Gauge("strategy_last_eval_ts", "Epoch seconds of last strategy evaluation", **registry_kwargs)
         self.strategy_evals_total = Counter("strategy_evals_total", "Total number of strategy evaluations", **registry_kwargs)
         self.strategy_entry_signals_total = Counter("strategy_entry_signals_total", "Strategy entry signals emitted", **registry_kwargs)
+        self.multi_strategy_intents_total = Counter(
+            "multi_strategy_intents_total",
+            "Multi-strategy intent lifecycle events",
+            ["strategy_id", "status"],
+            **registry_kwargs,
+        )
         self.market_data_stale_dropped_total = Counter(
             "market_data_stale_dropped_total",
             "Ticks dropped because they exceeded max_tick_age_seconds",

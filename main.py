@@ -18,7 +18,7 @@ from engine.alerts import configure_alerts, notify_incident
 from engine.broker import UpstoxBroker
 from engine.config import EngineConfig, IST
 from engine.config_sanity import ConfigError, sanity_check_config
-from engine.data import pick_strike_from_spot, pick_subscription_expiry, record_tick_seen, resolve_weekly_expiry
+from engine.data import get_app_config, pick_strike_from_spot, pick_subscription_expiry, record_tick_seen, resolve_weekly_expiry
 from engine.events import EventBus
 from engine.fees import load_fee_config
 from engine.instruments import InstrumentResolver
@@ -135,23 +135,41 @@ class EngineApp:
             metrics=self.metrics,
             iv_exit_threshold=getattr(config.strategy, "iv_exit_percentile", 0.0),
         )
-        tag = getattr(config, "strategy_tag", "").lower()
-        if tag == "advanced-buy":
-            strategy_cls = AdvancedBuyStrategy
-        elif tag == "scalping-buy":
-            strategy_cls = ScalpingBuyStrategy
+        raw_cfg = get_app_config()
+        ms_cfg = raw_cfg.get("multi_strategy") if isinstance(raw_cfg, dict) else None
+        ms_enabled = bool(isinstance(ms_cfg, dict) and ms_cfg.get("enabled", False))
+        if ms_enabled:
+            from engine.multi_strategy_executor import MultiStrategyExecutor
+
+            self.strategy = MultiStrategyExecutor(
+                config,
+                self.risk,
+                self.oms,
+                self.bus,
+                self.exit_engine,
+                self.instrument_cache,
+                self.metrics,
+                subscription_expiry_provider=self._subscription_expiry_for,
+                app_config=raw_cfg,
+            )
         else:
-            strategy_cls = IntradayBuyStrategy
-        self.strategy = strategy_cls(
-            config,
-            self.risk,
-            self.oms,
-            self.bus,
-            self.exit_engine,
-            self.instrument_cache,
-            self.metrics,
-            subscription_expiry_provider=self._subscription_expiry_for,
-        )
+            tag = getattr(config, "strategy_tag", "").lower()
+            if tag == "advanced-buy":
+                strategy_cls = AdvancedBuyStrategy
+            elif tag == "scalping-buy":
+                strategy_cls = ScalpingBuyStrategy
+            else:
+                strategy_cls = IntradayBuyStrategy
+            self.strategy = strategy_cls(
+                config,
+                self.risk,
+                self.oms,
+                self.bus,
+                self.exit_engine,
+                self.instrument_cache,
+                self.metrics,
+                subscription_expiry_provider=self._subscription_expiry_for,
+            )
         self.fee_config = load_fee_config()
         self.pnl = PnLCalculator(self.store, self.fee_config)
         configure_alerts(config.alerts.throttle_seconds)

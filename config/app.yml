@@ -52,6 +52,64 @@ strategy:
   pcr_range: [0.3, 5.0]
   spread_max_pct: 0.08
 
+# Multi-strategy (BUY-only, intraday). Disabled by default for backwards compatibility.
+multi_strategy:
+  enabled: false
+  parallel: false
+  max_workers: 0
+  allow_straddle: false
+  max_global_positions: 1
+  signal_gates:
+    delta_min: 0.25
+    delta_max: 0.55
+    spread_pct_max: 0.08
+    iv_zscore_max: 0.0
+    iv_percentile_min: 0.0
+    oi_percentile_min: 0.0
+  strategies:
+    - id: "orb"
+      import: "strategy.strategies.orb:OpeningRangeBreakoutStrategy"
+      enabled: true
+      params:
+        range_minutes: 15
+        breakout_margin_points: 5
+      risk:
+        max_positions: 1
+        cooldown_seconds: 300
+        max_premium_per_trade: 12000
+        risk_percent_per_trade: 0.12
+    - id: "vwap_pullback"
+      import: "strategy.strategies.vwap_pullback:VWAPPullbackContinuationStrategy"
+      enabled: true
+      params:
+        band_pct: 0.001
+      risk:
+        max_positions: 1
+        cooldown_seconds: 180
+        max_premium_per_trade: 12000
+        risk_percent_per_trade: 0.12
+    - id: "oi_covering"
+      import: "strategy.strategies.oi_covering:OICoveringMomentumStrategy"
+      enabled: true
+      params:
+        window_steps: 6
+      risk:
+        max_positions: 1
+        cooldown_seconds: 180
+        max_premium_per_trade: 12000
+        risk_percent_per_trade: 0.12
+    - id: "iv_expansion"
+      import: "strategy.strategies.iv_expansion:IVExpansionBreakoutStrategy"
+      enabled: true
+      params:
+        lookback_ticks: 60
+        iv_pct_max: 0.9
+      risk:
+        max_positions: 1
+        cooldown_seconds: 300
+        max_premium_per_trade: 12000
+        risk_percent_per_trade: 0.12
+
 banknifty:
   vol_breakout_mult: 1.2
 

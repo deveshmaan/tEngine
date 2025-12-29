@@ -4,13 +4,14 @@ import asyncio
 import gzip
 import json
 import random
+import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from engine.data import record_tick_seen
 from engine.events import EventBus
-from engine.time_machine import travel
+from engine.time_machine import install_now_provider
 from persistence import SQLiteStore
 
 try:  # Optional numpy seeding if available
@@ -49,24 +50,35 @@ async def replay(cfg: ReplayConfig) -> str:
     events = await _load_events(cfg)
     events.sort(key=lambda evt: evt["ts"])
     prev_ts: Optional[str] = None
-    for event in events:
-        ts_str = event["ts"]
-        delay = 0.0
-        if prev_ts:
-            delta = _seconds_between(prev_ts, ts_str)
-            delay = delta / cfg.speed if cfg.speed > 0 else 0.0
-        prev_ts = ts_str
-        if delay > 0:
-            await asyncio.sleep(delay)
-        payload = event.get("payload") or {}
-        with travel(ts_str):
+    current_ts: Optional[dt.datetime] = None
+    # Freeze engine clock to the last replayed timestamp so async consumers remain deterministic.
+    install_now_provider(lambda: current_ts or dt.datetime.now(dt.timezone.utc))
+    try:
+        for event in events:
+            ts_str = event["ts"]
+            delay = 0.0
+            if prev_ts:
+                delta = _seconds_between(prev_ts, ts_str)
+                delay = delta / cfg.speed if cfg.speed > 0 else 0.0
+            prev_ts = ts_str
+            if delay > 0:
+                await asyncio.sleep(delay)
+            payload = event.get("payload") or {}
+            current_ts = _parse_ts(ts_str)
             try:
-                ts_val = _parse_ts(ts_str).timestamp()
-                record_tick_seen(instrument_key=payload.get("instrument_key") or payload.get("instrument"), underlying=payload.get("underlying") or payload.get("symbol"), ts_seconds=ts_val)
+                record_tick_seen(
+                    instrument_key=payload.get("instrument_key") or payload.get("instrument"),
+                    underlying=payload.get("underlying") or payload.get("symbol"),
+                    ts_seconds=current_ts.timestamp(),
+                )
             except Exception:
                 pass
             await _BUS.publish("market/events", event)
-            _STORE.record_market_event(event["type"], payload, ts=_parse_ts(ts_str))
+            _STORE.record_market_event(event["type"], payload, ts=current_ts)
+            # Yield so consumers can process at the current frozen timestamp.
+            await asyncio.sleep(0)
+    finally:
+        install_now_provider(lambda: dt.datetime.now(dt.timezone.utc))
     return _STORE.run_id
 
 

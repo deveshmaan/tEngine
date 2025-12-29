@@ -268,15 +268,15 @@ class RiskManager:
                 pass
         return qty
 
-    def budget_ok_for(self, order: OrderBudget) -> bool:
+    def budget_ok_for(self, order: OrderBudget, *, now: Optional[dt.datetime] = None) -> bool:
         side = order.side.upper()
-        now_dt = self._now()
+        now_dt = self._effective_now(now)
         now_time = now_dt.time().replace(tzinfo=None)
         if side == "BUY" and now_time >= self.cfg.no_new_entries_after:
             self._emit_event("ENTRY_WINDOW", f"Entry window closed at {self.cfg.no_new_entries_after}", order.symbol)
             return False
 
-        if side == "BUY" and self.should_halt():
+        if side == "BUY" and self.should_halt(now=now_dt):
             self._emit_event("HALT", "Kill switch engaged", order.symbol)
             return False
 
@@ -322,6 +322,22 @@ class RiskManager:
 
         return True
 
+    def _effective_now(self, now: Optional[dt.datetime]) -> dt.datetime:
+        """Return a timezone-aware IST timestamp for time-based gating.
+
+        `now` is an optional override (used by replay / simulation paths).
+        """
+
+        value = now if now is not None else self._now()
+        if value.tzinfo is None:
+            return value.replace(tzinfo=IST)
+        return value.astimezone(IST)
+
+    def premium_exposure(self) -> float:
+        """Current open premium notional (₹) across all open positions."""
+
+        return float(self._premium_exposure())
+
     def _update_risk_metrics(self) -> None:
         """Update exposure gauges for open lots, premium, and square-off timer."""
 
@@ -351,8 +367,9 @@ class RiskManager:
         except Exception:
             return
 
-    def should_halt(self) -> bool:
-        if self._now().time().replace(tzinfo=None) >= self.cfg.square_off_by:
+    def should_halt(self, *, now: Optional[dt.datetime] = None) -> bool:
+        now_dt = self._effective_now(now)
+        if now_dt.time().replace(tzinfo=None) >= self.cfg.square_off_by:
             self._halt_reason = self._halt_reason or "SQUARE_OFF_TIME"
             self._kill_switch = True
         return self._kill_switch
