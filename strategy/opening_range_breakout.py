@@ -113,6 +113,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self._orb_start_time: Optional[dt.datetime] = None
         self._orb_end_time: Optional[dt.datetime] = None
         self._orb_established = False
+        self._session_date: Optional[dt.date] = None
         self._orb_tradeable = True
         self._above_range_triggered = False
         self._below_range_triggered = False
@@ -130,6 +131,31 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
 
         self._last_option_prices: dict[str, float] = {}
         self._last_option_ts: dict[str, dt.datetime] = {}
+
+    def _reset_session(self, ts: dt.datetime) -> None:
+        """Reset ORB state for a new trading date."""
+
+        self._session_date = ts.date()
+        self._orb_high = None
+        self._orb_low = None
+        self._orb_start_time = None
+        self._orb_end_time = None
+        self._orb_established = False
+        self._orb_tradeable = True
+        self._above_range_triggered = False
+        self._below_range_triggered = False
+        self._cum_volume = 0.0
+        self._cum_price_volume = 0.0
+        self._last_underlying_volume = None
+        self._current_minute_volume = 0.0
+        self._current_minute_start = None
+        self._orb_volume = 0.0
+        self._atr = _AtrTracker(self.orb_atr_period)
+        self._atr_bar_bucket = None
+        self._atr_bar = None
+        self._atr_uses_bars = False
+        self._last_option_prices.clear()
+        self._last_option_ts.clear()
 
     async def on_tick(self, event: dict) -> None:
         evt_type = event.get("type")
@@ -160,6 +186,8 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         return
 
     async def _handle_underlying_tick(self, symbol: str, price: float, ts: dt.datetime, payload: dict, evt_type: str) -> None:
+        if ts.date() != self._session_date:
+            self._reset_session(ts)
         if self._orb_start_time is None:
             market_open = ts.replace(hour=9, minute=15, second=0, microsecond=0)
             start_time = market_open if ts < market_open else ts.replace(second=0, microsecond=0)
@@ -171,6 +199,8 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
                 start=self._orb_start_time.isoformat(),
                 end=self._orb_end_time.isoformat(),
             )
+            if start_time > market_open:
+                self._logger.log_event(20, "orb_late_bootstrap", start=self._orb_start_time.isoformat())
 
         if self._orb_start_time and ts < self._orb_start_time:
             return
