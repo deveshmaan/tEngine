@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import time
+from collections import deque
 from typing import Callable, Optional
 
 from engine.config import EngineConfig
@@ -15,6 +17,49 @@ from market.instrument_cache import InstrumentCache
 from strategy.base import BaseStrategy
 
 _OPTION_MAX_AGE_SECONDS = 5.0
+
+
+class _AtrTracker:
+    def __init__(self, period: int) -> None:
+        self.period = max(int(period), 1)
+        self._prev_close: Optional[float] = None
+        self._atr: Optional[float] = None
+        self._seed: deque[float] = deque(maxlen=self.period)
+
+    def update(self, high: float, low: float, close: float) -> None:
+        if high is None or low is None or close is None:
+            return
+        prev_close = self._prev_close if self._prev_close is not None else close
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        if self._atr is None:
+            self._seed.append(tr)
+            if len(self._seed) == self.period:
+                self._atr = sum(self._seed) / float(self.period)
+        else:
+            self._atr = ((self._atr * (self.period - 1)) + tr) / float(self.period)
+        self._prev_close = close
+
+    def ready(self) -> bool:
+        return self._atr is not None
+
+    @property
+    def value(self) -> Optional[float]:
+        return self._atr
+
+
+def _atr_baseline(atr_value: float, opening_range_minutes: int) -> float:
+    return atr_value * math.sqrt(opening_range_minutes)
+
+
+def _orb_width_bounds(atr_value: float, opening_range_minutes: int, min_mult: float, max_mult: float) -> tuple[float, float]:
+    baseline = _atr_baseline(atr_value, opening_range_minutes)
+    return min_mult * baseline, max_mult * baseline
+
+
+def _dynamic_breakout_buffer(fixed: float, atr_value: Optional[float], atr_mult: float, use_atr_filter: bool) -> float:
+    if use_atr_filter and atr_value is not None:
+        return max(fixed, atr_value * atr_mult)
+    return fixed
 
 
 class OpeningRangeBreakoutStrategy(BaseStrategy):
@@ -41,12 +86,34 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         except (TypeError, ValueError):
             self.volume_surge_ratio = 1.5
         self.use_vwap_filter = bool(getattr(config.strategy, "vwap_confirmation", True))
+        try:
+            self.orb_atr_period = max(int(getattr(config.strategy, "orb_atr_period", 14)), 1)
+        except (TypeError, ValueError):
+            self.orb_atr_period = 14
+        try:
+            self.min_or_atr_mult = max(float(getattr(config.strategy, "min_or_atr_mult", 0.55)), 0.0)
+        except (TypeError, ValueError):
+            self.min_or_atr_mult = 0.55
+        try:
+            self.max_or_atr_mult = max(float(getattr(config.strategy, "max_or_atr_mult", 2.5)), 0.0)
+        except (TypeError, ValueError):
+            self.max_or_atr_mult = 2.5
+        try:
+            self.buffer_atr_mult = max(float(getattr(config.strategy, "buffer_atr_mult", 0.35)), 0.0)
+        except (TypeError, ValueError):
+            self.buffer_atr_mult = 0.35
+        try:
+            self.breakout_buffer_pts = max(float(getattr(config.strategy, "breakout_buffer_pts", 5.0)), 0.0)
+        except (TypeError, ValueError):
+            self.breakout_buffer_pts = 5.0
+        self.use_atr_filter = bool(getattr(config.strategy, "use_atr_filter", True))
 
         self._orb_high: Optional[float] = None
         self._orb_low: Optional[float] = None
         self._orb_start_time: Optional[dt.datetime] = None
         self._orb_end_time: Optional[dt.datetime] = None
         self._orb_established = False
+        self._orb_tradeable = True
         self._above_range_triggered = False
         self._below_range_triggered = False
 
@@ -56,6 +123,10 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self._current_minute_volume = 0.0
         self._current_minute_start: Optional[dt.datetime] = None
         self._orb_volume = 0.0
+        self._atr = _AtrTracker(self.orb_atr_period)
+        self._atr_bar_bucket: Optional[dt.datetime] = None
+        self._atr_bar: Optional[dict[str, float]] = None
+        self._atr_uses_bars = False
 
         self._last_option_prices: dict[str, float] = {}
         self._last_option_ts: dict[str, dt.datetime] = {}
@@ -83,12 +154,12 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         underlying = (payload.get("symbol") or payload.get("underlying") or index_symbol).upper()
         if underlying != index_symbol:
             return
-        await self._handle_underlying_tick(underlying, price, ts, payload)
+        await self._handle_underlying_tick(underlying, price, ts, payload, evt_type)
 
     async def on_fill(self, fill: dict) -> None:
         return
 
-    async def _handle_underlying_tick(self, symbol: str, price: float, ts: dt.datetime, payload: dict) -> None:
+    async def _handle_underlying_tick(self, symbol: str, price: float, ts: dt.datetime, payload: dict, evt_type: str) -> None:
         if self._orb_start_time is None:
             market_open = ts.replace(hour=9, minute=15, second=0, microsecond=0)
             start_time = market_open if ts < market_open else ts.replace(second=0, microsecond=0)
@@ -105,6 +176,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             return
 
         self._update_volume_state(price, ts, payload)
+        self._update_atr_state(price, ts, payload, evt_type)
 
         if not self._orb_established:
             if self._orb_end_time and ts < self._orb_end_time:
@@ -126,13 +198,43 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
                     low=self._orb_low,
                     ts=ts.isoformat(),
                 )
+                self._orb_tradeable = True
+                if self.use_atr_filter and self._orb_high is not None and self._orb_low is not None:
+                    atr_val = self._atr.value if self._atr.ready() else None
+                    if atr_val is None:
+                        self._logger.log_event(20, "orb_atr_not_ready")
+                    else:
+                        or_width = self._orb_high - self._orb_low
+                        min_ok, max_ok = _orb_width_bounds(
+                            atr_val,
+                            self.opening_range_minutes,
+                            self.min_or_atr_mult,
+                            self.max_or_atr_mult,
+                        )
+                        baseline = _atr_baseline(atr_val, self.opening_range_minutes)
+                        if or_width < min_ok or or_width > max_ok:
+                            self._orb_tradeable = False
+                            self._logger.log_event(
+                                20,
+                                "orb_orwidth_atr_block",
+                                or_width=or_width,
+                                atr=atr_val,
+                                baseline=baseline,
+                                min_ok=min_ok,
+                                max_ok=max_ok,
+                            )
 
         if not self._orb_established or self._orb_high is None or self._orb_low is None:
             return
 
+        if not self._orb_tradeable:
+            return
+
         has_open = self.risk.has_open_positions()
-        breakout_up = price > self._orb_high
-        breakout_down = price < self._orb_low
+        atr_val = self._atr.value if self._atr.ready() else None
+        dyn_buffer = _dynamic_breakout_buffer(self.breakout_buffer_pts, atr_val, self.buffer_atr_mult, self.use_atr_filter)
+        breakout_up = price > (self._orb_high + dyn_buffer)
+        breakout_down = price < (self._orb_low - dyn_buffer)
 
         if breakout_up and not self._above_range_triggered and not has_open:
             if not self._volume_ok(direction="up"):
@@ -165,6 +267,48 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             self.metrics.strategy_evals_total.inc()
         except Exception:
             pass
+
+    def _update_atr_state(self, price: float, ts: dt.datetime, payload: dict, evt_type: str) -> None:
+        if evt_type == "bar":
+            raw_high = payload.get("high")
+            raw_low = payload.get("low")
+            raw_close = payload.get("close")
+            if raw_high is not None and raw_low is not None and raw_close is not None:
+                try:
+                    high = float(raw_high)
+                    low = float(raw_low)
+                    close = float(raw_close)
+                except (TypeError, ValueError):
+                    high = low = close = None
+                if high is not None and low is not None and close is not None:
+                    self._atr.update(high, low, close)
+                    self._atr_uses_bars = True
+                    self._atr_bar_bucket = None
+                    self._atr_bar = None
+                    return
+        if self._atr_uses_bars:
+            return
+        bucket = ts.replace(second=0, microsecond=0)
+        if self._atr_bar_bucket is None:
+            self._atr_bar_bucket = bucket
+            self._atr_bar = {"open": price, "high": price, "low": price, "close": price}
+            return
+        if bucket == self._atr_bar_bucket:
+            bar = self._atr_bar
+            if bar is None:
+                bar = {"open": price, "high": price, "low": price, "close": price}
+                self._atr_bar = bar
+            bar["close"] = price
+            if price > bar["high"]:
+                bar["high"] = price
+            if price < bar["low"]:
+                bar["low"] = price
+            return
+        bar = self._atr_bar
+        if bar is not None:
+            self._atr.update(bar["high"], bar["low"], bar["close"])
+        self._atr_bar_bucket = bucket
+        self._atr_bar = {"open": price, "high": price, "low": price, "close": price}
 
     def _is_option_tick(self, symbol_hint: str, opt_type: str, index_symbol: str) -> bool:
         if opt_type in {"CE", "PE"}:
