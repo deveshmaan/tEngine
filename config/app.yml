@@ -51,6 +51,12 @@ strategy:
   volume_mult: 1.0
   pcr_range: [0.3, 5.0]
   spread_max_pct: 0.08
+  orb_atr_period: 14
+  min_or_atr_mult: 0.55
+  max_or_atr_mult: 2.50
+  buffer_atr_mult: 0.35
+  breakout_buffer_pts: 5.0
+  use_atr_filter: true
 
 banknifty:
   vol_breakout_mult: 1.2

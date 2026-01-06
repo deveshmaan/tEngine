@@ -408,6 +408,12 @@ class StrategyConfig:
     volume_mult: float = 1.5
     pcr_range: tuple[float, float] = (0.7, 1.3)
     spread_max_pct: float = 0.05
+    orb_atr_period: int = 14
+    min_or_atr_mult: float = 0.55
+    max_or_atr_mult: float = 2.5
+    buffer_atr_mult: float = 0.35
+    breakout_buffer_pts: float = 5.0
+    use_atr_filter: bool = True
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "StrategyConfig":
@@ -487,8 +493,29 @@ class StrategyConfig:
             spread_max_pct = float(payload.get("spread_max_pct", 0.05))
         except (TypeError, ValueError):
             spread_max_pct = 0.05
+        try:
+            orb_atr_period = int(payload.get("orb_atr_period", 14))
+        except (TypeError, ValueError):
+            orb_atr_period = 14
+        try:
+            min_or_atr_mult = float(payload.get("min_or_atr_mult", 0.55))
+        except (TypeError, ValueError):
+            min_or_atr_mult = 0.55
+        try:
+            max_or_atr_mult = float(payload.get("max_or_atr_mult", 2.5))
+        except (TypeError, ValueError):
+            max_or_atr_mult = 2.5
+        try:
+            buffer_atr_mult = float(payload.get("buffer_atr_mult", 0.35))
+        except (TypeError, ValueError):
+            buffer_atr_mult = 0.35
+        try:
+            breakout_buffer_pts = float(payload.get("breakout_buffer_pts", 5.0))
+        except (TypeError, ValueError):
+            breakout_buffer_pts = 5.0
         enable_call = bool(payload.get("enable_call_entries", True))
         enable_put = bool(payload.get("enable_put_entries", False))
+        use_atr_filter = bool(payload.get("use_atr_filter", True))
         event_path = str(payload.get("event_file_path") or "").strip() or None
         short = max(short_val, 1)
         long = max(long_val, short + 1)
@@ -512,8 +539,14 @@ class StrategyConfig:
             volume_mult=max(volume_mult, 0.0),
             pcr_range=(max(pcr_low, 0.0), max(pcr_high, 0.0)),
             spread_max_pct=max(spread_max_pct, 0.0),
+            orb_atr_period=max(orb_atr_period, 1),
+            min_or_atr_mult=max(min_or_atr_mult, 0.0),
+            max_or_atr_mult=max(max_or_atr_mult, 0.0),
+            buffer_atr_mult=max(buffer_atr_mult, 0.0),
+            breakout_buffer_pts=max(breakout_buffer_pts, 0.0),
             enable_call_entries=enable_call,
             enable_put_entries=enable_put,
+            use_atr_filter=use_atr_filter,
         )
 
 

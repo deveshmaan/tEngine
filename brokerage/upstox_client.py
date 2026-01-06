@@ -86,7 +86,7 @@ def load_upstox_credentials(secrets: Optional[object] = None) -> UpstoxConfig:
     """
 
     # token = getattr(secrets, "upstox_access_token", None) or _read_env("UPSTOX_ACCESS_TOKEN")
-    token = 'eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTM5MDJlYmJmOTZhNjUyZmExOTE2ZTYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY1MzQzOTgwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjU0MDQwMDB9.1JDa881upOPUOYvt5MKa8jg2G7s1cGjvnFRnVMNXvsM'
+    token = 'eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTVjZGUzNzQ4ZDQ1YjY3ZDRhOGZkNzUiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY3NjkzODc5LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3Njc3MzY4MDB9.yE6FYG4QL5ZCzO90KknVYJx8Dc6JwmNv_RMdPfUt7kE'
     if not token:
         raise CredentialError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     sandbox = str(os.getenv("UPSTOX_SANDBOX", "false")).lower() in {"1", "true", "yes"}
