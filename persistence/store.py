@@ -75,13 +75,14 @@ class SQLiteStore:
             ts = self._ts(order.updated_at)
             self._conn.execute(
                 """
-                INSERT INTO orders(run_id, client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id, idempotency_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO orders(run_id, client_order_id, strategy, symbol, side, qty, lot_size, price, state, last_update, broker_order_id, idempotency_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, client_order_id) DO UPDATE SET
                     strategy=excluded.strategy,
                     symbol=excluded.symbol,
                     side=excluded.side,
                     qty=excluded.qty,
+                    lot_size=excluded.lot_size,
                     price=excluded.price,
                     state=excluded.state,
                     last_update=excluded.last_update,
@@ -95,6 +96,7 @@ class SQLiteStore:
                     order.symbol,
                     order.side,
                     order.qty,
+                    order.lot_size,
                     order.limit_price,
                     order.state.value,
                     ts,
@@ -223,17 +225,19 @@ class SQLiteStore:
         opt_type: Optional[str],
         qty: int,
         avg_price: float,
+        lot_size: Optional[int],
         opened_at: dt.datetime,
         closed_at: Optional[dt.datetime],
     ) -> None:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO positions(run_id, symbol, expiry, strike, opt_type, qty, avg_price, opened_at, closed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO positions(run_id, symbol, expiry, strike, opt_type, qty, avg_price, lot_size, opened_at, closed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, symbol, expiry, strike, opt_type) DO UPDATE SET
                     qty=excluded.qty,
                     avg_price=excluded.avg_price,
+                    lot_size=excluded.lot_size,
                     opened_at=excluded.opened_at,
                     closed_at=excluded.closed_at
                 """,
@@ -245,6 +249,7 @@ class SQLiteStore:
                     opt_type,
                     qty,
                     avg_price,
+                    lot_size,
                     opened_at.isoformat(),
                     closed_at.isoformat() if closed_at else None,
                 ),
@@ -255,7 +260,7 @@ class SQLiteStore:
         with self._lock:
             cur = self._conn.execute(
                 """
-                SELECT qty, avg_price, opened_at, closed_at, expiry, strike, opt_type
+                SELECT qty, avg_price, opened_at, closed_at, expiry, strike, opt_type, lot_size
                 FROM positions
                 WHERE run_id=? AND symbol=? AND (closed_at IS NULL OR closed_at='')
                 ORDER BY id DESC
@@ -282,13 +287,14 @@ class SQLiteStore:
             "expiry": row["expiry"],
             "strike": row["strike"],
             "opt_type": row["opt_type"],
+            "lot_size": row["lot_size"],
         }
 
     def list_open_positions(self) -> List[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.execute(
                 """
-                SELECT symbol, qty, avg_price, opened_at, expiry, strike, opt_type
+                SELECT symbol, qty, avg_price, opened_at, expiry, strike, opt_type, lot_size
                 FROM positions
                 WHERE run_id=? AND (closed_at IS NULL OR closed_at='') AND ABS(qty) > 0
                 """,
@@ -310,6 +316,7 @@ class SQLiteStore:
                     "expiry": row["expiry"],
                     "strike": row["strike"],
                     "opt_type": row["opt_type"],
+                    "lot_size": row["lot_size"],
                 }
             )
         return positions
@@ -431,6 +438,42 @@ class SQLiteStore:
         )
         return [dict(row) for row in cur.fetchall()]
 
+    def list_costs_for_exec(self, exec_id: str) -> List[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT exec_id, category, amount, currency, ts, note FROM cost_ledger WHERE run_id=? AND exec_id=? ORDER BY ts",
+            (self.run_id, exec_id),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def replace_costs_for_exec(self, exec_id: str, rows: Iterable[Any], ts: Optional[dt.datetime] = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM cost_ledger WHERE run_id=? AND exec_id=?",
+                (self.run_id, exec_id),
+            )
+            stamp = self._ts(ts)
+            payload = [
+                (
+                    self.run_id,
+                    exec_id,
+                    str(row.category),
+                    float(row.amount),
+                    str(row.currency),
+                    stamp,
+                    getattr(row, "note", None),
+                )
+                for row in rows
+            ]
+            if payload:
+                self._conn.executemany(
+                    """
+                    INSERT INTO cost_ledger(run_id, exec_id, category, amount, currency, ts, note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+            self._conn.commit()
+
     def list_pnl_snapshots(self) -> List[Dict[str, Any]]:
         cur = self._conn.execute(
             "SELECT ts, realized, unrealized, fees, net, per_symbol FROM pnl_snapshots WHERE run_id=? ORDER BY ts",
@@ -481,7 +524,7 @@ class SQLiteStore:
     def load_active_orders(self) -> List[Dict[str, Any]]:
         cur = self._conn.execute(
             """
-            SELECT client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id, idempotency_key
+            SELECT client_order_id, strategy, symbol, side, qty, lot_size, price, state, last_update, broker_order_id, idempotency_key
             FROM orders
             WHERE run_id=? AND state NOT IN ('FILLED','REJECTED','CANCELED')
             """,
@@ -492,7 +535,7 @@ class SQLiteStore:
     def find_order_by_idempotency(self, key: str) -> Optional[Dict[str, Any]]:
         cur = self._conn.execute(
             """
-            SELECT client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id, idempotency_key
+            SELECT client_order_id, strategy, symbol, side, qty, lot_size, price, state, last_update, broker_order_id, idempotency_key
             FROM orders WHERE run_id=? AND idempotency_key=?
             """,
             (self.run_id, key),
@@ -503,7 +546,7 @@ class SQLiteStore:
     def find_order_by_client_id(self, client_order_id: str) -> Optional[Dict[str, Any]]:
         cur = self._conn.execute(
             """
-            SELECT client_order_id, strategy, symbol, side, qty, price, state, last_update, broker_order_id, idempotency_key
+            SELECT client_order_id, strategy, symbol, side, qty, lot_size, price, state, last_update, broker_order_id, idempotency_key
             FROM orders WHERE run_id=? AND client_order_id=?
             """,
             (self.run_id, client_order_id),

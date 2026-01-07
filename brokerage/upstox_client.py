@@ -28,7 +28,7 @@ INDEX_INSTRUMENT_KEYS = {
 class UpstoxConfig:
     access_token: str
     sandbox: bool = False
-    algo_name: str = "intraday_buy_engine"
+    algo_id: Optional[str] = None
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
 
@@ -74,6 +74,14 @@ def _read_env(name: str) -> Optional[str]:
     return text or None
 
 
+def _read_env_first(*names: str) -> Optional[str]:
+    for name in names:
+        value = _read_env(name)
+        if value:
+            return value
+    return None
+
+
 def load_upstox_credentials(secrets: Optional[object] = None) -> UpstoxConfig:
     """
     Load Upstox credentials strictly from environment variables.
@@ -81,22 +89,22 @@ def load_upstox_credentials(secrets: Optional[object] = None) -> UpstoxConfig:
     Required:
         - UPSTOX_ACCESS_TOKEN
     Optional:
-        - UPSTOX_API_KEY
-        - UPSTOX_API_SECRET
+        - UPSTOX_CLIENT_ID (preferred) or UPSTOX_API_KEY (legacy)
+        - UPSTOX_CLIENT_SECRET (preferred) or UPSTOX_API_SECRET (legacy)
     """
 
-    # token = getattr(secrets, "upstox_access_token", None) or _read_env("UPSTOX_ACCESS_TOKEN")
-    token = 'eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzR0NMM1kiLCJqdGkiOiI2OTVjZGUzNzQ4ZDQ1YjY3ZDRhOGZkNzUiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY3NjkzODc5LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3Njc3MzY4MDB9.yE6FYG4QL5ZCzO90KknVYJx8Dc6JwmNv_RMdPfUt7kE'
+    _ = secrets  # ignored: enforce env-only credential loading
+    token = _read_env("UPSTOX_ACCESS_TOKEN")
     if not token:
         raise CredentialError("UPSTOX_ACCESS_TOKEN not set; export it before running the engine.")
     sandbox = str(os.getenv("UPSTOX_SANDBOX", "false")).lower() in {"1", "true", "yes"}
-    algo_name = os.getenv("UPSTOX_ALGO_NAME", "intraday_buy_engine")
+    algo_id = _read_env("UPSTOX_ALGO_ID")
     return UpstoxConfig(
         access_token=token,
         sandbox=sandbox,
-        algo_name=algo_name,
-        api_key=getattr(secrets, "upstox_api_key", None) or _read_env("UPSTOX_API_KEY"),
-        api_secret=getattr(secrets, "upstox_api_secret", None) or _read_env("UPSTOX_API_SECRET"),
+        algo_id=algo_id,
+        api_key=_read_env_first("UPSTOX_CLIENT_ID", "UPSTOX_API_KEY"),
+        api_secret=_read_env_first("UPSTOX_CLIENT_SECRET", "UPSTOX_API_SECRET"),
     )
 
 
@@ -296,6 +304,7 @@ class UpstoxSession:
 
     def place_market_buy_stub(self, instrument_key: str, qty: int, tag: Optional[str] = None) -> dict:
         """Build a market BUY request. Only executes when sandbox mode is enabled."""
+        algo_id = self._cfg.algo_id
         body = upstox_client.PlaceOrderV3Request(
             instrument_token=instrument_key,
             transaction_type="BUY",
@@ -307,11 +316,14 @@ class UpstoxSession:
             trigger_price=0.0,
             is_amo=False,
             slice=False,
-            tag=tag or self._cfg.algo_name,
+            tag=tag or "intraday_buy_engine",
         )
         if self._api_client.configuration.sandbox:
             logging.info("[SANDBOX BUY] %s qty=%s", instrument_key, qty)
-            resp = self.order_api_v3.place_order(body, algo_name=self._cfg.algo_name)
+            if algo_id:
+                resp = self.order_api_v3.place_order(body, algo_id=algo_id)
+            else:
+                resp = self.order_api_v3.place_order(body)
             return resp.to_dict() if hasattr(resp, "to_dict") else resp
         logging.info("[DRY-RUN BUY] %s qty=%s", instrument_key, qty)
         return {"status": "dry-run", "request": body.to_dict()}

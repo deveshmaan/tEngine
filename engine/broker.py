@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import os
 import random
 import threading
 import time
@@ -49,7 +50,7 @@ except Exception:  # pragma: no cover
 
     def set_underlying_last_ts(instrument: str, ts_seconds: float): ...
 
-from brokerage.upstox_client import InvalidDateError, PlacedOrder, UpstoxConfig, UpstoxSession, normalize_place_order_response
+from brokerage.upstox_client import INDEX_INSTRUMENT_KEYS, InvalidDateError, PlacedOrder, UpstoxConfig, UpstoxSession, normalize_place_order_response
 from engine.config import BrokerConfig, CONFIG, IST
 from engine.data import record_tick_seen
 from engine.data import normalize_date, pick_subscription_expiry, preopen_expiry_smoke, resolve_expiries_with_fallback
@@ -532,6 +533,7 @@ class UpstoxBroker:
         self._token_refresh_cb = token_refresh_cb
         self._subscriptions: set[str] = set()
         self._subscription_meta: dict[str, dict[str, str]] = {}
+        self._subscription_last_seen: dict[str, float] = {}
         self._watchdog: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._logger = get_logger("UpstoxBroker")
@@ -635,6 +637,39 @@ class UpstoxBroker:
             raise RuntimeError(f"Unable to extract spot price for {symbol_up}")
         self._last_spot[symbol_up] = price
         return price
+
+    async def fetch_ltp(self, instrument_key: str) -> Optional[float]:
+        key = str(instrument_key or "").strip()
+        if not key:
+            return None
+        try:
+            resp = await self._rest_call(
+                "quote",
+                "ltp",
+                lambda session: session.get_ltp(key),
+                context={"instrument_key": key},
+            )
+        except Exception:
+            return None
+        data: Any = resp
+        if isinstance(resp, Mapping):
+            data = resp.get("data") or resp.get("ltp") or resp
+        entry: Any = None
+        if isinstance(data, Mapping):
+            entry = data.get(key) if key in data else next(iter(data.values()), None)
+        elif isinstance(data, list):
+            entry = data[0] if data else None
+        else:
+            entry = data
+        if isinstance(entry, Mapping):
+            raw = entry.get("ltp") or entry.get("last_price") or entry.get("close") or entry.get("price")
+        else:
+            raw = entry
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return val if val > 0 else None
 
     async def _subscribe_current_weekly(self, symbol: str) -> None:
         """
@@ -780,10 +815,15 @@ class UpstoxBroker:
             "qty": order.qty,
             "client_order_id": order.client_order_id,
         }
+        def _place(session):
+            algo_id = getattr(session.config, "algo_id", None)
+            if algo_id:
+                return session.order_api_v3.place_order(payload, algo_id=algo_id)
+            return session.order_api_v3.place_order(payload)
         resp = await self._rest_call(
             "place",
             "submit_order",
-            lambda session: session.order_api_v3.place_order(payload, algo_name=session.config.algo_name),
+            _place,
             context=context,
         )
         placed = normalize_place_order_response(resp)
@@ -852,17 +892,43 @@ class UpstoxBroker:
                 continue
             ordered_tokens.append(clean)
             new_set.add(clean)
-        removed = self._subscriptions - new_set
-        self._subscriptions = new_set
-        self._apply_subscription_metadata(new_set, overrides)
+        must_subscribe = self._must_subscribe_keys()
+        candidate_set = new_set | must_subscribe
+        if self._stream_mode == "full_d30" and len(candidate_set) > FULL_D30_LIMIT_PER_USER:
+            candidate_set = self._apply_subscription_cap(candidate_set, must_subscribe)
+        ordered_kept: list[str] = []
+        seen: set[str] = set()
+        for token in ordered_tokens:
+            if token in candidate_set and token not in seen:
+                ordered_kept.append(token)
+                seen.add(token)
+        for token in must_subscribe:
+            if token in candidate_set and token not in seen:
+                ordered_kept.append(token)
+                seen.add(token)
+        for token in candidate_set:
+            if token not in seen:
+                ordered_kept.append(token)
+                seen.add(token)
+        removed = self._subscriptions - candidate_set
+        self._subscriptions = candidate_set
+        self._apply_subscription_metadata(candidate_set, overrides)
         self._emit_subscription_metrics(removed, active=False)
-        self._emit_subscription_metrics(new_set, active=True)
+        self._emit_subscription_metrics(candidate_set, active=True)
         if not self._stream:
             return
-        await self._subscribe_batches(ordered_tokens, mode=self._stream_mode)
+        await self._subscribe_batches(ordered_kept, mode=self._stream_mode)
         if not self._watchdog and not self._starting:
             await self.start()
         self._last_ws_heartbeat = time.monotonic()
+
+    async def ensure_position_subscription(self, symbol: str) -> None:
+        key = self._resolve_instrument_key(symbol)
+        if not key:
+            return
+        if key in self._subscriptions:
+            return
+        await self.subscribe_marketdata(list(self._subscriptions | {key}))
 
     # ------------------------------------------------------------------ helpers
     def _build_rate_limits(self) -> dict[str, TokenBucket]:
@@ -886,6 +952,112 @@ class UpstoxBroker:
                 overrides[token] = meta
         return normalized, overrides
 
+    def _must_subscribe_keys(self) -> set[str]:
+        required = set()
+        required.update(self._index_subscription_keys())
+        required.update(self._position_subscription_keys())
+        return required
+
+    def _index_subscription_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for symbol in ("NIFTY", "BANKNIFTY"):
+            key = None
+            if self.instrument_cache:
+                try:
+                    key = self.instrument_cache.resolve_index_key(symbol)
+                except Exception:
+                    key = None
+            key = key or INDEX_INSTRUMENT_KEYS.get(symbol)
+            if key:
+                keys.add(str(key))
+        return keys
+
+    def _position_subscription_keys(self) -> set[str]:
+        keys: set[str] = set()
+        if not self._risk:
+            return keys
+        try:
+            positions = self._risk.store.list_open_positions()
+        except Exception:
+            positions = []
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "")
+            key = self._resolve_instrument_key(symbol)
+            if key:
+                keys.add(key)
+        return keys
+
+    def _resolve_instrument_key(self, symbol: str) -> Optional[str]:
+        if not symbol:
+            return None
+        if "|" in symbol:
+            return symbol
+        if self._resolver:
+            try:
+                meta = self._resolver.metadata_for(symbol)
+            except Exception:
+                meta = None
+            if meta and getattr(meta, "instrument_key", None):
+                return str(meta.instrument_key)
+        parsed = self._parse_symbol(symbol)
+        if parsed and self.instrument_cache:
+            underlying, expiry, strike, opt_type = parsed
+            try:
+                return self.instrument_cache.lookup(underlying, expiry, strike, opt_type)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _parse_symbol(symbol: str) -> Optional[tuple[str, str, float, str]]:
+        parts = symbol.split("-")
+        if len(parts) < 3:
+            return None
+        expiry = "-".join(parts[1:-1])
+        tail = parts[-1]
+        opt_type = tail[-2:].upper() if tail[-2:].upper() in {"CE", "PE"} else "CE"
+        strike_part = tail[:-2] if opt_type in {"CE", "PE"} else tail
+        try:
+            strike = float(strike_part)
+        except (TypeError, ValueError):
+            return None
+        return parts[0].upper(), expiry, strike, opt_type
+
+    def _apply_subscription_cap(self, tokens: set[str], protected: set[str]) -> set[str]:
+        if len(tokens) <= FULL_D30_LIMIT_PER_USER:
+            return tokens
+        if len(protected) >= FULL_D30_LIMIT_PER_USER:
+            self._logger.warning("subscription_cap_exceeded", count=len(tokens), protected=len(protected))
+            return set(list(protected)[:FULL_D30_LIMIT_PER_USER])
+        keep_slots = FULL_D30_LIMIT_PER_USER - len(protected)
+        candidates = [token for token in tokens if token not in protected]
+        now = time.time()
+
+        def _score(token: str) -> tuple[float, float]:
+            meta = self._subscription_meta.get(token)
+            if not meta:
+                meta = self._subscription_metadata_for(token)
+                self._subscription_meta[token] = meta
+            symbol = str(meta.get("symbol") or "")
+            strike_val = meta.get("strike")
+            distance = float("inf")
+            try:
+                spot = self._last_spot.get(symbol.upper())
+                if spot is not None and strike_val not in (None, ""):
+                    distance = abs(float(strike_val) - float(spot))
+            except (TypeError, ValueError):
+                distance = float("inf")
+            last_seen = self._subscription_last_seen.get(token, 0.0)
+            age = now - last_seen if last_seen else float("inf")
+            return (distance, age)
+
+        candidates.sort(key=_score)
+        kept = set(candidates[:keep_slots])
+        return protected | kept
+
+    def _record_subscription_seen(self, instrument_key: str, ts_seconds: Optional[float] = None) -> None:
+        self._subscription_last_seen[instrument_key] = float(ts_seconds or time.time())
+
     async def _subscribe_batches(self, tokens: Sequence[str], *, mode: Optional[str] = None) -> None:
         if not self._stream or not tokens:
             return
@@ -893,7 +1065,10 @@ class UpstoxBroker:
         stream_mode = mode or self._stream_mode
         for idx in range(0, len(tokens), batch_size):
             batch = list(tokens[idx : idx + batch_size])
-            await self._stream.subscribe(batch, stream_mode)
+            try:
+                await self._stream.subscribe(batch, stream_mode)
+            except TypeError:
+                await self._stream.subscribe(batch)
 
     def _coerce_subscription_entry(self, entry: Any) -> tuple[str, dict[str, str]]:
         token = ""
@@ -1149,6 +1324,13 @@ class UpstoxBroker:
             oi = self._coerce_float(market_ff.get("oi") or payload.get("oi"))
             iv = self._coerce_float(market_ff.get("iv") or payload.get("iv"))
             record_tick_seen(instrument_key=instrument_key, underlying=symbol or self._subscription_meta.get(instrument_key, {}).get("symbol"), ts_seconds=ts_seconds)
+            if symbol and expiry and strike and opt_type:
+                try:
+                    option_symbol = f"{symbol}-{expiry}-{int(strike)}{opt_type}"
+                    record_tick_seen(instrument_key=option_symbol, ts_seconds=ts_seconds)
+                except Exception:
+                    pass
+            self._record_subscription_seen(instrument_key, ts_seconds)
             stale = False
             if self._max_tick_age > 0:
                 stale = (time.time() - float(ts_seconds or time.time())) > self._max_tick_age
@@ -1228,6 +1410,7 @@ class UpstoxBroker:
         sym = self._underlying_symbol_for(instrument_key, payload)
         self._last_spot[sym.upper()] = ltp
         record_tick_seen(instrument_key=instrument_key, underlying=sym, ts_seconds=ts_seconds)
+        self._record_subscription_seen(instrument_key, ts_seconds)
         stale = False
         if self._max_tick_age > 0:
             stale = (time.time() - float(ts_seconds or time.time())) > self._max_tick_age
@@ -1400,6 +1583,13 @@ class UpstoxBroker:
             )
             record_tick_seen(instrument_key=key, underlying=symbol, ts_seconds=ts_seconds)
             try:
+                if symbol and expiry and strike_val not in ("", None) and opt_type:
+                    option_symbol = f"{symbol}-{expiry}-{int(float(strike_val))}{opt_type}"
+                    record_tick_seen(instrument_key=option_symbol, ts_seconds=ts_seconds)
+            except Exception:
+                pass
+            self._record_subscription_seen(key, ts_seconds)
+            try:
                 set_market_data_stale(key, 0)
             except Exception:
                 pass
@@ -1431,6 +1621,7 @@ class UpstoxBroker:
         )
         sym = self._underlying_symbol_for(key, payload)
         record_tick_seen(instrument_key=key, underlying=sym, ts_seconds=ts_seconds)
+        self._record_subscription_seen(key, ts_seconds)
         try:
             set_market_data_stale(key, 0)
         except Exception:
@@ -1717,7 +1908,8 @@ class UpstoxBroker:
 
     @staticmethod
     def _default_session_factory(token: Optional[str]) -> UpstoxSession:
-        cfg = UpstoxConfig(access_token=token, sandbox=False) if token else None  # type: ignore[arg-type]
+        algo_id = os.getenv("UPSTOX_ALGO_ID")
+        cfg = UpstoxConfig(access_token=token, sandbox=False, algo_id=algo_id) if token else None  # type: ignore[arg-type]
         return UpstoxSession(cfg)
 
     async def _notify_ws_failure(self, failures: int) -> None:

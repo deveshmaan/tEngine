@@ -1,4 +1,5 @@
 import datetime as dt
+from typing import Optional
 import json
 from pathlib import Path
 
@@ -23,7 +24,7 @@ class _DiscoveryOnlySession:
     def __init__(self) -> None:
         self.calls: list[dict[str, str | None]] = []
 
-    def get_option_contracts(self, instrument_key: str, expiry_date: str | None = None):
+    def get_option_contracts(self, instrument_key: str, expiry_date: Optional[str] = None):
         self.calls.append({"instrument_key": instrument_key, "expiry_date": expiry_date})
         return {"data": []}
 
@@ -33,7 +34,7 @@ class _OverrideSession:
         self.calls: list[tuple[str, str | None]] = []
         self._valid = valid
 
-    def get_option_contracts(self, instrument_key: str, expiry_date: str | None = None):
+    def get_option_contracts(self, instrument_key: str, expiry_date: Optional[str] = None):
         self.calls.append((instrument_key, expiry_date))
         if expiry_date:
             if self._valid:
@@ -61,8 +62,8 @@ data:
   expiry_override_max_age_minutes: 120
 
 risk:
-  daily_pnl_stop: -1
-  per_symbol_loss_stop: -1
+  daily_pnl_stop: 1
+  per_symbol_loss_stop: 1
   max_open_lots: 1
   notional_premium_cap: 1
   max_order_rate: 1

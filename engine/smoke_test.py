@@ -11,6 +11,7 @@ from typing import Any, Callable, Optional
 from engine.config import EngineConfig, ExitConfig, IST, SmokeTestConfig
 from engine.data import resolve_weekly_expiry
 from engine.exit import ExitEngine
+from engine.alerts import notify_incident
 from engine.logging_utils import get_logger
 from engine.oms import FINAL_STATES, OrderState
 from engine.risk import OrderBudget
@@ -40,6 +41,7 @@ class SelectedContract:
     opt_type: str
     mid_price: float
     notional: float
+    lot_size: int
 
 
 @dataclass
@@ -227,6 +229,7 @@ def select_affordable_contract(app_ctx: Any, cfg: EngineConfig) -> Optional[Sele
     broker = getattr(app_ctx, "broker", None)
     if not cache or not broker:
         return None
+    logger = getattr(app_ctx, "logger", get_logger("SmokeTest"))
     expiry = _active_expiry(app_ctx, cfg)
     side = cfg.smoke_test.side.upper()
     try:
@@ -237,7 +240,8 @@ def select_affordable_contract(app_ctx: Any, cfg: EngineConfig) -> Optional[Sele
         quotes = broker.cached_option_quotes()
     except Exception:
         quotes = {}
-    lot_size = max(int(cfg.data.lot_step or 1), 1)
+    fallback_lot = max(int(cfg.data.lot_step or 1), 1)
+    fallback_logged: set[tuple[str, str]] = set()
     lots = max(int(cfg.smoke_test.lots or 1), 1)
     max_notional = min(float(cfg.risk.notional_premium_cap), float(cfg.smoke_test.max_notional_rupees))
     best: Optional[SelectedContract] = None
@@ -245,6 +249,23 @@ def select_affordable_contract(app_ctx: Any, cfg: EngineConfig) -> Optional[Sele
         key = str(row.get("instrument_key") or "")
         if not key:
             continue
+        try:
+            lot_size = int(row.get("lot_size") or 0)
+        except (TypeError, ValueError):
+            lot_size = 0
+        if lot_size <= 0:
+            lot_size = fallback_lot
+            sym = str(row.get("symbol") or cfg.smoke_test.underlying)
+            marker = (sym.upper(), expiry)
+            if marker not in fallback_logged:
+                fallback_logged.add(marker)
+                logger.log_event(30, "lot_size_fallback", symbol=sym, expiry=expiry, fallback=fallback_lot)
+                notify_incident(
+                    "WARN",
+                    "Lot size fallback",
+                    f"symbol={sym} expiry={expiry} lot_step={fallback_lot}",
+                    tags=["lot_size_fallback"],
+                )
         quote = quotes.get(key)
         if not quote:
             try:
@@ -277,6 +298,7 @@ def select_affordable_contract(app_ctx: Any, cfg: EngineConfig) -> Optional[Sele
             opt_type=side,
             mid_price=mid,
             notional=notional,
+            lot_size=lot_size,
         )
         if best is None or candidate.mid_price < best.mid_price:
             best = candidate
@@ -383,6 +405,7 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
         symbol = selected.symbol
         expiry = selected.expiry
         strike = selected.strike
+        lot_size = max(int(selected.lot_size or lot_size), 1)
 
         tick_size = float(getattr(config.data, "tick_size", 0.05) or 0.05)
         band_low = _coerce_float(getattr(config.data, "price_band_low", None)) or 0.0
@@ -505,6 +528,7 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
                     opt_type=cfg.side,
                     qty=qty,
                     avg_price=entry_price,
+                    lot_size=lot_size,
                     opened_at=ts_now,
                     closed_at=None,
                 )
@@ -656,6 +680,7 @@ async def run_smoke_test_once(app_ctx: Any, cfg: SmokeTestConfig) -> Optional[Sm
                     opt_type=cfg.side,
                     qty=0,
                     avg_price=exit_price or entry_price,
+                    lot_size=lot_size,
                     opened_at=state.entry_ts or ts_now,
                     closed_at=closed_ts,
                 )

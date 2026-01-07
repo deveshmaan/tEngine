@@ -1,0 +1,4 @@
+BEGIN;
+ALTER TABLE orders ADD COLUMN lot_size INTEGER;
+ALTER TABLE positions ADD COLUMN lot_size INTEGER;
+COMMIT;

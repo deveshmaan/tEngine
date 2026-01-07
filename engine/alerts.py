@@ -19,7 +19,7 @@ class AlertService:
 
     def notify(self, level: str, title: str, body: str, tags: Optional[Iterable[str]] = None) -> bool:
         now = time.monotonic()
-        if now - self._last_sent < self.throttle_seconds:
+        if self._last_sent and (now - self._last_sent) < self.throttle_seconds:
             return False
         payload = {"level": level, "title": title, "body": body, "tags": list(tags or [])}
         sent = False

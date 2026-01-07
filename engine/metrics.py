@@ -55,6 +55,7 @@ class EngineMetrics:
             self.rejects_total = self.orders_rejected_total
             self.order_latency_ms_bucketed = _NoOpMetric()
             self.exit_events_total = _NoOpMetric()
+            self.exit_rest_fallback_total = _NoOpMetric()
             self.http_401_total = _NoOpMetric()
             self.rest_retries_total = _NoOpMetric()
             self.order_timeouts_total = _NoOpMetric()
@@ -150,6 +151,7 @@ class EngineMetrics:
         self.rejects_total = self.orders_rejected_total
         self.order_latency_ms_bucketed = Histogram("order_latency_ms_bucketed", "Order latency histogram", ["operation"], **registry_kwargs)
         self.exit_events_total = Counter("exit_events_total", "Exit triggers fired", ["reason"], **registry_kwargs)
+        self.exit_rest_fallback_total = Counter("exit_rest_fallback_total", "Exit REST fallback usage", ["instrument"], **registry_kwargs)
         self.http_401_total = Counter("http_401_total", "HTTP 401 responses", **registry_kwargs)
         self.rest_retries_total = Counter("rest_retries_total", "REST retries", ["endpoint"], **registry_kwargs)
         self.order_timeouts_total = Counter("order_timeouts_total", "Orders that hit submit timeout and were retried", **registry_kwargs)

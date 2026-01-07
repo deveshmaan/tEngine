@@ -1,4 +1,5 @@
 import datetime as dt
+from typing import Optional
 
 import pytest
 
@@ -10,7 +11,7 @@ class DummyCache:
     def __init__(self, expiries):
         self._expiries = expiries
 
-    def list_expiries(self, symbol: str, kind: str | None = None):
+    def list_expiries(self, symbol: str, kind: Optional[str] = None):
         return self._expiries.get(symbol.upper(), [])
 
     def refresh_option_chain(self, symbol: str, expiry: str):

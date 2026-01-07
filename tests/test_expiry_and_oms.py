@@ -1,4 +1,5 @@
 import datetime as dt
+from typing import Optional
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,7 @@ class FakeCache:
             "BANKNIFTY": ["2024-08-07", "2024-08-14"],
         }
 
-    def list_expiries(self, symbol: str, kind: str | None = None):  # noqa: D401 - test double
+    def list_expiries(self, symbol: str, kind: Optional[str] = None):  # noqa: D401 - test double
         return list(self.expiry_map.get(symbol.upper(), []))
 
     def refresh_option_chain(self, symbol: str, expiry: str, session=None):

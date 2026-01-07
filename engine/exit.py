@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Awaitable, Callable, Deque, Dict, Optional
 
 from engine.config import ExitConfig, IST
+from engine.data import is_market_data_stale, record_tick_seen
 from engine.logging_utils import get_logger
+from engine.alerts import notify_incident
 from engine.oms import OMS
 from engine.risk import RiskManager
 from persistence import SQLiteStore
@@ -29,6 +32,8 @@ class ExitEngine:
         tick_size: float,
         metrics: Optional["EngineMetrics"] = None,
         iv_exit_threshold: float = 0.0,
+        rest_ltp_provider: Optional[Callable[[str], Awaitable[Optional[float]]]] = None,
+        max_tick_age_seconds: float = 0.0,
     ) -> None:
         self.cfg = config
         self.risk = risk
@@ -39,6 +44,12 @@ class ExitEngine:
         self._logger = get_logger("ExitEngine")
         self._risk_halt_executed = False
         self._iv_exit_threshold = max(float(iv_exit_threshold or 0.0), 0.0)
+        self._rest_ltp_provider = rest_ltp_provider
+        self._tick_stale_threshold = max(float(max_tick_age_seconds or 0.0), 0.0)
+        self._rest_last_call = 0.0
+        self._rest_last_by_instrument: Dict[str, float] = {}
+        self._rest_min_interval = 1.0
+        self._rest_per_instrument_interval = 5.0
         self._iv_history: Dict[str, Deque[float]] = {}
         self._price_history: Dict[str, Deque[float]] = {}
         self._oi_history: Dict[str, Deque[float]] = {}
@@ -61,7 +72,7 @@ class ExitEngine:
                 "target1_price": self._target_price(float(price)),
                 "trailing_stop": None,
                 "trail_anchor_price": None,
-                "trailing_active": True,
+                "trailing_active": False,
                 "partial_filled_qty": 0,
                 "pending_exit_reason": None,
                 "pending_exit_ts": None,
@@ -97,6 +108,9 @@ class ExitEngine:
         if not plan:
             return
         ts_dt = self._parse_ts(ts)
+        rest_ltp = await self._maybe_rest_ltp(instrument_key)
+        if rest_ltp is not None and rest_ltp > 0:
+            ltp = rest_ltp
         position = self.store.load_open_position(instrument_key)
         if not position or int(position["qty"]) <= 0:
             self.store.delete_exit_plan(instrument_key)
@@ -306,6 +320,36 @@ class ExitEngine:
         except Exception as exc:  # pragma: no cover - fail-safe
             self._logger.log_event(30, "exit_submit_failed", symbol=instrument, qty=qty, price=ltp, reason=reason, error=str(exc))
 
+    async def _maybe_rest_ltp(self, instrument_key: str) -> Optional[float]:
+        if not self._rest_ltp_provider or self._tick_stale_threshold <= 0:
+            return None
+        if not is_market_data_stale(instrument_key, threshold=self._tick_stale_threshold):
+            return None
+        now = time.time()
+        if self._rest_min_interval and (now - self._rest_last_call) < self._rest_min_interval:
+            return None
+        last = self._rest_last_by_instrument.get(instrument_key, 0.0)
+        if self._rest_per_instrument_interval and (now - last) < self._rest_per_instrument_interval:
+            return None
+        self._rest_last_call = now
+        self._rest_last_by_instrument[instrument_key] = now
+        try:
+            ltp = await self._rest_ltp_provider(instrument_key)
+        except Exception as exc:
+            self._logger.log_event(30, "exit_rest_ltp_failed", symbol=instrument_key, error=str(exc))
+            return None
+        if ltp is None or ltp <= 0:
+            return None
+        record_tick_seen(instrument_key=instrument_key, ts_seconds=now)
+        self._logger.log_event(30, "exit_rest_fallback", symbol=instrument_key, ltp=ltp)
+        notify_incident("WARN", "Exit REST fallback", f"symbol={instrument_key} ltp={ltp}", tags=["exit_rest_fallback"])
+        if self._metrics and hasattr(self._metrics, "exit_rest_fallback_total"):
+            try:
+                self._metrics.exit_rest_fallback_total.labels(instrument=instrument_key).inc()
+            except Exception:
+                pass
+        return float(ltp)
+
     def _initial_stop_price(self, symbol: str, entry: float) -> Optional[float]:
         pct_cfg = getattr(self.cfg, "trailing_pct", 0.0)
         if pct_cfg > 0:
@@ -497,9 +541,15 @@ class ExitEngine:
     def _oi_reversal(self, instrument: str, price: float) -> bool:
         hist = self._oi_history.get(instrument)
         prices = self._price_history.get(instrument)
-        if not hist or len(hist) < 2 or not prices or len(prices) < 2:
+        if not hist or not prices or len(prices) < 2:
             return False
-        return hist[-1] > hist[-2] and prices[-1] < prices[-2]
+        if len(hist) < 2:
+            prev_oi = 0.0
+            curr_oi = hist[-1]
+        else:
+            prev_oi = hist[-2]
+            curr_oi = hist[-1]
+        return curr_oi > prev_oi and prices[-1] < prices[-2]
 
     def _expiry_deadline(self, symbol: str, plan: Dict[str, Any], now: dt.datetime) -> Optional[dt.datetime]:
         buffer_minutes = getattr(self.cfg, "time_buffer_minutes", 0)

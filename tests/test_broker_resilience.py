@@ -57,7 +57,7 @@ class FakeOrderApi:
         self.fail_times = fail_times
         self.fail_status = fail_status
 
-    def place_order(self, payload, algo_name=None):
+    def place_order(self, payload, algo_id=None):
         self.calls += 1
         if self.calls <= self.fail_times:
             raise ApiException(status=self.fail_status, reason="transient")
@@ -76,7 +76,7 @@ class FakeOrderApi:
 class FakeSession:
     def __init__(self, api):
         self.order_api_v3 = api
-        self.config = SimpleNamespace(algo_name="test")
+        self.config = SimpleNamespace(algo_id="test")
 
 
 class FailingSession(FakeSession):

@@ -13,6 +13,7 @@ from typing import Callable, List, Optional
 from dataclasses import replace
 
 from brokerage.upstox_client import CredentialError, load_upstox_credentials
+from engine.charges import UpstoxChargesClient
 from engine import smoke_test
 from engine.alerts import configure_alerts, notify_incident
 from engine.broker import UpstoxBroker
@@ -20,7 +21,7 @@ from engine.config import EngineConfig, IST
 from engine.config_sanity import ConfigError, sanity_check_config
 from engine.data import pick_strike_from_spot, pick_subscription_expiry, record_tick_seen, resolve_weekly_expiry
 from engine.events import EventBus
-from engine.fees import load_fee_config
+from engine.fees import FeeRow, load_fee_config
 from engine.instruments import InstrumentResolver
 from engine.logging_utils import configure_logging, get_logger
 from engine.metrics import EngineMetrics, bind_global_metrics, set_subscription_expiry, start_http_server_if_available
@@ -57,6 +58,7 @@ class EngineApp:
         self.logger = get_logger("EngineApp")
         self.bus = EventBus()
         self.store = SQLiteStore(config.persistence_path, run_id=config.run_id)
+        self._lot_size_fallbacks: set[str] = set()
         probe_expiries = os.getenv("UPSTOX_ENABLE_EXPIRY_PROBE", "true").lower() in {"1", "true", "yes"}
         self.instrument_cache = InstrumentCache(
             str(config.persistence_path),
@@ -134,6 +136,8 @@ class EngineApp:
             tick_size=config.data.tick_size,
             metrics=self.metrics,
             iv_exit_threshold=getattr(config.strategy, "iv_exit_percentile", 0.0),
+            rest_ltp_provider=self.broker.fetch_ltp,
+            max_tick_age_seconds=getattr(config.market_data, "max_tick_age_seconds", 0.0),
         )
         tag = getattr(config, "strategy_tag", "").lower()
         if tag == "advanced-buy":
@@ -154,6 +158,7 @@ class EngineApp:
         )
         self.fee_config = load_fee_config()
         self.pnl = PnLCalculator(self.store, self.fee_config)
+        self.charges_client = self._init_charges_client()
         configure_alerts(config.alerts.throttle_seconds)
         self._stop = asyncio.Event()
         self._market_task: Optional[asyncio.Task] = None
@@ -329,6 +334,7 @@ class EngineApp:
             except asyncio.TimeoutError:
                 continue
             try:
+                lot_size = self._lot_size_for_symbol(str(event["symbol"]), fallback=event.get("lot_size"))
                 expiry, strike, opt_type = self._instrument_meta(str(event["symbol"]))
                 exec_obj = PnLExecution(
                     exec_id=str(event.get("exec_id") or event["order_id"]),
@@ -341,6 +347,7 @@ class EngineApp:
                     expiry=expiry,
                     strike=strike,
                     opt_type=opt_type,
+                    lot_size=lot_size,
                 )
             except (KeyError, ValueError, TypeError):
                 continue
@@ -357,10 +364,14 @@ class EngineApp:
             except Exception:
                 self.logger.log_event(30, "exit_plan_seed_failed", symbol=exec_obj.symbol)
             try:
-                lot_guess = getattr(self.cfg.data, "lot_step", 1)
-                self.risk.on_fill(symbol=exec_obj.symbol, side=exec_obj.side, qty=exec_obj.qty, price=exec_obj.price, lot_size=lot_guess)
+                self.risk.on_fill(symbol=exec_obj.symbol, side=exec_obj.side, qty=exec_obj.qty, price=exec_obj.price, lot_size=lot_size)
             except Exception:
                 pass
+            try:
+                await self.broker.ensure_position_subscription(exec_obj.symbol)
+            except Exception as exc:
+                self.logger.log_event(30, "position_subscribe_failed", symbol=exec_obj.symbol, error=str(exc))
+            self._schedule_charge_calc(exec_obj)
 
     async def _consume_market_marks(self) -> None:
         queue = await self.bus.subscribe("market/events", maxsize=500)
@@ -524,12 +535,13 @@ class EngineApp:
                 qty = int(pos.get("qty") or 0)
                 if qty <= 0:
                     continue
+                lot_size = self._lot_size_for_symbol(pos["symbol"], fallback=pos.get("lot_size"))
                 budgets.append(
                     OrderBudget(
                         symbol=pos["symbol"],
                         qty=qty,
                         price=float(pos.get("avg_price") or 0.0),
-                        lot_size=max(self.cfg.data.lot_step, 1),
+                        lot_size=lot_size,
                         side="SELL",
                     )
                 )
@@ -583,7 +595,7 @@ class EngineApp:
                     set_subscription_expiry(self.cfg.data.index_symbol, expiry_str, "current")
             strike = pick_strike_from_spot(
                 spot,
-                step=self.cfg.data.lot_step,
+                step=self._strike_step_for(self.cfg.data.index_symbol),
             )
             symbol = f"{self.cfg.data.index_symbol}-{expiry_str}-{int(strike)}CE"
             instrument_key = self._instrument_key_for_symbol(symbol)
@@ -613,6 +625,104 @@ class EngineApp:
         base = max(1.0, base + drift)
         self._last_spot = base
         return base
+
+    def _strike_step_for(self, symbol: str) -> int:
+        try:
+            step_map = getattr(self.cfg.data, "strike_steps", {}) or {}
+            step = int(step_map.get(symbol.upper(), 50))
+        except Exception:
+            step = 50
+        return max(step, 1)
+
+    def _lot_size_for_symbol(self, symbol: str, fallback: Optional[int] = None) -> int:
+        fallback_val = max(int(fallback or getattr(self.cfg.data, "lot_step", 1)), 1)
+        try:
+            meta = self.instrument_resolver.metadata_for(symbol)
+        except Exception:
+            meta = None
+        if meta and getattr(meta, "lot_size", None):
+            try:
+                return max(int(meta.lot_size), 1)
+            except (TypeError, ValueError):
+                pass
+        key = str(symbol)
+        if key not in self._lot_size_fallbacks:
+            self._lot_size_fallbacks.add(key)
+            self.logger.log_event(30, "lot_size_fallback", symbol=symbol, fallback=fallback_val)
+            notify_incident("WARN", "Lot size fallback", f"symbol={symbol} lot_step={fallback_val}", tags=["lot_size_fallback"])
+        return fallback_val
+
+    def _init_charges_client(self) -> Optional[UpstoxChargesClient]:
+        try:
+            creds = load_upstox_credentials()
+        except Exception as exc:
+            self.logger.log_event(30, "charges_client_unavailable", error=str(exc))
+            return None
+        try:
+            return UpstoxChargesClient(creds.access_token, sandbox=creds.sandbox)
+        except Exception as exc:
+            self.logger.log_event(30, "charges_client_failed", error=str(exc))
+            return None
+
+    def _schedule_charge_calc(self, exec_obj: PnLExecution) -> None:
+        if not self.charges_client:
+            return
+        task = asyncio.create_task(self._fetch_and_store_charges(exec_obj), name=f"charges-{exec_obj.exec_id}")
+        self._tasks.append(task)
+
+    async def _fetch_and_store_charges(self, exec_obj: PnLExecution) -> None:
+        instrument_token = await self._resolve_instrument_token(exec_obj)
+        if not instrument_token:
+            self.logger.log_event(30, "charges_no_instrument", exec_id=exec_obj.exec_id, symbol=exec_obj.symbol)
+            return
+        try:
+            breakdown = await asyncio.to_thread(
+                self.charges_client.get_brokerage_breakdown,
+                instrument_token,
+                int(exec_obj.qty),
+                "I",
+                str(exec_obj.side).upper(),
+                float(exec_obj.price),
+            )
+        except Exception as exc:
+            self.logger.log_event(30, "charges_fetch_failed", exec_id=exec_obj.exec_id, error=str(exc))
+            return
+        if not breakdown:
+            return
+        rows = breakdown.rows or []
+        if not rows and breakdown.total > 0:
+            rows = [FeeRow(category="total", amount=breakdown.total, note="charge_api")]
+        if not rows:
+            return
+        try:
+            self.store.replace_costs_for_exec(exec_obj.exec_id, rows, ts=exec_obj.ts)
+        except Exception as exc:
+            self.logger.log_event(30, "charges_store_failed", exec_id=exec_obj.exec_id, error=str(exc))
+            return
+        try:
+            self.pnl.reconcile_exec_charges(exec_obj.exec_id, breakdown.total)
+        except Exception as exc:
+            self.logger.log_event(30, "charges_reconcile_failed", exec_id=exec_obj.exec_id, error=str(exc))
+
+    async def _resolve_instrument_token(self, exec_obj: PnLExecution) -> Optional[str]:
+        symbol = exec_obj.symbol
+        if "|" in symbol:
+            return symbol
+        underlying = symbol.split("-")[0].upper() if "-" in symbol else symbol.upper()
+        expiry = exec_obj.expiry
+        strike = exec_obj.strike
+        opt_type = exec_obj.opt_type or "CE"
+        if expiry and strike is not None:
+            try:
+                token = self.instrument_cache.lookup(underlying, expiry, strike, opt_type)
+                if token:
+                    return token
+            except Exception:
+                pass
+        try:
+            return await self.instrument_resolver.resolve_symbol(symbol)
+        except Exception:
+            return None
 
     def _resolve_metrics_port(self) -> int:
         raw = os.getenv("METRICS_PORT", "9103")

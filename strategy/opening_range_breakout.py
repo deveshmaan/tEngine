@@ -7,6 +7,7 @@ from collections import deque
 from typing import Callable, Optional
 
 from engine.config import EngineConfig
+from engine.alerts import notify_incident
 from engine.data import pick_strike_from_spot, pick_subscription_expiry, resolve_next_expiry, resolve_weekly_expiry
 from engine.events import EventBus, OrderSignal
 from engine.exit import ExitEngine
@@ -117,6 +118,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self._orb_tradeable = True
         self._above_range_triggered = False
         self._below_range_triggered = False
+        self._lot_size_fallbacks: set[tuple[str, str]] = set()
 
         self._cum_volume = 0.0
         self._cum_price_volume = 0.0
@@ -518,7 +520,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             return 50
 
     def _resolve_lot_size(self, expiry: str, symbol: str) -> int:
-        lot = max(int(self.cfg.data.lot_step), 1)
+        fallback = max(int(self.cfg.data.lot_step), 1)
         cache = self.instrument_cache
         try:
             meta = cache.get_meta(symbol, expiry)
@@ -526,10 +528,15 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             meta = None
         if isinstance(meta, tuple) and len(meta) >= 2 and meta[1]:
             try:
-                lot = max(int(meta[1]), 1)
+                return max(int(meta[1]), 1)
             except (TypeError, ValueError):
                 pass
-        return lot
+        key = (symbol.upper(), expiry)
+        if key not in self._lot_size_fallbacks:
+            self._lot_size_fallbacks.add(key)
+            self._logger.log_event(30, "lot_size_fallback", symbol=symbol, expiry=expiry, fallback=fallback)
+            notify_incident("WARN", "Lot size fallback", f"symbol={symbol} expiry={expiry} lot_step={fallback}", tags=["lot_size_fallback"])
+        return fallback
 
     def _option_price_for(self, symbol: str, ts: dt.datetime, threshold: float) -> Optional[float]:
         price = self._last_option_prices.get(symbol)

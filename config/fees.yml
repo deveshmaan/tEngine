@@ -1,4 +1,4 @@
-brokerage_per_order: 2.0
+brokerage_per_order: 20.0 # fallback only
 exchange_txn_rate_per_turnover: 0.0009
 sebi_rate_per_turnover: 0.000001
 gst_rate_on_services: 0.18

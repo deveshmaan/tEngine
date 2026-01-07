@@ -3,7 +3,7 @@ import datetime as dt
 import pytest
 from upstox_client.rest import ApiException
 
-from engine.config import IST
+from engine.config import IST, EngineConfig
 from engine import data as data_mod
 from engine.data import pick_strike_from_spot, resolve_next_expiry
 from market.instrument_cache import InstrumentCache
@@ -168,6 +168,11 @@ def test_weekly_fallback_to_monthly(instrument_cache):
 def test_pick_strike_rounding():
     assert pick_strike_from_spot(spot=22654, step=50) == 22650
     assert pick_strike_from_spot(spot=48765, step=100) == 48800
+
+
+def test_banknifty_strike_step_default():
+    cfg = EngineConfig.load()
+    assert cfg.data.strike_steps.get("BANKNIFTY") == 100
 
 
 def test_refresh_expiry_recovers_after_invalid_date(tmp_path, monkeypatch):

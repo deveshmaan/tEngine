@@ -55,12 +55,14 @@ def compute_position_size(
         return 0
     if capital <= 0 or pct <= 0 or premium_val <= 0 or lot <= 0:
         return 0
+    if stop_pct <= 0 or stop_pct >= 1:
+        return 0
     risk_fraction = pct / 100.0
     budget = capital * risk_fraction
-    per_lot_cost = premium_val * lot
-    if budget <= 0 or per_lot_cost <= 0:
+    per_lot_risk = premium_val * lot * stop_pct
+    if budget <= 0 or per_lot_risk <= 0:
         return 0
-    lots = int(budget // per_lot_cost)
+    lots = int(budget // per_lot_risk)
     if max_open_lots is not None:
         try:
             remaining = max(float(max_open_lots) - float(open_lots), 0.0)
@@ -180,7 +182,6 @@ class RiskManager:
 
     # ----------------------------------------------------------------- updates
     def on_fill(self, *, symbol: str, side: str, qty: int, price: float, lot_size: int) -> None:
-        prev_state = self._positions.get(symbol)
         state = self._positions.setdefault(symbol, PositionState(lot_size=max(lot_size, 1)))
         signed_qty = qty if side.upper() == "BUY" else -qty
         prev_qty = state.net_qty
@@ -210,7 +211,7 @@ class RiskManager:
 
         self._positions[symbol] = state
 
-        if prev_state and prev_state.net_qty > 0 and state.net_qty == 0:
+        if prev_qty > 0 and state.net_qty == 0:
             trade_pnl = state.realized_pnl
             self._trades_executed_today += 1
             if trade_pnl < 0:
@@ -573,14 +574,13 @@ class RiskManager:
 
     def _evaluate_limits(self, symbol: str) -> None:
         total_pnl = self._total_pnl()
-        # daily_pnl_stop is expected to be negative (loss stop). Trigger when total PnL breaches it.
-        if self.cfg.daily_pnl_stop < 0 and total_pnl <= self.cfg.daily_pnl_stop:
+        if self.cfg.daily_pnl_stop > 0 and total_pnl <= -self.cfg.daily_pnl_stop:
             self.trigger_kill("DAILY_STOP")
         state = self._positions.get(symbol)
         if not state:
             return
         symbol_pnl = state.realized_pnl + state.mark_to_market()
-        if symbol_pnl <= -self.cfg.per_symbol_loss_stop:
+        if self.cfg.per_symbol_loss_stop > 0 and symbol_pnl <= -self.cfg.per_symbol_loss_stop:
             self.trigger_kill(f"SYMBOL_STOP:{symbol}")
 
     def _total_pnl(self) -> float:
