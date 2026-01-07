@@ -8,6 +8,7 @@ This tree lists only the files involved in running the trading engine so it can 
 ├── requirements.txt
 ├── run_stack.sh
 ├── Readme.md
+├── .env.example
 ├── config
 │   ├── app.yml
 │   └── fees.yml
@@ -15,7 +16,8 @@ This tree lists only the files involved in running the trading engine so it can 
 │   └── prometheus.yml
 ├── docs
 │   ├── engine_flow.svg
-│   └── repo_structure.md  (this file)
+│   ├── repo_structure.md  (this file)
+│   └── setup.md
 ├── brokerage
 │   └── upstox_client.py
 ├── market
@@ -24,14 +26,28 @@ This tree lists only the files involved in running the trading engine so it can 
 ├── persistence
 │   ├── __init__.py
 │   ├── db.py
+│   ├── schema_migrations
+│   │   ├── 001_base_schema.sql
+│   │   ├── 003_add_costs_metrics.sql
+│   │   ├── 004_positions_unique.sql
+│   │   ├── 005_exit_plans.sql
+│   │   └── 006_add_lot_size_columns.sql
 │   └── store.py
+├── strategy
+│   ├── advanced_buy.py
+│   ├── momentum.py
+│   ├── opening_range_breakout.py
+│   └── scalping_buy.py
 └── engine
     ├── __init__.py
     ├── alerts.py
     ├── broker.py
+    ├── charges.py
     ├── config.py
+    ├── config_sanity.py
     ├── data.py
     ├── events.py
+    ├── exit.py
     ├── fees.py
     ├── instruments.py
     ├── logging_utils.py
@@ -41,6 +57,7 @@ This tree lists only the files involved in running the trading engine so it can 
     ├── recovery.py
     ├── replay.py
     ├── risk.py
+    ├── smoke_test.py
     └── time_machine.py
 ```
 
@@ -49,7 +66,7 @@ This tree lists only the files involved in running the trading engine so it can 
 ```
 streamlit_app.py
 grafana/
-└── dashboard.json
+└── dashboard_buy.json
 ```
 
 Copy the snippet above into ChatGPT Pro to give it an accurate view of the engine’s active modules without including unused or legacy files.

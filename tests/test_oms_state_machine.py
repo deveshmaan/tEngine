@@ -30,7 +30,12 @@ class _DummyStore(SQLiteStore):
 
 
 def _oms():
-    return OMS(broker=_StubBroker(), store=_DummyStore(), config=type("C", (), {"max_inflight_orders": 10, "resubmit_backoff": 0.1, "reconciliation_interval": 1.0, "submit": type("S", (), {"default": "market", "max_spread_ticks": 1, "depth_threshold": 0})})())
+    return OMS(
+        broker=_StubBroker(),
+        store=_DummyStore(),
+        config=type("C", (), {"max_inflight_orders": 10, "resubmit_backoff": 0.1, "reconciliation_interval": 1.0, "submit": type("S", (), {"default": "market", "max_spread_ticks": 1, "depth_threshold": 0})})(),
+        default_meta=(0.05, 1, 0.0, 0.0),
+    )
 
 
 @pytest.mark.asyncio

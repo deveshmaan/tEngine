@@ -1,4 +1,5 @@
 import datetime as dt
+from typing import Optional
 
 import pytest
 
@@ -15,7 +16,7 @@ class DummyRisk:
         self._halt_reason = reason
         return []
 
-    def halt_reason(self) -> str | None:
+    def halt_reason(self) -> Optional[str]:
         return self._halt_reason
 
     def should_halt(self) -> bool:
@@ -49,7 +50,7 @@ def _engine(tmp_path, cfg: ExitConfig) -> tuple[ExitEngine, SQLiteStore, DummyOM
 
 
 def _seed_position(store: SQLiteStore, symbol: str, qty: int, price: float, ts: dt.datetime) -> None:
-    store.upsert_position(symbol=symbol, expiry=None, strike=None, opt_type=None, qty=qty, avg_price=price, opened_at=ts, closed_at=None)
+    store.upsert_position(symbol=symbol, expiry=None, strike=None, opt_type=None, qty=qty, avg_price=price, lot_size=1, opened_at=ts, closed_at=None)
 
 
 @pytest.mark.asyncio

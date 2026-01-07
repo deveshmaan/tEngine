@@ -9,8 +9,8 @@ from persistence import SQLiteStore
 
 def _risk(tmp_path, **overrides) -> RiskManager:
     base = dict(
-        daily_pnl_stop=-10000,
-        per_symbol_loss_stop=-5000,
+        daily_pnl_stop=10000,
+        per_symbol_loss_stop=5000,
         max_open_lots=10,
         notional_premium_cap=1_000_000,
         max_order_rate=100,

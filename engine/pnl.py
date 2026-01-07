@@ -22,6 +22,7 @@ class Execution:
     expiry: Optional[str] = None
     strike: Optional[float] = None
     opt_type: Optional[str] = None
+    lot_size: Optional[int] = None
     venue: str = "SIM"
 
 
@@ -45,6 +46,7 @@ class PositionState:
     last_price: Optional[float] = None
     opened_at: Optional[dt.datetime] = None
     closed_at: Optional[dt.datetime] = None
+    lot_size: Optional[int] = None
 
     @property
     def net_qty(self) -> int:
@@ -68,6 +70,8 @@ class PnLCalculator:
         self._positions: Dict[Tuple[str, Optional[str], Optional[float], Optional[str]], PositionState] = {}
         self._total_fees = 0.0
         self._total_realized = 0.0
+        self._fees_by_exec: Dict[str, float] = {}
+        self._exec_keys: Dict[str, Tuple[str, Optional[str], Optional[float], Optional[str]]] = {}
 
     def on_execution(self, exec: Execution) -> None:
         key = (exec.symbol, exec.expiry, exec.strike, exec.opt_type)
@@ -75,13 +79,22 @@ class PnLCalculator:
             key,
             PositionState(symbol=exec.symbol, expiry=exec.expiry, strike=exec.strike, opt_type=exec.opt_type),
         )
+        self._exec_keys[exec.exec_id] = key
+        if exec.lot_size:
+            state.lot_size = exec.lot_size
         state.opened_at = state.opened_at or exec.ts
-        fees = fees_for_execution(exec, self.fee_config)
-        fee_total = sum(row.amount for row in fees)
-        for row in fees:
-            self.store.record_cost(exec.exec_id, category=row.category, amount=row.amount, currency=row.currency, note=row.note, ts=exec.ts)
+        existing_costs = self.store.list_costs_for_exec(exec.exec_id)
+        if existing_costs:
+            fee_total = sum(float(row.get("amount") or 0.0) for row in existing_costs)
+        else:
+            fees = fees_for_execution(exec, self.fee_config)
+            fee_total = sum(row.amount for row in fees)
+            for row in fees:
+                note = row.note or "fallback_fee_estimate"
+                self.store.record_cost(exec.exec_id, category=row.category, amount=row.amount, currency=row.currency, note=note, ts=exec.ts)
         state.fees += fee_total
         self._total_fees += fee_total
+        self._fees_by_exec[exec.exec_id] = fee_total
         realized = self._apply_fifo(state, exec)
         state.realized += realized
         self._total_realized += realized
@@ -97,9 +110,28 @@ class PnLCalculator:
             opt_type=state.opt_type,
             qty=state.net_qty,
             avg_price=state.avg_price,
+            lot_size=state.lot_size,
             opened_at=state.opened_at or exec.ts,
             closed_at=state.closed_at,
         )
+
+    def reconcile_exec_charges(self, exec_id: str, total_charges: float) -> None:
+        if exec_id not in self._fees_by_exec:
+            return
+        prev = self._fees_by_exec.get(exec_id, 0.0)
+        try:
+            total_val = float(total_charges)
+        except (TypeError, ValueError):
+            return
+        delta = total_val - prev
+        if abs(delta) <= 0:
+            self._fees_by_exec[exec_id] = total_val
+            return
+        key = self._exec_keys.get(exec_id)
+        if key and key in self._positions:
+            self._positions[key].fees += delta
+        self._total_fees += delta
+        self._fees_by_exec[exec_id] = total_val
 
     def mark_to_market(self, quotes: Dict[str, float]) -> None:
         for state in self._positions.values():

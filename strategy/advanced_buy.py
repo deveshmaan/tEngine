@@ -13,6 +13,7 @@ import yaml
 
 from engine.config import EngineConfig
 from engine.data import pick_strike_from_spot, pick_subscription_expiry, resolve_next_expiry
+from engine.alerts import notify_incident
 from engine.events import EventBus, OrderSignal
 from engine.logging_utils import get_logger
 from engine.metrics import EngineMetrics
@@ -78,6 +79,7 @@ class AdvancedBuyStrategy(BaseStrategy):
         self._oi_history: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=4))
         self._last_option_price: dict[str, float] = {}
         self._last_option_ts: dict[str, dt.datetime] = {}
+        self._lot_size_fallbacks: set[tuple[str, str]] = set()
         self._last_underlying_price: dict[str, float] = {}
         self._prev_underlying_price: dict[str, float] = {}
 
@@ -538,7 +540,7 @@ class AdvancedBuyStrategy(BaseStrategy):
             return max(int(self.cfg.data.lot_step), 1)
 
     def _resolve_lot_size(self, expiry: str, symbol: str) -> int:
-        lot = max(int(self.cfg.data.lot_step), 1)
+        fallback = max(int(self.cfg.data.lot_step), 1)
         cache = self.instrument_cache
         try:
             meta = cache.get_meta(symbol, expiry)
@@ -546,10 +548,15 @@ class AdvancedBuyStrategy(BaseStrategy):
             meta = None
         if isinstance(meta, tuple) and len(meta) >= 2 and meta[1]:
             try:
-                lot = max(int(meta[1]), 1)
+                return max(int(meta[1]), 1)
             except (TypeError, ValueError):
                 pass
-        return lot
+        key = (symbol.upper(), expiry)
+        if key not in self._lot_size_fallbacks:
+            self._lot_size_fallbacks.add(key)
+            self._logger.log_event(30, "lot_size_fallback", symbol=symbol, expiry=expiry, fallback=fallback)
+            notify_incident("WARN", "Lot size fallback", f"symbol={symbol} expiry={expiry} lot_step={fallback}", tags=["lot_size_fallback"])
+        return fallback
 
     def _record_option_observations(self, instrument: str, payload: dict, price: float, ts: dt.datetime) -> None:
         if not instrument:

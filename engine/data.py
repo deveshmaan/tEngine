@@ -218,6 +218,8 @@ def normalize_date(value: object) -> str:
     text = str(value).strip()
     if not text:
         raise ValueError("Date must be in YYYY-MM-DD format")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        raise ValueError(f"Date must be in YYYY-MM-DD format: {text}")
     if re.search(r"[T\s/:+]", text):
         raise ValueError(f"Date must be in YYYY-MM-DD format: {text}")
     try:

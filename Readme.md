@@ -20,7 +20,7 @@ Set `PROM_URL` if the Prometheus endpoint is not running on `127.0.0.1:9103`.
 ### Grafana
 
 1. Add a Prometheus datasource that points to your server.
-2. Import `grafana/dashboard.json`.
+2. Import `grafana/dashboard_buy.json`.
 3. Replace the placeholder datasource UID (`__PROM_DS__`) with your Prometheus datasource.
 
 The dashboard includes widgets for PnL, risk halts, order/latency trends, and per-instrument telemetry (LTP, IV, IV z-score).
@@ -50,26 +50,31 @@ Then point Grafana’s Prometheus datasource at the Prometheus server (default `
 
 ## Environment variables
 
+- `UPSTOX_CLIENT_ID` – OAuth client ID (preferred)
+- `UPSTOX_CLIENT_SECRET` – OAuth client secret (preferred)
+- `UPSTOX_REDIRECT_URI` – OAuth redirect URL
 - `UPSTOX_ACCESS_TOKEN` – OAuth token pulled after login
+- `UPSTOX_ALGO_ID` – optional algo header for order placement
 - `UNDERLYING` – `NIFTY` (default) or `BANKNIFTY`
 - `DRY_RUN` – `true` (default) keeps the engine in simulation mode
 - `MARKET_STREAM_MODE` – set to `full_d30` if your Upstox Plus/Pro plan exposes deeper market-data; otherwise leave at the default `full`
 
 ## Security & Credentials
 
-- **Never** commit API keys or OAuth tokens. All broker and analytics credentials (Upstox, AngelOne, Finvasia, OpenAI) are now loaded through environment variables (see `CredentialTo/CredentialToBrokerAPI.py`). Rotate any previously exposed keys before running the engine.
-- Export `UPSTOX_ACCESS_TOKEN`, `UPSTOX_API_KEY`, etc. via a secrets manager (`direnv`, `1Password CLI`, `aws secretsmanager`, etc.) before running `main.py`.
+- **Never** commit API keys or OAuth tokens. All broker and analytics credentials (Upstox, AngelOne, Finvasia, OpenAI) are loaded through environment variables (see `.env.example` and `docs/setup.md`). Rotate any previously exposed keys before running the engine.
+- Export `UPSTOX_ACCESS_TOKEN`, `UPSTOX_CLIENT_ID`, etc. via a secrets manager (`direnv`, `1Password CLI`, `aws secretsmanager`, etc.) before running `main.py`.
 - The engine refuses to connect without `UPSTOX_ACCESS_TOKEN`, keeping the repo compliant with Upstox/NSE audits.
 - Optional static-IP hardening: set `ALLOWED_IPS` (comma-separated) or `allowed_ips` in `config/app.yml`. The broker will abort startup if the current public IP is not whitelisted. See `docs/setup.md` for the full env checklist.
+- Secret scanning: install pre-commit and run gitleaks locally (`pre-commit install`, `pre-commit run --all-files`). CI runs the same scan on push/PR.
 
 ## Engine Workflow (BUY-side)
 
-1. **Market data** – `MarketDataHub` subscribes to Upstox `MarketDataStreamerV3`, caching LTP, Greeks, spreads, implied volatility, and open interest (OI) per strike. Data older than `MAX_TICK_AGE_S` is rejected.
-2. **Signal stack** – `SignalEngine` enforces:
+1. **Market data** – `UpstoxBroker` streams `MarketDataStreamerV3` ticks, while `InstrumentCache` tracks contracts/expiries. Stale ticks are flagged via `max_tick_age_seconds`.
+2. **Signal stack** – Strategy classes (`AdvancedBuyStrategy`, `ScalpingBuyStrategy`, `OpeningRangeBreakoutStrategy`) enforce:
    - Delta window (`0.25–0.55`), spot-momentum bias, and Zerodha Varsity spread discipline (absolute and % of premium).
    - IV sanity (z-score band) plus a rolling IV percentile gate inspired by Kaushik/Gurjar breakout playbooks.
    - OI percentile filters so BUY orders align with fresh writer covering (per NSE option-chain advisories and the `Nifty_Bank_Option_Strategies_Booklet`).
-3. **Execution** – `OrderManager` places pegged BUY limits (or market orders) using the official `upstox-python-sdk`. Stops/targets from the trade plan are persisted in `RiskManager`, and `_evaluate_exits` fires MARKET exits once LTP penetrates the guardrails.
+3. **Execution** – `OMS` places orders using the official `upstox-python-sdk`. `ExitEngine` manages stops/targets and uses REST LTP fallback when streaming is stale.
 4. **Risk & Ledger** – Every fill updates SQLite (`engine_state.sqlite`), Prometheus metrics, and the daily realized PnL used by `RiskManager` to halt trading at drawdown/profit caps.
 5. **Monitoring** – Streamlit + Grafana dashboards ingest metrics such as IV percentile, OI percentile, last exit reason, and risk halts.
 
@@ -104,6 +109,13 @@ The script:
 - Automatically frees default ports (Prometheus 9090, Streamlit 8502, metrics exporter 9103). Override them via `PROM_PORT`, `STREAMLIT_PORT`, or `METRICS_PORT` if you need different bindings.
 
 Override binaries/paths by exporting `PROM_BIN`, `PROM_CONFIG`, or `PROM_STORAGE` before running the script.
+
+## Operational Checklist
+
+- Copy `.env.example` to `.env` and set the required Upstox variables.
+- Install pre-commit and enable gitleaks scanning (`pre-commit install`).
+- Start the stack with `./run_stack.sh` or run `python main.py`.
+- Launch the UI with `streamlit run streamlit_app.py` and (optionally) Grafana + Prometheus.
 
 ## Tests
 

@@ -39,3 +39,20 @@ def test_entry_cutoff_blocks_new_orders(tmp_path):
     budget = OrderBudget(symbol="NIFTY-EXP-20000", qty=50, price=200.0, lot_size=50, side="BUY")
     assert not risk.budget_ok_for(budget)
     assert store.list_risk_events()[-1]["code"] == "ENTRY_WINDOW"
+
+
+def test_position_size_uses_stop_loss_pct(tmp_path):
+    store = SQLiteStore(tmp_path / "risk.sqlite", run_id="test-run")
+    cfg = RiskLimits(
+        daily_pnl_stop=1000,
+        per_symbol_loss_stop=600,
+        max_open_lots=5,
+        notional_premium_cap=50000,
+        max_order_rate=10,
+        no_new_entries_after=dt.time(15, 10),
+        square_off_by=dt.time(15, 22),
+        risk_percent_per_trade=1.0,
+    )
+    risk = RiskManager(cfg, store, capital_base=100000)
+    qty = risk.position_size(premium=200.0, lot_size=50, stop_loss_pct=0.1)
+    assert qty == 50

@@ -25,6 +25,17 @@ LOG = logging.getLogger(__name__)
 _EXPIRY_SOURCE_CODES = {"contracts": 0, "instruments": 1, "override": 2}
 
 
+def _is_invalid_date_error(exc: Exception) -> bool:
+    if isinstance(exc, InvalidDateError):
+        return True
+    if isinstance(exc, ApiException):
+        body = getattr(exc, "body", "") or ""
+        text = body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else str(body)
+        if "UDAPI1088" in text or "Invalid date" in text:
+            return True
+    return False
+
+
 def _underlying_key(symbol: str) -> str:
     symbol_upper = symbol.upper()
     if symbol_upper == "NIFTY":
@@ -231,19 +242,41 @@ class InstrumentCache:
         session = session or self._ensure_session()
         key = self.resolve_index_key(symbol)
         self._logger.debug("Refreshing option chain for %s expiry %s (key=%s)", symbol, expiry, key)
+        attempts: set[str] = set()
         contracts: Tuple[Dict[str, object], ...] = tuple()
         payload: Optional[Dict[str, object]] = None
-        try:
-            payload = session.get_option_contracts(key, expiry)
-        except ApiException:
-            payload = None
-        if payload:
-            contracts = self._parse_option_chain(payload)
-        if not contracts:
-            payload = session.get_option_chain(key, expiry)
-            contracts = self._parse_option_chain(payload)
-        if not contracts:
-            return 0
+        while True:
+            if expiry in attempts:
+                return 0
+            attempts.add(expiry)
+            try:
+                payload = session.get_option_contracts(key, expiry)
+            except Exception as exc:
+                if _is_invalid_date_error(exc):
+                    fallback = self._fallback_next_expiry(symbol, expiry)
+                    if fallback:
+                        expiry = fallback
+                        continue
+                    return 0
+                payload = None
+            if payload:
+                contracts = self._parse_option_chain(payload)
+            if not contracts:
+                try:
+                    payload = session.get_option_chain(key, expiry)
+                except Exception as exc:
+                    if _is_invalid_date_error(exc):
+                        fallback = self._fallback_next_expiry(symbol, expiry)
+                        if fallback:
+                            expiry = fallback
+                            continue
+                        return 0
+                    self._logger.warning("Option chain fetch failed for %s %s: %s", symbol, expiry, exc)
+                    return 0
+                contracts = self._parse_option_chain(payload)
+            if not contracts:
+                return 0
+            break
         now = self._now_str()
         rows = []
         for item in contracts:
@@ -627,8 +660,11 @@ class InstrumentCache:
         inc_expiry_attempt("contracts")
         try:
             payload = session.get_option_contracts(key)
-        except InvalidDateError:
-            LOG.warning("OptionContracts discovery failed for %s; falling back to instruments", symbol)
+        except Exception as exc:
+            if _is_invalid_date_error(exc):
+                LOG.warning("OptionContracts discovery failed for %s; falling back to instruments", symbol)
+            else:
+                LOG.warning("OptionContracts discovery failed for %s: %s", symbol, exc)
         else:
             expiries = _extract_expiries_from_contracts_payload(payload)
             if expiries:
@@ -655,6 +691,14 @@ class InstrumentCache:
                     inc_expiry_override_used()
                     source_code = _EXPIRY_SOURCE_CODES["override"]
 
+        if not expiries and self._enable_remote_expiry_probe:
+            inc_expiry_attempt("guess")
+            expiries = self._guess_future_expiries()
+            if expiries:
+                LOG.warning("Using guessed expiries for %s", symbol)
+                inc_expiry_success("guess")
+                source_code = _EXPIRY_SOURCE_CODES["override"]
+
         if not expiries:
             raise RuntimeError("Broker returned no expiries for %s" % symbol)
 
@@ -676,6 +720,21 @@ class InstrumentCache:
         if self._is_meta_fresh(self._contracts_meta(symbol, expiry), CONTRACT_TTL_SECONDS):
             return
         self.refresh_expiry(symbol, expiry)
+
+    def _fallback_next_expiry(self, symbol: str, current: str) -> Optional[str]:
+        try:
+            self._refresh_expiries(symbol)
+        except Exception as exc:
+            self._logger.warning("Failed to refresh expiries after invalid date for %s: %s", symbol, exc)
+            return None
+        try:
+            expiries = self.list_expiries(symbol)
+        except Exception:
+            return None
+        for exp in expiries:
+            if exp != current:
+                return exp
+        return None
 
     def _extract_expiries(self, payload: Dict[str, object]) -> List[str]:
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -701,6 +760,23 @@ class InstrumentCache:
 
     def _normalize_date_str(self, value: str) -> str:
         return normalize_date(value)
+
+    def _guess_future_expiries(self, weeks: int = 6, months: int = 3) -> List[str]:
+        try:
+            count = max(int(weeks), 0)
+        except Exception:
+            count = 6
+        now = dt.datetime.now(IST).date()
+        weekday = self._weekly_expiry_weekday
+        days_ahead = (weekday - now.weekday()) % 7
+        first = now + dt.timedelta(days=days_ahead)
+        expiries: List[str] = []
+        for idx in range(count):
+            candidate = first + dt.timedelta(days=7 * idx)
+            while candidate in self._holidays:
+                candidate -= dt.timedelta(days=1)
+            expiries.append(candidate.isoformat())
+        return sorted(set(expiries))
 
     def _parse_option_chain(self, payload: Dict[str, object]) -> Tuple[Dict[str, object], ...]:
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -787,6 +863,18 @@ class InstrumentCache:
         expiries: List[str] = []
         for row in rows:
             if not isinstance(row, dict):
+                continue
+            fallback_symbol = row.get("symbol")
+            if fallback_symbol:
+                if str(fallback_symbol).upper() != symbol.upper():
+                    continue
+                expiry = row.get("expiry")
+                if not expiry:
+                    continue
+                try:
+                    expiries.append(normalize_date(expiry))
+                except Exception:
+                    continue
                 continue
             if row.get("instrument_type") != "OPTIDX":
                 continue

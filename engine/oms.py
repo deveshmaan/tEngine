@@ -118,6 +118,7 @@ class Order:
     symbol: str
     side: str
     qty: int
+    lot_size: int = 1
     order_type: str = "MARKET"
     limit_price: Optional[float] = None
     state: OrderState = OrderState.NEW
@@ -148,6 +149,7 @@ class Order:
             symbol=snapshot["symbol"],
             side=snapshot["side"],
             qty=int(snapshot["qty"]),
+            lot_size=int(snapshot.get("lot_size") or 1),
             order_type="MARKET",
             limit_price=snapshot.get("price"),
             state=state,
@@ -401,6 +403,7 @@ class OMS:
                     "price": price,
                     "ts": order.updated_at.isoformat(),
                     "exec_id": order.client_order_id,
+                    "lot_size": order.lot_size,
                 },
             )
         if self._metrics:
@@ -509,14 +512,16 @@ class OMS:
             if self._metrics:
                 self._metrics.orders_submitted_total.inc()
             ack = await self._broker.submit_order(order)
-        except BrokerError as exc:
-            if getattr(exc, "code", "") == "insufficient_funds":
-                await self._persist_transition(order, OrderState.SUBMITTED, OrderState.REJECTED, reason="insufficient_funds")
-                self._record_reject_metric("broker")
+        except Exception as exc:
+            from engine.broker import BrokerError
+
+            if isinstance(exc, BrokerError):
+                if getattr(exc, "code", "") == "insufficient_funds":
+                    await self._persist_transition(order, OrderState.SUBMITTED, OrderState.REJECTED, reason="insufficient_funds")
+                    self._record_reject_metric("broker")
+                    raise
+                await self._persist_transition(order, OrderState.SUBMITTED, OrderState.NEW, reason="retry")
                 raise
-            await self._persist_transition(order, OrderState.SUBMITTED, OrderState.NEW, reason="retry")
-            raise
-        except Exception:
             await self._persist_transition(order, OrderState.SUBMITTED, OrderState.NEW, reason="retry")
             raise
         order.broker_order_id = ack.broker_order_id
@@ -578,6 +583,7 @@ class OMS:
             fallback_expiry = engine_now(IST).date().isoformat()
             underlying, expiry, strike, opt_type = order.symbol.upper(), fallback_expiry, 0.0, "CE"
         tick_size, lot_size, band_low, band_high = self._lookup_contract_meta(underlying, expiry, strike, opt_type)
+        order.lot_size = max(int(lot_size or self._default_meta[1]), 1)
         if not skip_style:
             self._apply_submit_style(order, tick_size, band_low, band_high)
         order_type = order.order_type.upper()
@@ -593,7 +599,7 @@ class OMS:
             order.side,
             order.qty,
             order.limit_price if order_type != "MARKET" else None,
-            lot_size=lot_size or self._default_meta[1],
+            lot_size=order.lot_size,
             tick=tick_size or self._default_meta[0],
             band_low=band_low or self._default_meta[2],
             band_high=band_high or self._default_meta[3],

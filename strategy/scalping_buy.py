@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 import yaml
 
 from engine.config import EngineConfig
+from engine.alerts import notify_incident
 from engine.data import pick_strike_from_spot, pick_subscription_expiry, resolve_next_expiry
 from engine.events import EventBus, OrderSignal
 from engine.logging_utils import get_logger
@@ -65,6 +66,7 @@ class ScalpingBuyStrategy(BaseStrategy):
         self._highest_lookback: dict[str, deque[float]] = {}
         self._scalp_start: dict[str, float] = {}
         self._scalp_durations: deque[float] = deque(maxlen=100)
+        self._lot_size_fallbacks: set[tuple[str, str]] = set()
 
     async def init(self, app: Any) -> None:
         await super().init(app)
@@ -274,14 +276,19 @@ class ScalpingBuyStrategy(BaseStrategy):
             return int(self.cfg.data.lot_step)
 
     def _resolve_lot_size(self, expiry: str, symbol: str) -> int:
-        lot = max(int(self.cfg.data.lot_step), 1)
+        fallback = max(int(self.cfg.data.lot_step), 1)
         try:
             meta = self.instrument_cache.get_meta(symbol, expiry)
             if isinstance(meta, tuple) and len(meta) >= 2 and meta[1]:
-                lot = max(int(meta[1]), 1)
+                return max(int(meta[1]), 1)
         except Exception:
             pass
-        return lot
+        key = (symbol.upper(), expiry)
+        if key not in self._lot_size_fallbacks:
+            self._lot_size_fallbacks.add(key)
+            self._logger.log_event(30, "lot_size_fallback", symbol=symbol, expiry=expiry, fallback=fallback)
+            notify_incident("WARN", "Lot size fallback", f"symbol={symbol} expiry={expiry} lot_step={fallback}", tags=["lot_size_fallback"])
+        return fallback
 
     async def _publish_signal(self, instrument: str, qty: int, price: float, ts: dt.datetime, meta: Optional[dict[str, Any]] = None) -> None:
         signal = OrderSignal(

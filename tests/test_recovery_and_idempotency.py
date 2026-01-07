@@ -41,7 +41,7 @@ def _cfg() -> OMSConfig:
     return OMSConfig(resubmit_backoff=0.1, reconciliation_interval=0.5, max_inflight_orders=10)
 
 
-DEFAULT_META = (0.05, 50, 10.0, 500.0)
+DEFAULT_META = (0.05, 1, 10.0, 500.0)
 DEFAULT_SQUARE_OFF = dt.time(15, 30)
 
 

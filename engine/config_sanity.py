@@ -46,8 +46,10 @@ def sanity_check_config(cfg: EngineConfig) -> None:
         except Exception:
             logging.getLogger("ConfigSanity").error("%s: %s", code, message)
 
-    if cfg.risk.daily_pnl_stop >= 0:
-        _err("risk_daily_pnl_stop", "risk.daily_pnl_stop must be negative (loss stop).")
+    if cfg.risk.daily_pnl_stop <= 0:
+        _err("risk_daily_pnl_stop", "risk.daily_pnl_stop must be a positive rupee loss stop.")
+    if cfg.risk.per_symbol_loss_stop <= 0:
+        _err("risk_per_symbol_loss_stop", "risk.per_symbol_loss_stop must be a positive rupee loss stop.")
     if not _positive(cfg.risk.notional_premium_cap):
         _err("risk_notional_premium_cap", "risk.notional_premium_cap must be > 0.")
     if cfg.risk.max_open_lots < 0:

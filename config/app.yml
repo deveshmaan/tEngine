@@ -7,7 +7,7 @@ allowed_ips: [] # Optional static IP allowlist; can also be set via ALLOWED_IPS 
 
 data:
   index_symbol: "NIFTY"
-  lot_step: 75
+  lot_step: 65
   tick_size: 0.05
   price_band_low: 3.0
   price_band_high: 99999.0
@@ -20,7 +20,7 @@ data:
     - "2024-12-25"
   strike_steps:
     NIFTY: 50
-    BANKNIFTY: 50
+    BANKNIFTY: 100
 
 market_data:
   window_steps: 8 # +/- steps around ATM
@@ -62,8 +62,8 @@ banknifty:
   vol_breakout_mult: 1.2
 
 risk:
-  daily_pnl_stop: -5000 # max you are willing to lose in a day
-  per_symbol_loss_stop: -1000
+  daily_pnl_stop: 5000 # max you are willing to lose in a day
+  per_symbol_loss_stop: 1000
   max_open_lots: 1
   notional_premium_cap: 40000
   no_new_entries_after: "15:20:00"

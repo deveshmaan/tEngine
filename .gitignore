@@ -11,3 +11,7 @@ cache/
 prometheus/
 trading_resource/
 .env
+*.env
+*.key
+*.pem
+secrets.*
