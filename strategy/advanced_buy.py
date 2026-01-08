@@ -207,7 +207,10 @@ class AdvancedBuyStrategy(BaseStrategy):
             pass
         lot_size = self._resolve_lot_size(expiry, symbol)
         risk_pct = getattr(self.cfg.risk, "risk_percent_per_trade", 0.0)
-        risk_pct_norm = risk_pct if risk_pct <= 1 else risk_pct / 100.0
+        try:
+            risk_pct_norm = float(risk_pct) / 100.0
+        except (TypeError, ValueError):
+            risk_pct_norm = 0.0
         risk_adjust = 1.0
         if iv_pct >= 0.8:
             risk_adjust *= 0.5

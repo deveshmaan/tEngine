@@ -42,7 +42,7 @@ from engine.exit import ExitEngine
 from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 from market.instrument_cache import InstrumentCache
-from strategy import AdvancedBuyStrategy, IntradayBuyStrategy, ScalpingBuyStrategy
+from strategy import AdvancedBuyStrategy, IntradayBuyStrategy, OpeningRangeBreakoutStrategy, ScalpingBuyStrategy
 
 try:  # pragma: no cover - optional acceleration
     import uvloop
@@ -102,7 +102,12 @@ class EngineApp:
             set_capital_config(config.capital_base, config.risk.risk_percent_per_trade)
         except Exception:
             self.logger.log_event(30, "metrics_capital_config_failed")
-        self.risk = RiskManager(config.risk, self.store, capital_base=config.capital_base)
+        self.risk = RiskManager(
+            config.risk,
+            self.store,
+            capital_base=config.capital_base,
+            default_stop_loss_pct=config.exit.stop_pct,
+        )
         self.subscription_expiries: dict[str, str] = {}
         self.broker = UpstoxBroker(
             config=config.broker,
@@ -124,6 +129,7 @@ class EngineApp:
             metrics=self.metrics,
             default_meta=default_meta,
             square_off_time=config.risk.square_off_by,
+            risk=self.risk,
         )
         self.broker.bind_reconcile_callback(self.oms.reconcile_from_broker)
         self.broker.bind_square_off_callback(self._execute_square_off)
@@ -136,7 +142,7 @@ class EngineApp:
             tick_size=config.data.tick_size,
             metrics=self.metrics,
             iv_exit_threshold=getattr(config.strategy, "iv_exit_percentile", 0.0),
-            rest_ltp_provider=self.broker.fetch_ltp,
+            rest_ltp_provider=self._fetch_ltp_with_resolver,
             max_tick_age_seconds=getattr(config.market_data, "max_tick_age_seconds", 0.0),
         )
         tag = getattr(config, "strategy_tag", "").lower()
@@ -144,6 +150,8 @@ class EngineApp:
             strategy_cls = AdvancedBuyStrategy
         elif tag == "scalping-buy":
             strategy_cls = ScalpingBuyStrategy
+        elif tag in {"orb", "opening-range-breakout"}:
+            strategy_cls = OpeningRangeBreakoutStrategy
         else:
             strategy_cls = IntradayBuyStrategy
         self.strategy = strategy_cls(
@@ -235,6 +243,7 @@ class EngineApp:
                 )
             except Exception:
                 self.logger.log_event(30, "exit_plan_reseed_failed", symbol=pos.get("symbol"))
+        self._bootstrap_risk_positions()
         self._square_task = asyncio.create_task(self._square_off_watchdog(), name="square-off")
         tasks: List[asyncio.Task] = [self._square_task]
         if replay_cfg:
@@ -364,7 +373,14 @@ class EngineApp:
             except Exception:
                 self.logger.log_event(30, "exit_plan_seed_failed", symbol=exec_obj.symbol)
             try:
-                self.risk.on_fill(symbol=exec_obj.symbol, side=exec_obj.side, qty=exec_obj.qty, price=exec_obj.price, lot_size=lot_size)
+                self.risk.on_fill(
+                    symbol=exec_obj.symbol,
+                    side=exec_obj.side,
+                    qty=exec_obj.qty,
+                    price=exec_obj.price,
+                    lot_size=lot_size,
+                    order_id=exec_obj.order_id,
+                )
             except Exception:
                 pass
             try:
@@ -651,6 +667,27 @@ class EngineApp:
             self.logger.log_event(30, "lot_size_fallback", symbol=symbol, fallback=fallback_val)
             notify_incident("WARN", "Lot size fallback", f"symbol={symbol} lot_step={fallback_val}", tags=["lot_size_fallback"])
         return fallback_val
+
+    def _bootstrap_risk_positions(self) -> None:
+        for pos in self.store.list_open_positions():
+            symbol = str(pos.get("symbol") or "")
+            qty = pos.get("qty")
+            price = pos.get("avg_price")
+            lot_size = pos.get("lot_size") or self._lot_size_for_symbol(symbol)
+            try:
+                self.risk.bootstrap_position(symbol=symbol, qty=int(qty or 0), price=float(price or 0.0), lot_size=int(lot_size or 0))
+            except Exception:
+                self.logger.log_event(30, "risk_bootstrap_failed", symbol=symbol)
+
+    async def _fetch_ltp_with_resolver(self, instrument_or_symbol: str) -> Optional[float]:
+        key = str(instrument_or_symbol or "").strip()
+        if not key:
+            return None
+        if "|" not in key:
+            resolved = self._instrument_key_for_symbol(key)
+            if resolved:
+                key = resolved
+        return await self.broker.fetch_ltp(key)
 
     def _init_charges_client(self) -> Optional[UpstoxChargesClient]:
         try:

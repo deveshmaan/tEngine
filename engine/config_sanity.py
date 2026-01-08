@@ -98,6 +98,12 @@ def sanity_check_config(cfg: EngineConfig) -> None:
         _err("strategy_volume_mult", "strategy.volume_mult must be >= 0.")
     if getattr(cfg.strategy, "spread_max_pct", 0.0) < 0:
         _err("strategy_spread_max_pct", "strategy.spread_max_pct must be >= 0.")
+    if getattr(cfg.strategy, "opening_range_minutes", 0) <= 0:
+        _err("strategy_opening_range_minutes", "strategy.opening_range_minutes must be > 0.")
+    if getattr(cfg.strategy, "volume_surge_ratio", 0.0) < 0:
+        _err("strategy_volume_surge_ratio", "strategy.volume_surge_ratio must be >= 0.")
+    if getattr(cfg.strategy, "orb_max_trades_per_session", 1) <= 0:
+        _err("strategy_orb_max_trades", "strategy.orb_max_trades_per_session must be >= 1.")
     pcr_range = getattr(cfg.strategy, "pcr_range", (0.0, 0.0))
     try:
         pcr_low, pcr_high = pcr_range

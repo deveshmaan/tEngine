@@ -108,6 +108,10 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         except (TypeError, ValueError):
             self.breakout_buffer_pts = 5.0
         self.use_atr_filter = bool(getattr(config.strategy, "use_atr_filter", True))
+        try:
+            self.max_orb_trades = max(int(getattr(config.strategy, "orb_max_trades_per_session", 1)), 1)
+        except (TypeError, ValueError):
+            self.max_orb_trades = 1
 
         self._orb_high: Optional[float] = None
         self._orb_low: Optional[float] = None
@@ -118,6 +122,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self._orb_tradeable = True
         self._above_range_triggered = False
         self._below_range_triggered = False
+        self._orb_trades_taken = 0
         self._lot_size_fallbacks: set[tuple[str, str]] = set()
 
         self._cum_volume = 0.0
@@ -146,6 +151,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self._orb_tradeable = True
         self._above_range_triggered = False
         self._below_range_triggered = False
+        self._orb_trades_taken = 0
         self._cum_volume = 0.0
         self._cum_price_volume = 0.0
         self._last_underlying_volume = None
@@ -192,17 +198,19 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             self._reset_session(ts)
         if self._orb_start_time is None:
             market_open = ts.replace(hour=9, minute=15, second=0, microsecond=0)
-            start_time = market_open if ts < market_open else ts.replace(second=0, microsecond=0)
-            self._orb_start_time = start_time
-            self._orb_end_time = start_time + dt.timedelta(minutes=self.opening_range_minutes)
+            self._orb_start_time = market_open
+            self._orb_end_time = market_open + dt.timedelta(minutes=self.opening_range_minutes)
             self._logger.log_event(
                 20,
                 "orb_start",
                 start=self._orb_start_time.isoformat(),
                 end=self._orb_end_time.isoformat(),
             )
-            if start_time > market_open:
-                self._logger.log_event(20, "orb_late_bootstrap", start=self._orb_start_time.isoformat())
+            if ts >= (self._orb_end_time or market_open):
+                self._orb_established = True
+                self._orb_tradeable = False
+                self._logger.log_event(20, "orb_window_missed", ts=ts.isoformat(), end=self._orb_end_time.isoformat())
+                return
 
         if self._orb_start_time and ts < self._orb_start_time:
             return
@@ -261,6 +269,8 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
 
         if not self._orb_tradeable:
             return
+        if self._orb_trades_taken >= self.max_orb_trades:
+            return
 
         has_open = self.risk.has_open_positions()
         atr_val = self._atr.value if self._atr.ready() else None
@@ -276,7 +286,10 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             if breakout_up:
                 placed = await self._place_order(symbol, price, ts, opt_type="CE")
                 if placed:
+                    self._orb_trades_taken += 1
                     self._above_range_triggered = True
+                    if self._orb_trades_taken >= self.max_orb_trades:
+                        self._orb_tradeable = False
 
         if breakout_down and not self._below_range_triggered and not has_open:
             if not self._volume_ok(direction="down"):
@@ -286,7 +299,10 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             if breakout_down:
                 placed = await self._place_order(symbol, price, ts, opt_type="PE")
                 if placed:
+                    self._orb_trades_taken += 1
                     self._below_range_triggered = True
+                    if self._orb_trades_taken >= self.max_orb_trades:
+                        self._orb_tradeable = False
 
         if self._above_range_triggered and price <= self._orb_high:
             self._above_range_triggered = False

@@ -76,13 +76,19 @@ class ScalpingBuyStrategy(BaseStrategy):
         if event.get("type") not in {"tick", "quote"}:
             return
         payload = event.get("payload") or {}
-        symbol = (payload.get("symbol") or payload.get("underlying") or "").upper()
-        if symbol not in {"NIFTY", "BANKNIFTY"}:
-            return
         ltp = self._extract_price(payload)
         if ltp is None:
             return
         ts = self._event_ts(event.get("ts"))
+        symbol_hint = payload.get("symbol") or payload.get("underlying") or ""
+        opt_type = str(payload.get("opt_type") or "").upper()
+        if opt_type in {"CE", "PE"} or ("-" in str(symbol_hint) and str(symbol_hint).upper() not in {"NIFTY", "BANKNIFTY"}):
+            option_symbol = symbol_hint or payload.get("instrument") or payload.get("instrument_key") or ""
+            await self._handle_option_tick(option_symbol, ltp, ts, payload)
+            return
+        symbol = str(symbol_hint).upper()
+        if symbol not in {"NIFTY", "BANKNIFTY"}:
+            return
         if self._event_guard(ts):
             return
         self._record_eval_metrics()
@@ -115,6 +121,19 @@ class ScalpingBuyStrategy(BaseStrategy):
             self.metrics.strategy_evals_total.inc()
         except Exception:
             pass
+
+    async def _handle_option_tick(self, symbol: str, price: float, ts: dt.datetime, payload: Optional[dict] = None) -> None:
+        if symbol:
+            try:
+                self.risk.on_tick(symbol, price)
+            except Exception:
+                pass
+        try:
+            oi_val = (payload or {}).get("oi")
+            iv_val = (payload or {}).get("iv")
+            await self.exit_engine.on_tick(symbol, price, ts, oi=oi_val, iv=iv_val)
+        except Exception:
+            self._logger.log_event(30, "exit_tick_failed", symbol=symbol)
 
     def _update_bar(self, symbol: str, price: float, volume: float, ts: dt.datetime) -> bool:
         bucket = ts.replace(second=0, microsecond=0)
