@@ -96,6 +96,13 @@ class RiskEvent:
     context: Dict[str, float | int | str] = field(default_factory=dict)
 
 
+@dataclass
+class PendingOrder:
+    side: str
+    qty: int
+    lot_size: int
+
+
 class SessionGuard:
     """Encapsulate time-of-day guardrails for session bootstrap."""
 
@@ -168,6 +175,7 @@ class RiskManager:
         self._scalping_timestamps: Deque[dt.datetime] = deque()
         self._expected_price: Dict[str, float] = {}
         self._expected_spread: Dict[str, float] = {}
+        self._pending_orders: Dict[str, PendingOrder] = {}
         self._slippage_sum_pct: float = 0.0
         self._slippage_count: int = 0
         self._slippage_bad: int = 0
@@ -181,7 +189,18 @@ class RiskManager:
         self._update_risk_metrics()
 
     # ----------------------------------------------------------------- updates
-    def on_fill(self, *, symbol: str, side: str, qty: int, price: float, lot_size: int) -> None:
+    def on_fill(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        lot_size: int,
+        order_id: Optional[str] = None,
+    ) -> None:
+        if order_id and side.upper() == "BUY":
+            self._reduce_pending_order(order_id, qty)
         state = self._positions.setdefault(symbol, PositionState(lot_size=max(lot_size, 1)))
         signed_qty = qty if side.upper() == "BUY" else -qty
         prev_qty = state.net_qty
@@ -248,7 +267,7 @@ class RiskManager:
     # ----------------------------------------------------------------- checks
     def position_size(self, *, premium: float, lot_size: int, stop_loss_pct: Optional[float] = None) -> int:
         stop_pct = self._default_stop_loss_pct if stop_loss_pct is None else stop_loss_pct
-        open_lots = self._total_open_lots()
+        open_lots = self._total_open_lots(include_pending=True)
         qty = compute_position_size(
             self.capital_base,
             getattr(self.cfg, "risk_percent_per_trade", 0.0),
@@ -263,7 +282,7 @@ class RiskManager:
                 lot = max(int(lot_size), 1)
                 pending_lots = qty / lot
                 exposure = self._premium_exposure() + (qty * premium)
-                open_lots = self._total_open_lots() + pending_lots
+                open_lots = self._total_open_lots(include_pending=True) + pending_lots
                 set_risk_dials(open_lots=open_lots, notional_rupees=exposure, daily_stop_rupees=self.cfg.daily_pnl_stop)
             except Exception:
                 pass
@@ -327,7 +346,7 @@ class RiskManager:
         """Update exposure gauges for open lots, premium, and square-off timer."""
 
         try:
-            open_lots = 0.0
+            open_lots = self._total_open_lots(include_pending=True)
             notional = 0.0
             for state in self._positions.values():
                 lot = max(state.lot_size, 1)
@@ -440,7 +459,7 @@ class RiskManager:
         return count
 
     def has_open_positions(self) -> bool:
-        return self.open_position_count() > 0
+        return self.open_position_count() > 0 or self._pending_open_lots() > 0.0
 
     def evaluate_boot_state(self, now_ist: Optional[dt.datetime] = None, has_positions: Optional[bool] = None) -> dict[str, str]:
         now = now_ist or self._session_guard.now()
@@ -549,16 +568,82 @@ class RiskManager:
             self._order_timestamps.popleft()
 
     def _lots_available(self, order: OrderBudget) -> bool:
-        open_lots = self._total_open_lots()
+        open_lots = self._total_open_lots(include_pending=True)
         pending = order.qty / max(order.lot_size, 1)
         return open_lots + pending <= self.cfg.max_open_lots
 
-    def _total_open_lots(self) -> float:
+    def _total_open_lots(self, *, include_pending: bool = False) -> float:
         lots = 0.0
         for state in self._positions.values():
             if state.net_qty > 0:
-                lots += state.net_qty / max(state.lot_size, 1)
+                lots += abs(state.net_qty) / max(state.lot_size, 1)
+        if include_pending:
+            lots += self._pending_open_lots()
         return lots
+
+    def _pending_open_lots(self) -> float:
+        lots = 0.0
+        for pending in self._pending_orders.values():
+            if pending.side.upper() != "BUY":
+                continue
+            lots += pending.qty / max(pending.lot_size, 1)
+        return lots
+
+    def register_pending_order(self, order_id: str, *, side: str, qty: int, lot_size: int) -> None:
+        if not order_id or side.upper() != "BUY":
+            return
+        try:
+            qty_val = int(qty)
+            lot = max(int(lot_size), 1)
+        except (TypeError, ValueError):
+            return
+        if qty_val <= 0:
+            return
+        self._pending_orders[order_id] = PendingOrder(side="BUY", qty=qty_val, lot_size=lot)
+        self._update_risk_metrics()
+
+    def clear_pending_order(self, order_id: str) -> None:
+        if not order_id:
+            return
+        if order_id in self._pending_orders:
+            self._pending_orders.pop(order_id, None)
+            self._update_risk_metrics()
+
+    def _reduce_pending_order(self, order_id: str, filled_qty: int) -> None:
+        if not order_id:
+            return
+        pending = self._pending_orders.get(order_id)
+        if not pending:
+            return
+        try:
+            fill = int(filled_qty)
+        except (TypeError, ValueError):
+            return
+        if fill <= 0:
+            return
+        pending.qty = max(pending.qty - fill, 0)
+        if pending.qty <= 0:
+            self._pending_orders.pop(order_id, None)
+        self._update_risk_metrics()
+
+    def bootstrap_position(self, *, symbol: str, qty: int, price: float, lot_size: Optional[int] = None) -> None:
+        if not symbol:
+            return
+        try:
+            qty_val = int(qty)
+            px = float(price)
+        except (TypeError, ValueError):
+            return
+        if qty_val == 0 or px <= 0:
+            return
+        lot = max(int(lot_size or 1), 1)
+        state = self._positions.setdefault(symbol, PositionState(lot_size=lot))
+        state.lot_size = lot
+        state.net_qty = qty_val
+        state.avg_price = px
+        state.last_price = px
+        self._positions[symbol] = state
+        self._update_risk_metrics()
 
     def _premium_budget_ok(self, order: OrderBudget) -> bool:
         exposure = self._premium_exposure()

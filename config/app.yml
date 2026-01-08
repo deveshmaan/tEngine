@@ -57,6 +57,7 @@ strategy:
   buffer_atr_mult: 0.35
   breakout_buffer_pts: 5.0
   use_atr_filter: true
+  orb_max_trades_per_session: 1
 
 banknifty:
   vol_breakout_mult: 1.2
@@ -69,7 +70,7 @@ risk:
   no_new_entries_after: "15:20:00"
   square_off_by: "15:25:00"
   max_order_rate: 5
-  risk_percent_per_trade: 0.12 # 12% of capital per trade; ~1 lot at current NIFTY option premiums
+  risk_percent_per_trade: 12.0 # percent of capital per trade; ~1 lot at current NIFTY option premiums
   scalping_risk_pct: 0.5
   scalping_trades_per_hour: 30
   max_slippage_pct_per_trade: 0.0 # 0 disables slippage halt

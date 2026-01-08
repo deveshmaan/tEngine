@@ -408,11 +408,15 @@ class StrategyConfig:
     volume_mult: float = 1.5
     pcr_range: tuple[float, float] = (0.7, 1.3)
     spread_max_pct: float = 0.05
+    opening_range_minutes: int = 15
+    volume_surge_ratio: float = 1.5
+    vwap_confirmation: bool = True
     orb_atr_period: int = 14
     min_or_atr_mult: float = 0.55
     max_or_atr_mult: float = 2.5
     buffer_atr_mult: float = 0.35
     breakout_buffer_pts: float = 5.0
+    orb_max_trades_per_session: int = 1
     use_atr_filter: bool = True
 
     @staticmethod
@@ -494,6 +498,15 @@ class StrategyConfig:
         except (TypeError, ValueError):
             spread_max_pct = 0.05
         try:
+            opening_range_minutes = int(payload.get("opening_range_minutes", 15))
+        except (TypeError, ValueError):
+            opening_range_minutes = 15
+        try:
+            volume_surge_ratio = float(payload.get("volume_surge_ratio", 1.5))
+        except (TypeError, ValueError):
+            volume_surge_ratio = 1.5
+        vwap_confirmation = bool(payload.get("vwap_confirmation", True))
+        try:
             orb_atr_period = int(payload.get("orb_atr_period", 14))
         except (TypeError, ValueError):
             orb_atr_period = 14
@@ -513,6 +526,10 @@ class StrategyConfig:
             breakout_buffer_pts = float(payload.get("breakout_buffer_pts", 5.0))
         except (TypeError, ValueError):
             breakout_buffer_pts = 5.0
+        try:
+            orb_max_trades = int(payload.get("orb_max_trades_per_session", 1))
+        except (TypeError, ValueError):
+            orb_max_trades = 1
         enable_call = bool(payload.get("enable_call_entries", True))
         enable_put = bool(payload.get("enable_put_entries", False))
         use_atr_filter = bool(payload.get("use_atr_filter", True))
@@ -539,11 +556,15 @@ class StrategyConfig:
             volume_mult=max(volume_mult, 0.0),
             pcr_range=(max(pcr_low, 0.0), max(pcr_high, 0.0)),
             spread_max_pct=max(spread_max_pct, 0.0),
+            opening_range_minutes=max(opening_range_minutes, 1),
+            volume_surge_ratio=max(volume_surge_ratio, 0.0),
+            vwap_confirmation=bool(vwap_confirmation),
             orb_atr_period=max(orb_atr_period, 1),
             min_or_atr_mult=max(min_or_atr_mult, 0.0),
             max_or_atr_mult=max(max_or_atr_mult, 0.0),
             buffer_atr_mult=max(buffer_atr_mult, 0.0),
             breakout_buffer_pts=max(breakout_buffer_pts, 0.0),
+            orb_max_trades_per_session=max(orb_max_trades, 1),
             enable_call_entries=enable_call,
             enable_put_entries=enable_put,
             use_atr_filter=use_atr_filter,

@@ -6,7 +6,7 @@ import hashlib
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, TYPE_CHECKING
 
 from engine.alerts import notify_incident
 from engine.config import IST, OMSConfig
@@ -44,6 +44,9 @@ except Exception:  # pragma: no cover
 from engine.time_machine import now as engine_now, utc_now
 from market.instrument_cache import InstrumentCache
 from persistence import SQLiteStore
+
+if TYPE_CHECKING:  # pragma: no cover
+    from engine.risk import RiskManager
 
 
 class OrderState(str, Enum):
@@ -202,6 +205,7 @@ class OMS:
         metrics: Optional[EngineMetrics] = None,
         default_meta: Optional[tuple[float, int, float, float]] = None,
         square_off_time: Optional[dt.time] = None,
+        risk: Optional["RiskManager"] = None,
     ):
         self._broker = broker
         self._store = store
@@ -216,6 +220,7 @@ class OMS:
         self._market_depth: Dict[str, Dict[str, float]] = {}
         self._square_off_time = square_off_time
         self._square_off_buffer = dt.timedelta(minutes=5)
+        self._risk = risk
 
     # --------------------------------------------------------------- id helpers
     @staticmethod
@@ -268,11 +273,33 @@ class OMS:
             if existing:
                 if existing.state in FINAL_STATES:
                     return existing
+                if self._risk:
+                    try:
+                        remaining_qty = max(int(existing.qty) - int(existing.filled_qty or 0), 0)
+                        self._risk.register_pending_order(
+                            existing.client_order_id,
+                            side=existing.side,
+                            qty=remaining_qty,
+                            lot_size=existing.lot_size,
+                        )
+                    except Exception:
+                        pass
                 return await self._ensure_submitted(existing)
             stored = self._store.find_order_by_client_id(client_id) or self._store.find_order_by_idempotency(idem)
             if stored:
                 restored = Order.from_snapshot(stored)
                 self._orders[restored.client_order_id] = restored
+                if self._risk:
+                    try:
+                        remaining_qty = max(int(restored.qty) - int(restored.filled_qty or 0), 0)
+                        self._risk.register_pending_order(
+                            restored.client_order_id,
+                            side=restored.side,
+                            qty=remaining_qty,
+                            lot_size=restored.lot_size,
+                        )
+                    except Exception:
+                        pass
                 return await self._ensure_submitted(restored)
             self._ensure_capacity()
             order = Order(
@@ -290,6 +317,16 @@ class OMS:
             except OrderValidationError as exc:
                 self._record_validation_failure(exc, order)
                 raise
+            if self._risk:
+                try:
+                    self._risk.register_pending_order(
+                        order.client_order_id,
+                        side=order.side,
+                        qty=order.qty,
+                        lot_size=order.lot_size,
+                    )
+                except Exception:
+                    pass
             order.submit_ts = time.time()
             if not order.last_md_tick_ts:
                 order.last_md_tick_ts = order.submit_ts
@@ -558,6 +595,11 @@ class OMS:
             new_state=new.value,
             reason=reason,
         )
+        if self._risk and new in {OrderState.CANCELED, OrderState.REJECTED}:
+            try:
+                self._risk.clear_pending_order(order.client_order_id)
+            except Exception:
+                pass
         try:
             record_state_transition(prev.value, new.value)
         except Exception:
@@ -584,6 +626,8 @@ class OMS:
             underlying, expiry, strike, opt_type = order.symbol.upper(), fallback_expiry, 0.0, "CE"
         tick_size, lot_size, band_low, band_high = self._lookup_contract_meta(underlying, expiry, strike, opt_type)
         order.lot_size = max(int(lot_size or self._default_meta[1]), 1)
+        if order.side.upper() == "SELL":
+            skip_style = True
         if not skip_style:
             self._apply_submit_style(order, tick_size, band_low, band_high)
         order_type = order.order_type.upper()
