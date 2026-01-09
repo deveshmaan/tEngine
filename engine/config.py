@@ -418,6 +418,22 @@ class StrategyConfig:
     breakout_buffer_pts: float = 5.0
     orb_max_trades_per_session: int = 1
     use_atr_filter: bool = True
+    # Liquidity pool breaker strategy
+    top_n_zones: int = 3
+    chain_refresh_seconds: int = 300
+    chain_min_cooldown_seconds: int = 30
+    liquidity_weight: float = 1.0
+    min_oi: float = 0.0
+    min_vol: float = 0.0
+    oi_drop_pct_trigger: float = 0.15
+    absorption_oi_rise_pct: float = 0.1
+    min_vol_delta: float = 100.0
+    absorption_confirm_seconds: int = 45
+    reclaim_buffer_points: float = 2.0
+    stop_buffer_points: float = 3.0
+    risk_pct: float = 0.0
+    max_hold_minutes: int = 0
+    no_new_entries_after_time: Optional[dt.time] = None
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> "StrategyConfig":
@@ -530,6 +546,69 @@ class StrategyConfig:
             orb_max_trades = int(payload.get("orb_max_trades_per_session", 1))
         except (TypeError, ValueError):
             orb_max_trades = 1
+        try:
+            top_n_zones = int(payload.get("top_n_zones", 3))
+        except (TypeError, ValueError):
+            top_n_zones = 3
+        try:
+            chain_refresh_seconds = int(payload.get("chain_refresh_seconds", 300))
+        except (TypeError, ValueError):
+            chain_refresh_seconds = 300
+        try:
+            chain_min_cooldown_seconds = int(payload.get("chain_min_cooldown_seconds", 30))
+        except (TypeError, ValueError):
+            chain_min_cooldown_seconds = 30
+        try:
+            liquidity_weight = float(payload.get("liquidity_weight", 1.0))
+        except (TypeError, ValueError):
+            liquidity_weight = 1.0
+        try:
+            min_oi = float(payload.get("min_oi", 0.0))
+        except (TypeError, ValueError):
+            min_oi = 0.0
+        try:
+            min_vol = float(payload.get("min_vol", 0.0))
+        except (TypeError, ValueError):
+            min_vol = 0.0
+        try:
+            oi_drop_pct_trigger = float(payload.get("oi_drop_pct_trigger", 0.15))
+        except (TypeError, ValueError):
+            oi_drop_pct_trigger = 0.15
+        try:
+            absorption_oi_rise_pct = float(payload.get("absorption_oi_rise_pct", 0.1))
+        except (TypeError, ValueError):
+            absorption_oi_rise_pct = 0.1
+        try:
+            min_vol_delta = float(payload.get("min_vol_delta", 100.0))
+        except (TypeError, ValueError):
+            min_vol_delta = 100.0
+        try:
+            absorption_confirm_seconds = int(payload.get("absorption_confirm_seconds", 45))
+        except (TypeError, ValueError):
+            absorption_confirm_seconds = 45
+        try:
+            reclaim_buffer_points = float(payload.get("reclaim_buffer_points", 2.0))
+        except (TypeError, ValueError):
+            reclaim_buffer_points = 2.0
+        try:
+            stop_buffer_points = float(payload.get("stop_buffer_points", 3.0))
+        except (TypeError, ValueError):
+            stop_buffer_points = 3.0
+        try:
+            risk_pct = float(payload.get("risk_pct", 0.0))
+        except (TypeError, ValueError):
+            risk_pct = 0.0
+        try:
+            max_hold_minutes = int(payload.get("max_hold_minutes", 0))
+        except (TypeError, ValueError):
+            max_hold_minutes = 0
+        no_new_entries_after_time: Optional[dt.time] = None
+        raw_no_new_entries = payload.get("no_new_entries_after_time")
+        if raw_no_new_entries:
+            try:
+                no_new_entries_after_time = _parse_time_str(str(raw_no_new_entries))
+            except (TypeError, ValueError):
+                no_new_entries_after_time = None
         enable_call = bool(payload.get("enable_call_entries", True))
         enable_put = bool(payload.get("enable_put_entries", False))
         use_atr_filter = bool(payload.get("use_atr_filter", True))
@@ -568,6 +647,21 @@ class StrategyConfig:
             enable_call_entries=enable_call,
             enable_put_entries=enable_put,
             use_atr_filter=use_atr_filter,
+            top_n_zones=max(top_n_zones, 1),
+            chain_refresh_seconds=max(chain_refresh_seconds, 1),
+            chain_min_cooldown_seconds=max(chain_min_cooldown_seconds, 1),
+            liquidity_weight=max(liquidity_weight, 0.0),
+            min_oi=max(min_oi, 0.0),
+            min_vol=max(min_vol, 0.0),
+            oi_drop_pct_trigger=max(oi_drop_pct_trigger, 0.0),
+            absorption_oi_rise_pct=max(absorption_oi_rise_pct, 0.0),
+            min_vol_delta=max(min_vol_delta, 0.0),
+            absorption_confirm_seconds=max(absorption_confirm_seconds, 1),
+            reclaim_buffer_points=max(reclaim_buffer_points, 0.0),
+            stop_buffer_points=max(stop_buffer_points, 0.0),
+            risk_pct=max(risk_pct, 0.0),
+            max_hold_minutes=max(max_hold_minutes, 0),
+            no_new_entries_after_time=no_new_entries_after_time,
         )
 
 
