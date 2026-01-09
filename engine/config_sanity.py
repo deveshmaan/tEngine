@@ -111,6 +111,35 @@ def sanity_check_config(cfg: EngineConfig) -> None:
             _err("strategy_pcr_range", "strategy.pcr_range must be non-negative.")
     except Exception:
         _err("strategy_pcr_range", "strategy.pcr_range must be a 2-tuple.")
+    if getattr(cfg.strategy, "top_n_zones", 0) <= 0:
+        _err("strategy_top_n_zones", "strategy.top_n_zones must be >= 1.")
+    if getattr(cfg.strategy, "chain_refresh_seconds", 0) <= 0:
+        _err("strategy_chain_refresh_seconds", "strategy.chain_refresh_seconds must be > 0.")
+    if getattr(cfg.strategy, "chain_min_cooldown_seconds", 0) <= 0:
+        _err("strategy_chain_min_cooldown_seconds", "strategy.chain_min_cooldown_seconds must be > 0.")
+    if getattr(cfg.strategy, "liquidity_weight", 0.0) < 0:
+        _err("strategy_liquidity_weight", "strategy.liquidity_weight must be >= 0.")
+    if getattr(cfg.strategy, "min_oi", 0.0) < 0:
+        _err("strategy_min_oi", "strategy.min_oi must be >= 0.")
+    if getattr(cfg.strategy, "min_vol", 0.0) < 0:
+        _err("strategy_min_vol", "strategy.min_vol must be >= 0.")
+    if getattr(cfg.strategy, "oi_drop_pct_trigger", 0.0) < 0:
+        _err("strategy_oi_drop_pct_trigger", "strategy.oi_drop_pct_trigger must be >= 0.")
+    if getattr(cfg.strategy, "absorption_oi_rise_pct", 0.0) < 0:
+        _err("strategy_absorption_oi_rise_pct", "strategy.absorption_oi_rise_pct must be >= 0.")
+    if getattr(cfg.strategy, "min_vol_delta", 0.0) < 0:
+        _err("strategy_min_vol_delta", "strategy.min_vol_delta must be >= 0.")
+    if getattr(cfg.strategy, "absorption_confirm_seconds", 0) <= 0:
+        _err("strategy_absorption_confirm_seconds", "strategy.absorption_confirm_seconds must be > 0.")
+    if getattr(cfg.strategy, "reclaim_buffer_points", 0.0) < 0:
+        _err("strategy_reclaim_buffer_points", "strategy.reclaim_buffer_points must be >= 0.")
+    if getattr(cfg.strategy, "stop_buffer_points", 0.0) < 0:
+        _err("strategy_stop_buffer_points", "strategy.stop_buffer_points must be >= 0.")
+    lpb_risk_pct = getattr(cfg.strategy, "risk_pct", 0.0)
+    if lpb_risk_pct < 0 or lpb_risk_pct > 100:
+        _err("strategy_risk_pct", "strategy.risk_pct must be between 0 and 100.")
+    if getattr(cfg.strategy, "max_hold_minutes", 0) < 0:
+        _err("strategy_max_hold_minutes", "strategy.max_hold_minutes must be >= 0.")
 
     for ip in getattr(cfg, "allowed_ips", ()):
         try:

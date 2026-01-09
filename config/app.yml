@@ -58,6 +58,21 @@ strategy:
   breakout_buffer_pts: 5.0
   use_atr_filter: true
   orb_max_trades_per_session: 1
+  top_n_zones: 3
+  chain_refresh_seconds: 300
+  chain_min_cooldown_seconds: 30
+  liquidity_weight: 1.0
+  min_oi: 0
+  min_vol: 0
+  oi_drop_pct_trigger: 0.15
+  absorption_oi_rise_pct: 0.1
+  min_vol_delta: 100
+  absorption_confirm_seconds: 45
+  reclaim_buffer_points: 2.0
+  stop_buffer_points: 3.0
+  risk_pct: 0.0
+  max_hold_minutes: 0
+  no_new_entries_after_time: null
 
 banknifty:
   vol_breakout_mult: 1.2

@@ -130,6 +130,11 @@ class EngineMetrics:
             self.scalping_pcr_high = _NoOpMetric()
             self.scalping_spread_max_pct = _NoOpMetric()
             self.scalping_risk_pct = _NoOpMetric()
+            self.lpbreaker_signals_total = _NoOpMetric()
+            self.lpbreaker_zone_strike = _NoOpMetric()
+            self.lpbreaker_oi_change_pct = _NoOpMetric()
+            self.lpbreaker_vol_delta = _NoOpMetric()
+            self.lpbreaker_pending_breach = _NoOpMetric()
             return
         registry_kwargs = {"registry": self._registry} if self._registry is not None else {}
         self.engine_up = Gauge("engine_up", "Engine up status", **registry_kwargs)
@@ -301,6 +306,11 @@ class EngineMetrics:
             self.scalping_pcr_high = scalping_pcr_high
             self.scalping_spread_max_pct = scalping_spread_max_pct
             self.scalping_risk_pct = scalping_risk_pct
+            self.lpbreaker_signals_total = lpbreaker_signals_total
+            self.lpbreaker_zone_strike = lpbreaker_zone_strike
+            self.lpbreaker_oi_change_pct = lpbreaker_oi_change_pct
+            self.lpbreaker_vol_delta = lpbreaker_vol_delta
+            self.lpbreaker_pending_breach = lpbreaker_pending_breach
         except Exception:
             pass
 
@@ -855,6 +865,27 @@ scalping_pcr_low = _gauge("scalping_pcr_low", "Scalping PCR lower bound.")
 scalping_pcr_high = _gauge("scalping_pcr_high", "Scalping PCR upper bound.")
 scalping_spread_max_pct = _gauge("scalping_spread_max_pct", "Max allowed spread pct for scalps.")
 scalping_risk_pct = _gauge("scalping_risk_pct", "Risk per scalp (% of capital).")
+lpbreaker_signals_total = _counter("lpbreaker_signals_total", "Liquidity pool breaker signals emitted.", labelnames=("type",))
+lpbreaker_zone_strike = _gauge(
+    "lpbreaker_zone_strike",
+    "Liquidity pool breaker zone strike by rank.",
+    labelnames=("rank", "side"),
+)
+lpbreaker_oi_change_pct = _gauge(
+    "lpbreaker_oi_change_pct",
+    "Liquidity pool breaker OI change pct at breach.",
+    labelnames=("strike", "opt_type"),
+)
+lpbreaker_vol_delta = _gauge(
+    "lpbreaker_vol_delta",
+    "Liquidity pool breaker volume delta at breach.",
+    labelnames=("strike", "opt_type"),
+)
+lpbreaker_pending_breach = _gauge(
+    "lpbreaker_pending_breach",
+    "Liquidity pool breaker pending breach state.",
+    labelnames=("strike", "direction"),
+)
 strategy_realized_vol = _gauge("strategy_realized_vol", "Realized 1m return volatility", labelnames=("symbol",))
 strategy_realized_vol_avg = _gauge("strategy_realized_vol_avg", "Average realized volatility", labelnames=("symbol",))
 strategy_vol_breakout_state = _gauge("strategy_vol_breakout_state", "1 when realized vol is in breakout", labelnames=("symbol",))
@@ -1038,6 +1069,11 @@ __all__ += [
     "scalping_pcr_high",
     "scalping_spread_max_pct",
     "scalping_risk_pct",
+    "lpbreaker_signals_total",
+    "lpbreaker_zone_strike",
+    "lpbreaker_oi_change_pct",
+    "lpbreaker_vol_delta",
+    "lpbreaker_pending_breach",
     "strategy_realized_vol",
     "strategy_realized_vol_avg",
     "strategy_vol_breakout_state",

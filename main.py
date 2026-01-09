@@ -42,7 +42,13 @@ from engine.exit import ExitEngine
 from engine.time_machine import now as engine_now
 from persistence import SQLiteStore
 from market.instrument_cache import InstrumentCache
-from strategy import AdvancedBuyStrategy, IntradayBuyStrategy, OpeningRangeBreakoutStrategy, ScalpingBuyStrategy
+from strategy import (
+    AdvancedBuyStrategy,
+    IntradayBuyStrategy,
+    LiquidityPoolBreakerStrategy,
+    OpeningRangeBreakoutStrategy,
+    ScalpingBuyStrategy,
+)
 
 try:  # pragma: no cover - optional acceleration
     import uvloop
@@ -150,6 +156,8 @@ class EngineApp:
             strategy_cls = AdvancedBuyStrategy
         elif tag == "scalping-buy":
             strategy_cls = ScalpingBuyStrategy
+        elif tag in {"liquidity-pool-breaker", "liquidity_pool_breaker", "lpb"}:
+            strategy_cls = LiquidityPoolBreakerStrategy
         elif tag in {"orb", "opening-range-breakout"}:
             strategy_cls = OpeningRangeBreakoutStrategy
         else:
